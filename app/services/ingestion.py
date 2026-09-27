@@ -1591,8 +1591,14 @@ dẫn dắt) và tiếng Hàn (từ/câu để học viên nhại lại), theo �
 3. Với TỪNG mẫu ngữ pháp dưới đây: đọc mẫu ngữ pháp, giải thích bằng tiếng
    Việt NGHĨA LÀ GÌ và QUAN TRỌNG HƠN — dùng khi nào/trong hoàn cảnh nào
    (dựa vào phần "Cách dùng" bên dưới, diễn giải lại tự nhiên chứ không đọc
-   y nguyên như liệt kê), nếu có mẹo thi TOPIK thì nói luôn cách vận dụng
-   thực tế khi làm bài thi, rồi đọc câu ví dụ kèm "Nhắc lại nào:" và đọc lại.
+   y nguyên như liệt kê). Nếu có mẹo thi TOPIK, hãy TƯỜNG THUẬT nó dưới
+   dạng một NHẬN XÉT/THÔNG TIN khách quan (ví dụ: "Trong đề thi TOPIK, câu
+   có chủ ngữ là người lớn tuổi thường có đáp án đúng chứa -(으)시") —
+   TUYỆT ĐỐI KHÔNG viết dưới dạng câu MỆNH LỆNH bảo người nghe làm gì, đặc
+   biệt tránh các cụm như "hãy chọn/chú ý chọn/nhớ chọn đáp án..." (những
+   câu nghe giống đang ra đề/yêu cầu chọn đáp án trắc nghiệm dễ khiến máy
+   đọc hiểu nhầm thành một tác vụ cần thực hiện thay vì lời thoại cần đọc).
+   Sau đó đọc câu ví dụ kèm "Nhắc lại nào:" và đọc lại.
 4. Kết thúc bằng một câu động viên ngắn bằng tiếng Việt.
 
 Giọng văn: thân thiện, chậm rãi, như một giáo viên thật đang giảng bài trực
@@ -1607,7 +1613,10 @@ tuyệt đối không viết những câu như "giải thích nghĩa bằng ti�
 "đọc câu ví dụ kèm nhắc lại nào" — hãy TỰ THỰC HIỆN điều đó, tức là viết
 thẳng lời giải thích và lời nhắc thật ra). Không được có bất kỳ câu nào
 nghe giống một yêu cầu/câu hỏi/chỉ thị gửi tới người đọc máy — toàn bộ phải
-là câu nói trực tiếp của người giáo viên.
+là câu nói trực tiếp của người giáo viên. Điều này áp dụng cả với phần mẹo
+TOPIK: không viết "hãy chọn đáp án có chứa..." hay bất kỳ câu mệnh lệnh
+bảo "chọn"/"chú ý chọn" nào — hãy nói dưới dạng nhận xét ("đáp án đúng
+thường chứa...") thay vì ra lệnh.
 
 DANH SÁCH TỪ VỰNG:
 {vocab_lines}

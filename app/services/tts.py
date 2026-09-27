@@ -137,6 +137,20 @@ def _synthesize_chunk_pcm(client: genai.Client, text: str, config: dict, models_
                     "Thử lại vào ngày mai, hoặc bật billing (pay-as-you-go) cho API key trong "
                     "Google AI Studio / Google Cloud Console để tăng hạn mức."
                 ) from exc
+            if exc.code == 400 and "tried to generate text" in (exc.message or ""):
+                # Content-shape rejection, not a transient failure: some
+                # phrasing in this particular chunk (imperative/exam-style
+                # wording like "hãy chọn đáp án...") reads to the TTS model
+                # like a task to perform rather than a transcript to voice.
+                # Confirmed in production against a TOPIK-tip sentence
+                # phrased as a command; build_podcast_prompt now steers the
+                # script generator away from that phrasing, but since each
+                # retry regenerates a fresh script, retrying can still help.
+                raise RuntimeError(
+                    "Một đoạn trong kịch bản bị Gemini hiểu nhầm là câu lệnh thay vì lời thoại cần "
+                    "đọc (thường do câu mẹo TOPIK viết theo kiểu ra lệnh). Thử lại để kịch bản được "
+                    "viết lại theo cách diễn đạt khác."
+                ) from exc
             raise RuntimeError(
                 f"Gemini TTS tạm thời gặp lỗi ({exc.code} {exc.status or 'unknown'}), thử lại sau ít phút."
             ) from exc
