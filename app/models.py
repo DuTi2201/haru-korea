@@ -127,17 +127,49 @@ class LectureAudio(Base):
 
 
 # ------------------------------------------------------------------ corpus --
-class CorpusItem(Base):
-    __tablename__ = "corpus_item"
+class Film(Base):
+    """SRS §5 FILM — the registry a subtitle upload is filed under. Named
+    by the admin at upload time (not AI-derived), so unlike everything
+    else this module writes, a row here is created immediately rather
+    than staged through import_item/review (SDD's "khu chờ duyệt" rule
+    protects against hallucinated *content*, not an admin-typed title).
+    """
+
+    __tablename__ = "film"
     __table_args__ = {"schema": "corpus"}
 
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(255), unique=True)
+
+
+class CorpusItem(Base):
+    """SRS §5 CORPUS_ITEM. `film_id`/`topic_ids` stay bare ids with no
+    physical FK to `content` (cross-schema — SDD principle: modules never
+    JOIN/FK across schema boundaries); `film_id` DOES get a real FK since
+    both tables live in `corpus`. `grammar_point_ids` is the
+    `CORPUS_ITEM }o--o{ GRAMMAR_POINT : dùng` relationship from the SRS
+    ER diagram — present in the diagram but not in the SDD's DDL snippet,
+    so it's added here the same bare-array way as `topic_ids`.
+    Deliberately has NO `import_item_id` (SRS's "Nguồn dữ liệu" convention
+    only lists it for từ/ngữ pháp/bài đọc, not câu) — see ingest.py's
+    corpus rollback note for what that means for undo.
+    """
+
+    __tablename__ = "corpus_item"
+    __table_args__ = (
+        UniqueConstraint("film_id", "source_ref", name="uq_corpus_item_film_source_ref"),
+        {"schema": "corpus"},
+    )
+
     id: Mapped[uuid.UUID] = _uuid_pk()
-    film_id: Mapped[str] = mapped_column(String(64))
+    film_id: Mapped[int] = mapped_column(ForeignKey("corpus.film.id", ondelete="CASCADE"), index=True)
     text_ko: Mapped[str] = mapped_column(Text)
-    kind: Mapped[str] = mapped_column(String(32))
-    level: Mapped[str] = mapped_column(String(16))
-    register: Mapped[str] = mapped_column(String(32))
-    topic_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer))
+    kind: Mapped[str] = mapped_column(Enum("câu", "cụm từ", "mẫu ngữ pháp", name="corpus_item_kind"))
+    level: Mapped[int] = mapped_column(SmallInteger)
+    register: Mapped[str] = mapped_column(Enum("존댓말", "반말", "hỗn hợp", name="corpus_item_register"))
+    source_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    topic_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
+    grammar_point_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
     embedding = mapped_column(Vector(768), nullable=True)
 
 
@@ -256,31 +288,101 @@ class ExamItemTag(Base):
     source: Mapped[str] = mapped_column(String(32))
 
 
-# ----------------------------------------------------------------- practice --
+# --------------------------------------------------------- content: lessons --
+# SRS §5: LESSON, TOPIC, VOCAB_ITEM, GRAMMAR_POINT — all lesson-scoped,
+# all in `content` (same schema as the exam_* tables above), field lists
+# transcribed verbatim from the SRS ER diagram (pages 12-14).
+class Topic(Base):
+    __tablename__ = "topic"
+    __table_args__ = {"schema": "content"}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    quizlet_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+
+class Lesson(Base):
+    __tablename__ = "lesson"
+    __table_args__ = {"schema": "content"}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(255))
+    level: Mapped[int] = mapped_column(SmallInteger)  # 1-6, TOPIK-tương ứng, ước lượng — not an exam score
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    quizlet_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    import_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LessonTopic(Base):
+    """LESSON }o--o{ TOPIC : thuộc — real FK join table (both sides are
+    same-schema `content`, unlike corpus_item's bare topic_ids array,
+    which crosses into `corpus`)."""
+
+    __tablename__ = "lesson_topic"
+    __table_args__ = {"schema": "content"}
+
+    lesson_id: Mapped[int] = mapped_column(
+        ForeignKey("content.lesson.id", ondelete="CASCADE"), primary_key=True
+    )
+    topic_id: Mapped[int] = mapped_column(
+        ForeignKey("content.topic.id", ondelete="CASCADE"), primary_key=True
+    )
+
+
 class VocabItem(Base):
     __tablename__ = "vocab_item"
+    __table_args__ = {"schema": "content"}
 
-    id: Mapped[uuid.UUID] = _uuid_pk()
-    learner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"))
-    term_ko: Mapped[str] = mapped_column(String(120))
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lesson_id: Mapped[int] = mapped_column(ForeignKey("content.lesson.id", ondelete="CASCADE"), index=True)
+    hangul: Mapped[str] = mapped_column(String(120))
+    pos: Mapped[str | None] = mapped_column(String(32), nullable=True)
     meaning_vi: Mapped[str] = mapped_column(String(255))
-    topic_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    level: Mapped[str] = mapped_column(String(16))
+    definition_ko: Mapped[str | None] = mapped_column(Text, nullable=True)
+    level: Mapped[int] = mapped_column(SmallInteger)
+    hanja: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sino_vietnamese: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    example_ko: Mapped[str | None] = mapped_column(Text, nullable=True)
+    import_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
+class GrammarPoint(Base):
+    __tablename__ = "grammar_point"
+    __table_args__ = {"schema": "content"}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lesson_id: Mapped[int] = mapped_column(ForeignKey("content.lesson.id", ondelete="CASCADE"), index=True)
+    pattern: Mapped[str] = mapped_column(String(255))  # V/A + hình thái, vd "V + -(으)ㄹ 뿐만 아니라"
+    meaning_vi: Mapped[str] = mapped_column(String(255))
+    level: Mapped[int] = mapped_column(SmallInteger)
+    example_ko: Mapped[str | None] = mapped_column(Text, nullable=True)
+    import_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
+# ----------------------------------------------------------------- practice --
 class ItemState(Base):
-    """Spaced-repetition state (SM-2-style) per vocab item per learner."""
+    """SRS §5 ITEM_STATE — a single decay-style `strength` per learner
+    per (vocab_item|grammar_point), nudged by quick in-app checks; NOT a
+    full SM-2 state machine (no srs_stage/ease/next_review_at — those
+    were this scaffold's own pre-SRS guess, dropped now that the spec is
+    in hand). `item_id` is a bare id (polymorphic across two `content`
+    tables), so — same as corpus_item.topic_ids — no physical FK.
+    """
 
     __tablename__ = "item_state"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    learner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"))
-    vocab_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("vocab_item.id"))
-    srs_stage: Mapped[int] = mapped_column(Integer, default=0)
-    next_review_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    ease: Mapped[float] = mapped_column(Float, default=2.5)
+    learner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"), index=True)
+    item_type: Mapped[str] = mapped_column(Enum("vocab_item", "grammar_point", name="item_state_type"))
+    item_id: Mapped[int] = mapped_column(Integer)
+    strength: Mapped[float] = mapped_column(Float, default=0.0)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    __table_args__ = (UniqueConstraint("learner_id", "vocab_item_id", name="uq_item_state_learner_item"),)
+    __table_args__ = (
+        UniqueConstraint("learner_id", "item_type", "item_id", name="uq_item_state_learner_item"),
+    )
 
 
 class ErrorLog(Base):
@@ -367,7 +469,16 @@ class ImportBatch(Base):
         default="queued",
     )
     flagged_count: Mapped[int] = mapped_column(Integer, default=0)
+    source_file: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Bare id, no FK — only meaningful for kind="corpus"; crosses into
+    # `corpus` schema, same bare-id convention as corpus_item.topic_ids.
+    film_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("kind", "file_hash", name="uq_import_batch_kind_file_hash"),
+    )
 
 
 class ImportItem(Base):

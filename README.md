@@ -51,6 +51,11 @@ the environment level):
 | `CORS_ORIGIN_REGEX` | `^https://.*\.lovable\.app$` (covers every preview subdomain) |
 | `JWT_SECRET` | a long random string |
 | `GEMINI_API_KEY` | server-side only, never exposed to the client |
+| `GEMINI_MODEL_LESSON_INGEST` | optional, defaults to `gemini-3.5-flash-lite` |
+| `GEMINI_MODEL_CORPUS_INGEST` | optional, defaults to `gemini-3.5-flash-lite` |
+| `GEMINI_EMBEDDING_MODEL` | optional, defaults to `gemini-embedding-2` |
+| `MAX_INGEST_FILE_MB` | optional, defaults to `20` — caps a single Studio upload |
+| `CORPUS_CHUNK_SIZE` | optional, defaults to `40` — subtitle cues per Gemini call |
 
 After first deploy of `api`, run the migration once (Railway's one-off
 command / shell, or a Release Command on the service):
@@ -73,12 +78,33 @@ alembic upgrade head   # first time, or after a schema change
 
 Real and tested: auth (signup/login/JWT/roles), the generic `jobs`
 read+SSE endpoints, the full `generate_lecture_audio` job end-to-end,
-the writing-submission state machine's shape, the import/review-queue
-shape, problem+json error responses, CORS for the Lovable origin.
+the writing-submission state machine's shape, problem+json error
+responses, CORS for the Lovable origin, and — as of this pass — the full
+lesson (image/PDF) and film-subtitle (corpus) ingestion pipeline:
+`POST /api/v1/imports` (multipart upload, kind=lesson|corpus) → Gemini
+extraction/classification (Celery) → `GET .../items` + `PATCH .../items/
+{id}` review queue → `POST .../confirm` (Celery, writes content.lesson/
+vocab_item/grammar_point or corpus.corpus_item+embedding) → `POST
+.../rollback` (lesson: full undo via import_item_id lineage; corpus:
+only before confirm — see `CorpusItem`'s docstring in `app/models.py`
+for why). Verified end-to-end against a local Postgres+pgvector+Redis
+with the Gemini calls mocked (real network calls need a live API key,
+which this sandbox doesn't have) — see the two ingestion Pydantic
+extraction schemas and prompts in `app/services/ingestion.py`.
+
+File uploads are base64'd straight through the Celery/Redis message
+(no object storage provisioned yet) — fine for admin-tool volumes, capped
+by `MAX_INGEST_FILE_MB`; swap for real object storage if that stops
+being true. Subtitle files are classified in fixed-size chunks
+(`CORPUS_CHUNK_SIZE`) specifically so each Gemini call's prompt stays a
+constant size regardless of film length (FR-19 / Gate G6's "kích thước
+prompt không phình theo độ dài kịch bản").
 
 Stubbed (`TODO` in code, intentionally — this is a first scaffold, not
-the finished app): real Gemini prompts for every module, ffmpeg audio
-transcoding (currently a `sleep`), Storage integration for
-photo/audio uploads (image_key/opus_path are placeholder strings), the
-3-pass exam-ingestion pipeline, SRS scheduling logic, AI cost logging /
-admin usage dashboard, and per-learner daily AI quota enforcement.
+the finished app): ffmpeg audio transcoding (currently a `sleep`),
+Storage integration for writing-submission photo/audio uploads
+(image_key/opus_path are placeholder strings — the lesson/corpus
+ingestion above solved this differently, see above), the 3-pass
+exam-ingestion pipeline (kind=exam_paper isn't handled by `POST /imports`
+yet), SRS scheduling logic, AI cost logging / admin usage dashboard, and
+per-learner daily AI quota enforcement.

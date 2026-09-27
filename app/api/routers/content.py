@@ -6,11 +6,12 @@ each grows past a handful of routes.
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_profile
 from app.db import get_db
-from app.models import Profile
+from app.models import Profile, Topic
 from app.schemas import ProfileOut
 
 router = APIRouter(tags=["content"])
@@ -18,8 +19,9 @@ router = APIRouter(tags=["content"])
 
 @router.get("/topics")
 async def list_topics(db: Annotated[AsyncSession, Depends(get_db)]):
-    # TODO: query content.topic once that table/module is built.
-    return []
+    result = await db.execute(select(Topic).order_by(Topic.name))
+    topics = result.scalars().all()
+    return [{"id": t.id, "name": t.name, "quizlet_url": t.quizlet_url} for t in topics]
 
 
 @router.get("/me/plan")

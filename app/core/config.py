@@ -40,8 +40,22 @@ class Settings(BaseSettings):
     JWT_ACCESS_TTL_MIN: int = 60
     JWT_REFRESH_TTL_DAYS: int = 30
 
-    # Gemini
+    # Gemini — model choice is config, not hard-coded (SDD §5 principle 6);
+    # override per-env on Railway if a cheaper/newer model becomes the
+    # better fit. Flash-Lite for both ingestion jobs: high volume, well-
+    # constrained JSON schema, no need for Pro-tier reasoning.
     GEMINI_API_KEY: str = ""
+    GEMINI_MODEL_LESSON_INGEST: str = "gemini-3.5-flash-lite"
+    GEMINI_MODEL_CORPUS_INGEST: str = "gemini-3.5-flash-lite"
+    GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-2"
+
+    # Content-ingestion tuning (Studio uploads — admin.py/ingest.py)
+    MAX_INGEST_FILE_MB: int = 20
+    # Cues per Gemini call when classifying a subtitle file — the knob
+    # that keeps FR-19/Gate-G6's "prompt size không phình theo độ dài
+    # kịch bản" true: each call's prompt is this many cues, however long
+    # the film is; a longer film means more calls, never a bigger prompt.
+    CORPUS_CHUNK_SIZE: int = 40
 
     # Rate limiting (Postgres-table equivalent of the SDD's Redis quota)
     AI_DAILY_JOB_LIMIT: int = 200

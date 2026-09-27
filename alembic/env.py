@@ -34,7 +34,11 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        # include_schemas=True: several modules (audio/content/corpus/
+        # analytics) live outside "public" — without this, autogenerate
+        # can't see them on the DB side and reports every table in them
+        # as a false "added" diff on every run.
+        context.configure(connection=connection, target_metadata=target_metadata, include_schemas=True)
         with context.begin_transaction():
             context.run_migrations()
 

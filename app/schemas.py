@@ -116,9 +116,23 @@ class ImportBatchOut(BaseModel):
     kind: str
     status: str
     flagged_count: int
+    source_file: str | None
+    film_id: int | None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ImportBatchAccepted(BaseModel):
+    """POST /imports's 202 envelope: same job_id/poll_url/events_url shape
+    as JobAccepted, plus the batch id — the caller needs it immediately
+    (to list/patch/confirm items) and can't wait for the job to finish."""
+
+    import_batch_id: uuid.UUID
+    job_id: uuid.UUID
+    status: JobStatus = "queued"
+    poll_url: str
+    events_url: str
 
 
 class ImportItemOut(BaseModel):
