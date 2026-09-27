@@ -4,7 +4,7 @@ corpus (listening sentences), progress (item-state check-ins), curriculum
 for the scaffold; split into content.py/curriculum.py/practice.py once
 each grows past a handful of routes.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
@@ -13,7 +13,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import _problem, get_current_profile
 from app.db import get_db
-from app.models import CorpusItem, Film, GrammarPoint, ItemState, Lesson, LessonTopic, Profile, Topic, VocabItem
+from app.models import (
+    CorpusItem,
+    EditorialArticle,
+    EditorialOutlineSubmission,
+    Film,
+    GrammarPoint,
+    ItemState,
+    Lesson,
+    LessonTopic,
+    Profile,
+    Topic,
+    VocabItem,
+)
 from app.schemas import (
     CorpusItemOut,
     GrammarPointOut,
@@ -21,6 +33,8 @@ from app.schemas import (
     ItemStateReviewRequest,
     LessonOut,
     ProfileOut,
+    TodayPlanOut,
+    TodayPlanTask,
     TopicOut,
     VocabItemOut,
 )
@@ -161,11 +175,134 @@ async def record_item_review(
     return state
 
 
-@router.get("/me/plan")
-async def get_my_plan(profile: Annotated[Profile, Depends(get_current_profile)]):
-    # TODO: derive today's plan from curriculum module once implemented;
-    # for now the Lovable /today screen can render its own mock plan.
-    return {"learner_id": str(profile.id), "tasks": []}
+@router.get("/me/plan", response_model=TodayPlanOut)
+async def get_my_plan(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile, Depends(get_current_profile)],
+):
+    """Real /today data — every field here comes from a query, never a
+    hardcoded placeholder. `streak_days`/`readiness_pct` are derived from
+    ItemState (the only per-learner history table that exists so far —
+    see its docstring), so a brand-new learner honestly gets 0/None
+    rather than fake numbers; the frontend renders that as a first-run
+    empty state instead of a lie. Each task is only included when there
+    is real content behind it (a lesson/corpus item/confirmed article
+    actually exists) and `status` is only ever "done"/"in_progress" when
+    that is something this endpoint can actually verify — no fabricated
+    checkmarks like the old Lovable mock had."""
+    states = (
+        (await db.execute(select(ItemState).where(ItemState.learner_id == profile.id))).scalars().all()
+    )
+    today = datetime.now(timezone.utc).date()
+
+    seen_dates = {s.last_seen.astimezone(timezone.utc).date() for s in states}
+    streak_days = 0
+    cursor = today if today in seen_dates else today - timedelta(days=1)
+    while cursor in seen_dates:
+        streak_days += 1
+        cursor -= timedelta(days=1)
+
+    readiness_pct = round(sum(s.strength for s in states) / len(states) * 100, 1) if states else None
+
+    tasks: list[TodayPlanTask] = []
+
+    # -- vocab/grammar review: reuse get_lesson("today")'s own "earliest
+    # confirmed lesson" heuristic so this never drifts from what /lesson/
+    # today itself resolves to.
+    lesson = (await db.execute(select(Lesson).order_by(Lesson.id).limit(1))).scalars().first()
+    if lesson is not None:
+        vocab_ids = [
+            v_id
+            for (v_id,) in (
+                await db.execute(select(VocabItem.id).where(VocabItem.lesson_id == lesson.id))
+            ).all()
+        ]
+        grammar_ids = [
+            g_id
+            for (g_id,) in (
+                await db.execute(select(GrammarPoint.id).where(GrammarPoint.lesson_id == lesson.id))
+            ).all()
+        ]
+        total = len(vocab_ids) + len(grammar_ids)
+        if total > 0:
+            reviewed_today = sum(
+                1
+                for s in states
+                if s.last_seen.astimezone(timezone.utc).date() == today
+                and (
+                    (s.item_type == "vocab_item" and s.item_id in vocab_ids)
+                    or (s.item_type == "grammar_point" and s.item_id in grammar_ids)
+                )
+            )
+            status_ = "done" if reviewed_today >= total else ("in_progress" if reviewed_today > 0 else "todo")
+            tasks.append(
+                TodayPlanTask(
+                    kind="vocab_review",
+                    title=lesson.title,
+                    subtitle=f"{total} từ/ngữ pháp"
+                    + (f" · đã ôn {reviewed_today}/{total} hôm nay" if reviewed_today else ""),
+                    status=status_,
+                    lesson_id=lesson.id,
+                )
+            )
+
+    # -- listening: no per-item completion is tracked yet for corpus
+    # items (only lesson vocab/grammar go through /progress/reviews), so
+    # this is honestly always "todo" rather than a faked checkmark.
+    corpus_count = (
+        await db.execute(select(func.count()).select_from(CorpusItem).where(CorpusItem.kind == "câu"))
+    ).scalar_one()
+    if corpus_count > 0:
+        tasks.append(
+            TodayPlanTask(
+                kind="listening",
+                title="Luyện nghe câu mẫu từ phim",
+                subtitle=f"{corpus_count} câu có sẵn, giọng đọc Gemini chuẩn Seoul",
+                status="todo",
+            )
+        )
+
+    # -- reading: most recently created *confirmed* article (body_ko set
+    # by apply_editorial_batch, so this only ever surfaces something a
+    # human has actually reviewed and confirmed).
+    article = (
+        (
+            await db.execute(
+                select(EditorialArticle)
+                .where(EditorialArticle.body_ko.isnot(None))
+                .order_by(EditorialArticle.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if article is not None:
+        submission = (
+            await db.execute(
+                select(EditorialOutlineSubmission).where(
+                    EditorialOutlineSubmission.learner_id == profile.id,
+                    EditorialOutlineSubmission.editorial_article_id == article.id,
+                )
+            )
+        ).scalar_one_or_none()
+        tasks.append(
+            TodayPlanTask(
+                kind="reading",
+                title=article.title_ko or article.source_name,
+                subtitle="Đọc xã luận · luyện dàn ý câu 54",
+                status="done" if submission and submission.revision_count > 0 else "todo",
+                article_id=article.id,
+            )
+        )
+
+    return TodayPlanOut(
+        streak_days=streak_days,
+        readiness_pct=readiness_pct,
+        goal=profile.goal,
+        exam_date=profile.exam_date,
+        tasks=tasks,
+    )
 
 
 @router.patch("/me/goal", response_model=ProfileOut)

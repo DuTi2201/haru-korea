@@ -199,6 +199,28 @@ class ItemStateOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class TodayPlanTask(BaseModel):
+    """One real, clickable suggestion for /me/plan — never a fabricated
+    stat. `status` is only ever computed from data that actually exists;
+    a task whose progress genuinely isn't tracked yet (e.g. listening)
+    always reports "todo" rather than faking a checkmark."""
+
+    kind: Literal["vocab_review", "listening", "reading"]
+    title: str
+    subtitle: str
+    status: Literal["todo", "in_progress", "done"]
+    lesson_id: int | None = None
+    article_id: uuid.UUID | None = None
+
+
+class TodayPlanOut(BaseModel):
+    streak_days: int
+    readiness_pct: float | None
+    goal: str | None
+    exam_date: datetime | None
+    tasks: list[TodayPlanTask]
+
+
 # ------------------------------------------------------------------- ingest --
 class ImportBatchOut(BaseModel):
     id: uuid.UUID
