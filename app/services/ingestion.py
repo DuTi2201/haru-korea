@@ -17,8 +17,12 @@ import hashlib
 import json
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Literal
 
+import feedparser
+import httpx
+from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -28,6 +32,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models import (
     CorpusItem,
+    EditorialArticle,
+    EditorialCandidate,
+    EditorialSource,
     ExamItem,
     ExamPaper,
     ExamPassage,
@@ -194,6 +201,85 @@ EXAM_SCHEMA: dict[str, Any] = {
 }
 
 
+# Editorial reading (사설/칼럼 luyện đọc + luyện dàn ý cho TOPIK viết câu 54):
+# one call per article. body_ko is the admin-reviewable staged text (see
+# ingest.py's module docstring on "staged, human confirms") — the model
+# reads it as-is, warts (stray scraped nav/ad lines) and all.
+EDITORIAL_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "level_estimate": {
+            "type": "INTEGER",
+            "description": "1-6, ước lượng theo cấp TOPIK tương ứng với độ khó bài viết",
+        },
+        "topic_tags": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "description": "2-4 chủ đề ngắn gọn bằng tiếng Việt, vd 'già hóa dân số', 'AI', 'môi trường', 'giáo dục'",
+        },
+        "vocab": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "hangul": {"type": "STRING"},
+                    "pos": {"type": "STRING", "nullable": True, "description": "từ loại, vd 동사/명사/형용사"},
+                    "meaning_vi": {"type": "STRING"},
+                    "definition_ko": {"type": "STRING", "nullable": True},
+                    "level": {"type": "INTEGER"},
+                    "hanja": {"type": "STRING", "nullable": True},
+                    "sino_vietnamese": {"type": "STRING", "nullable": True, "description": "âm Hán Việt nếu có"},
+                    "example_ko": {"type": "STRING", "nullable": True},
+                    "confidence": {"type": "NUMBER"},
+                },
+                "required": ["hangul", "meaning_vi", "level", "confidence"],
+            },
+        },
+        "grammar": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "pattern": {"type": "STRING", "description": "Mẫu ngữ pháp dạng V/A + hình thái"},
+                    "meaning_vi": {"type": "STRING"},
+                    "level": {"type": "INTEGER"},
+                    "example_ko": {"type": "STRING", "nullable": True},
+                    "confidence": {"type": "NUMBER"},
+                },
+                "required": ["pattern", "meaning_vi", "level", "confidence"],
+            },
+        },
+        "model_outline": {
+            "type": "OBJECT",
+            "properties": {
+                "phenomenon": {"type": "STRING", "description": "Đoạn hiện tượng (현상), viết bằng tiếng Hàn"},
+                "cause": {"type": "STRING", "description": "Đoạn nguyên nhân (원인), tiếng Hàn"},
+                "consequence": {"type": "STRING", "description": "Đoạn kết quả/ảnh hưởng (결과), tiếng Hàn"},
+                "solution": {"type": "STRING", "description": "Đoạn giải pháp/kiến nghị (해결 방안), tiếng Hàn"},
+            },
+            "required": ["phenomenon", "cause", "consequence", "solution"],
+        },
+        "thinking_guide_text": {
+            "type": "STRING",
+            "description": (
+                "3-5 câu hỏi gợi mở bằng tiếng Việt giúp người học tự suy nghĩ trước khi viết dàn ý, "
+                "không tiết lộ nội dung dàn ý mẫu"
+            ),
+        },
+        "confidence": {"type": "NUMBER"},
+    },
+    "required": [
+        "level_estimate",
+        "topic_tags",
+        "vocab",
+        "grammar",
+        "model_outline",
+        "thinking_guide_text",
+        "confidence",
+    ],
+}
+
+
 class VocabExtraction(BaseModel):
     hangul: str
     pos: str | None = None
@@ -262,6 +348,25 @@ class ExamItemExtraction(BaseModel):
 class ExamExtraction(BaseModel):
     passages: list[ExamPassageExtraction] = Field(default_factory=list)
     items: list[ExamItemExtraction] = Field(default_factory=list)
+
+
+class ModelOutline(BaseModel):
+    phenomenon: str
+    cause: str
+    consequence: str
+    solution: str
+
+
+class EditorialExtraction(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    level_estimate: int = Field(ge=1, le=6)
+    topic_tags: list[str] = Field(default_factory=list)
+    vocab: list[VocabExtraction] = Field(default_factory=list)
+    grammar: list[GrammarExtraction] = Field(default_factory=list)
+    model_outline: ModelOutline
+    thinking_guide_text: str
+    confidence: float = Field(ge=0, le=1, default=0.5)
 
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -561,6 +666,157 @@ def run_lesson_extraction(db: Session, batch: ImportBatch, file_bytes: bytes, mi
     return staged, flagged
 
 
+_ARTICLE_FETCH_TIMEOUT = 15.0
+_ARTICLE_MAX_BODY_CHARS = 20000
+_ARTICLE_USER_AGENT = "Mozilla/5.0 (compatible; HaruBot/1.0; +family-use-only, not for redistribution)"
+
+
+def fetch_article_text(url: str) -> tuple[str, str | None]:
+    """Fetches one editorial/column page and strips it to plain text —
+    script/style/nav/footer/ad-ish tags removed, whitespace collapsed,
+    truncated to _ARTICLE_MAX_BODY_CHARS (a TOPIK 쓰기 54 사설 is a few
+    hundred words; this only guards against an unexpectedly huge page).
+    Returns (body_ko, parsed_title) — parsed_title is a fallback only,
+    used when the admin/candidate didn't already supply one. Deliberately
+    NOT written straight onto EditorialArticle: it becomes part of a
+    staged `editorial_meta` ImportItem instead, so an admin can review —
+    and hand-fix a messy scrape — before it ever reaches a learner (same
+    "staged, human confirms" principle as everything else here)."""
+    resp = httpx.get(
+        url,
+        timeout=_ARTICLE_FETCH_TIMEOUT,
+        follow_redirects=True,
+        headers={"User-Agent": _ARTICLE_USER_AGENT},
+    )
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript"]):
+        tag.decompose()
+
+    title: str | None = None
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if og_title and og_title.get("content"):
+        title = og_title["content"].strip()
+
+    # get_text() on the whole document would also pick up <title>/<meta>
+    # text sitting in <head> — read from <body> alone so that never leaks
+    # into the article body.
+    root = soup.body or soup
+    lines = [ln.strip() for ln in root.get_text("\n").splitlines()]
+    body = "\n".join(ln for ln in lines if ln)
+    return body[:_ARTICLE_MAX_BODY_CHARS], title
+
+
+def build_editorial_prompt(body_ko: str) -> str:
+    return f"""Bạn là biên tập viên nội dung luyện đọc xã luận/chuyên mục báo tiếng
+Hàn cho người Việt học tiếng Hàn trình độ trung-cao cấp (TOPIK II), đang
+chuẩn bị cho câu 54 phần viết (bài luận theo cấu trúc hiện tượng – nguyên
+nhân – kết quả – giải pháp).
+
+Văn bản dưới đây được lấy tự động từ một trang báo nên có thể còn lẫn vài
+dòng menu/quảng cáo/liên quan khác — hãy bỏ qua các dòng đó, chỉ tập trung
+vào nội dung bài xã luận/chuyên mục chính.
+
+Đọc bài viết và:
+1. Ước lượng cấp độ TOPIK (1-6) và đề xuất 2-4 chủ đề ngắn gọn bằng tiếng Việt.
+2. Trích xuất từ vựng và mẫu ngữ pháp đáng học (cùng tiêu chí như trích xuất
+   bài học thông thường: nghĩa tiếng Việt, định nghĩa tiếng Hàn ngắn gọn nếu
+   có, Hán tự/âm Hán Việt nếu là từ Hán Hàn, câu ví dụ).
+3. Viết MỘT dàn ý mẫu bằng tiếng Hàn theo đúng cấu trúc 4 phần của câu 54:
+   hiện tượng, nguyên nhân, kết quả/ảnh hưởng, giải pháp/kiến nghị — mỗi
+   phần 2-4 câu, lấy cảm hứng từ chủ đề bài xã luận này (không cần bám sát
+   từng câu chữ gốc).
+4. Viết 3-5 câu hỏi gợi mở bằng tiếng Việt để người học tự suy nghĩ TRƯỚC
+   khi xem dàn ý mẫu — gợi mở tư duy, không tiết lộ nội dung dàn ý.
+
+Trả về đúng JSON schema đã cho, không thêm giải thích. Tự đánh giá độ tự tin
+(confidence, 0-1) cho toàn bộ kết quả.
+
+Bài viết:
+{body_ko}"""
+
+
+def extract_editorial(body_ko: str) -> EditorialExtraction:
+    result = gemini_client.generate_structured(
+        model=settings.GEMINI_MODEL_LESSON_INGEST,
+        prompt=build_editorial_prompt(body_ko),
+        response_schema=EDITORIAL_SCHEMA,
+        prompt_version="editorial-v1",
+    )
+    return EditorialExtraction.model_validate(_parse_json(result["text"]))
+
+
+def run_editorial_extraction(
+    db: Session, batch: ImportBatch, body_ko: str, title_ko: str | None
+) -> tuple[int, int]:
+    """Stages the fetched body + Gemini's classification as one
+    kind="editorial_meta" ImportItem (body_ko included, so an admin can
+    review/edit the scraped text before confirm — see fetch_article_text),
+    plus one kind="vocab_item"/"grammar_point" ImportItem per extracted
+    word/pattern (lesson_id left null at confirm time — see
+    apply_editorial_batch). Returns (staged_count, flagged_count)."""
+    extraction = extract_editorial(body_ko)
+    staged = 0
+    flagged = 0
+
+    meta_status = confidence_status(extraction.confidence)
+    if meta_status != "pending":
+        flagged += 1
+    db.add(
+        ImportItem(
+            import_batch_id=batch.id,
+            kind="editorial_meta",
+            status=meta_status,
+            confidence=extraction.confidence,
+            payload={
+                "body_ko": body_ko,
+                "title_ko": title_ko,
+                "level_estimate": extraction.level_estimate,
+                "topic_tags": extraction.topic_tags,
+                "model_outline": extraction.model_outline.model_dump(),
+                "thinking_guide_text": extraction.thinking_guide_text,
+            },
+        )
+    )
+    staged += 1
+
+    for v in extraction.vocab:
+        status = confidence_status(v.confidence)
+        if status != "pending":
+            flagged += 1
+        db.add(
+            ImportItem(
+                import_batch_id=batch.id,
+                kind="vocab_item",
+                status=status,
+                confidence=v.confidence,
+                payload=v.model_dump(exclude={"confidence"}),
+            )
+        )
+        staged += 1
+
+    for g in extraction.grammar:
+        status = confidence_status(g.confidence)
+        if status != "pending":
+            flagged += 1
+        db.add(
+            ImportItem(
+                import_batch_id=batch.id,
+                kind="grammar_point",
+                status=status,
+                confidence=g.confidence,
+                payload=g.model_dump(exclude={"confidence"}),
+            )
+        )
+        staged += 1
+
+    db.flush()
+    return staged, flagged
+
+
 # ================================================================ confirm ==
 _VOCAB_FIELDS = {"hangul", "pos", "meaning_vi", "definition_ko", "level", "hanja", "sino_vietnamese", "example_ko"}
 _GRAMMAR_FIELDS = {"pattern", "meaning_vi", "level", "example_ko"}
@@ -765,6 +1021,62 @@ def apply_exam_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
     return {"applied": applied, "exam_paper_id": str(batch.exam_paper_id)}
 
 
+def apply_editorial_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
+    """Writes a confirmed `editorial_meta` item's body/classification onto
+    the pre-created EditorialArticle row exactly once (import_item_id
+    guard, same idea as Lesson's content_hash dedup — see
+    find_or_create_editorial_article's docstring for why the row already
+    exists before this runs), and confirmed vocab/grammar proposals into
+    content.vocab_item/grammar_point with lesson_id=None, appending their
+    ids onto the article's own vocab_ids/grammar_ids bare arrays — no
+    cross-schema FK/JOIN, same module-boundary rule corpus_item's
+    topic_ids/grammar_point_ids already follow."""
+    if batch.editorial_article_id is None:
+        return {"applied": 0, "reason": "batch_has_no_editorial_article_id"}
+
+    article = db.get(EditorialArticle, batch.editorial_article_id)
+    if article is None:
+        return {"applied": 0, "reason": "editorial_article_not_found"}
+
+    items = db.execute(select(ImportItem).where(ImportItem.import_batch_id == batch.id)).scalars().all()
+    applied = 0
+
+    meta_item = next((i for i in items if i.kind == "editorial_meta" and i.status == "confirmed"), None)
+    if meta_item is not None and article.import_item_id is None:
+        payload = meta_item.payload
+        article.body_ko = payload["body_ko"]
+        article.title_ko = payload.get("title_ko") or article.title_ko
+        article.level_estimate = payload["level_estimate"]
+        article.topic_tags = payload.get("topic_tags", [])
+        article.model_outline = payload["model_outline"]
+        article.thinking_guide_text = payload["thinking_guide_text"]
+        article.import_item_id = meta_item.id
+        db.add(article)
+        applied += 1
+
+    for item in items:
+        if item.status != "confirmed" or item.kind not in ("vocab_item", "grammar_point"):
+            continue
+        model = VocabItem if item.kind == "vocab_item" else GrammarPoint
+        allowed_fields = _VOCAB_FIELDS if item.kind == "vocab_item" else _GRAMMAR_FIELDS
+        already = db.execute(select(model).where(model.import_item_id == item.id)).scalar_one_or_none()
+        if already is not None:
+            continue
+        payload = {k: v for k, v in item.payload.items() if k in allowed_fields}
+        row = model(lesson_id=None, import_item_id=item.id, **payload)
+        db.add(row)
+        db.flush()
+        if item.kind == "vocab_item":
+            article.vocab_ids = [*article.vocab_ids, row.id]
+        else:
+            article.grammar_ids = [*article.grammar_ids, row.id]
+        db.add(article)
+        applied += 1
+
+    db.flush()
+    return {"applied": applied, "editorial_article_id": str(article.id)}
+
+
 def apply_import_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
     if batch.kind == "lesson":
         outcome = apply_lesson_batch(db, batch)
@@ -772,6 +1084,8 @@ def apply_import_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
         outcome = apply_corpus_batch(db, batch)
     elif batch.kind == "exam_paper":
         outcome = apply_exam_batch(db, batch)
+    elif batch.kind == "editorial_article":
+        outcome = apply_editorial_batch(db, batch)
     else:
         outcome = {"applied": 0, "reason": f"confirm not implemented for kind={batch.kind!r}"}
 
@@ -828,6 +1142,31 @@ async def rollback_import_batch(db: AsyncSession, batch: ImportBatch) -> dict[st
             await db.execute(delete(ExamItem).where(ExamItem.import_item_id.in_(item_ids)))
         if passage_ids:
             await db.execute(delete(ExamPassage).where(ExamPassage.id.in_(passage_ids)))
+    elif batch.kind == "editorial_article":
+        # vocab_item/grammar_point carry import_item_id directly, same as
+        # lesson. EditorialArticle itself is immediate-creation (like
+        # Film/ExamPaper) and never gets deleted — only the enrichment
+        # this batch's `editorial_meta` item wrote gets reset back to
+        # null/empty, and only if THIS batch is the one that applied it
+        # (article.import_item_id guard, mirrors apply_editorial_batch's
+        # own idempotency check).
+        rows = await db.execute(select(ImportItem.id).where(ImportItem.import_batch_id == batch.id))
+        item_ids = [row[0] for row in rows.all()]
+        if item_ids:
+            for model in (VocabItem, GrammarPoint):
+                await db.execute(delete(model).where(model.import_item_id.in_(item_ids)))
+        if batch.editorial_article_id is not None:
+            article = await db.get(EditorialArticle, batch.editorial_article_id)
+            if article is not None and article.import_item_id in item_ids:
+                article.body_ko = None
+                article.level_estimate = None
+                article.topic_tags = []
+                article.vocab_ids = []
+                article.grammar_ids = []
+                article.model_outline = None
+                article.thinking_guide_text = None
+                article.import_item_id = None
+                db.add(article)
 
     batch.status = "rolled_back"
     db.add(batch)
@@ -867,3 +1206,127 @@ def find_or_create_exam_paper(
     db.add(paper)
     db.flush()
     return paper
+
+
+def find_or_create_editorial_article(
+    db: Session,
+    source_url: str,
+    source_name: str,
+    title_ko: str | None = None,
+    published_date: datetime | None = None,
+) -> EditorialArticle:
+    """Same immediate-creation timing as find_or_create_film/
+    find_or_create_exam_paper: source_url/source_name (and title_ko/
+    published_date, when already known — e.g. from an RSS candidate) are
+    admin/candidate-given, not AI-derived, so this row exists before
+    extraction runs. body_ko/level_estimate/topic_tags/model_outline stay
+    NULL until apply_editorial_batch fills them in at confirm time —
+    until then this row is just the stable id that
+    import_batch.editorial_article_id points at."""
+    source_url = source_url.strip()
+    existing = db.execute(
+        select(EditorialArticle).where(EditorialArticle.source_url == source_url)
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    article = EditorialArticle(
+        source_url=source_url,
+        source_name=source_name.strip(),
+        title_ko=title_ko.strip() if title_ko else None,
+        published_date=published_date,
+    )
+    db.add(article)
+    db.flush()
+    return article
+
+
+# ---------------------------------------------------- RSS auto-discovery ==
+# Phase 2 of the editorial proposal doc, implemented now per owner's
+# request: a periodic Celery-beat task pulls each registered source's
+# official RSS feed and keyword-filters it — NO Gemini call, no
+# publishing. Matching entries just become editorial_candidate rows
+# (status="new") for an admin to browse in Studio and pick from; only the
+# *search* step is automated (SDD: "nguồn staged, con người xác nhận").
+EDITORIAL_TOPIC_KEYWORDS: dict[str, list[str]] = {
+    "già hóa dân số": ["고령화", "저출산", "인구 감소", "인구절벽", "인구정책"],
+    "AI": ["인공지능", "생성형 AI", "챗GPT", " AI "],
+    "môi trường": ["환경", "기후변화", "탄소중립", "미세먼지", "온실가스"],
+    "giáo dục": ["교육", "입시", "사교육", "학교폭력", "대학수학능력"],
+}
+
+
+def classify_candidate_topics(text: str) -> list[str]:
+    """Plain keyword match, no AI — see module note above on what Phase 2
+    does and doesn't automate."""
+    matched = []
+    for tag, keywords in EDITORIAL_TOPIC_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            matched.append(tag)
+    return matched
+
+
+def discover_editorial_candidates_for_source(db: Session, source: EditorialSource) -> int:
+    """Fetches one EditorialSource's RSS feed, keeps only entries matching
+    a topic keyword, and upserts them into editorial_candidate (status=
+    "new"). ON CONFLICT DO NOTHING on source_url means re-seeing an entry
+    the feed still lists on a later poll is a no-op — in particular, a
+    candidate an admin already dismissed or ingested never gets silently
+    reset back to "new". Returns how many rows were newly inserted."""
+    if not source.rss_url:
+        return 0
+    parsed = feedparser.parse(source.rss_url)
+    inserted = 0
+    for entry in parsed.entries:
+        title = getattr(entry, "title", "").strip()
+        link = getattr(entry, "link", "").strip()
+        summary = getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
+        if not title or not link:
+            continue
+
+        topics = classify_candidate_topics(f"{title}\n{summary}")
+        if not topics:
+            continue
+
+        published_date = None
+        parsed_time = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+        if parsed_time:
+            published_date = datetime(*parsed_time[:6], tzinfo=timezone.utc)
+
+        stmt = (
+            pg_insert(EditorialCandidate)
+            .values(
+                source_name=source.name,
+                source_url=link,
+                title_ko=title,
+                snippet_ko=(summary.strip()[:500] or None),
+                topic_tags=topics,
+                published_date=published_date,
+                status="new",
+            )
+            .on_conflict_do_nothing(index_elements=["source_url"])
+        )
+        result = db.execute(stmt)
+        if result.rowcount:
+            inserted += 1
+
+    db.flush()
+    return inserted
+
+
+def discover_editorial_candidates(db: Session) -> dict[str, Any]:
+    """Runs discovery across every active registered source. One bad feed
+    (network error, malformed XML) is recorded in `errors` and does not
+    sink the rest of the run."""
+    sources = db.execute(select(EditorialSource).where(EditorialSource.active.is_(True))).scalars().all()
+    per_source: dict[str, int] = {}
+    errors: dict[str, str] = {}
+    total = 0
+    for source in sources:
+        try:
+            n = discover_editorial_candidates_for_source(db, source)
+        except Exception as exc:  # noqa: BLE001 — one feed's failure isn't fatal to the run
+            errors[source.name] = str(exc)[:200]
+            continue
+        per_source[source.name] = n
+        total += n
+    return {"total_inserted": total, "per_source": per_source, "errors": errors}

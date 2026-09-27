@@ -18,6 +18,7 @@ import base64
 import hashlib
 import mimetypes
 import uuid
+from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Form, Query, UploadFile, status
@@ -33,6 +34,7 @@ from app.services import ingestion
 from app.workers.tasks import (
     apply_import_batch_task,
     extract_corpus_import,
+    extract_editorial_import,
     extract_exam_paper_import,
     extract_lesson_import,
 )
@@ -45,21 +47,110 @@ _LESSON_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"
 _MAX_BYTES = settings.MAX_INGEST_FILE_MB * 1024 * 1024
 
 
+async def start_editorial_import(
+    db: AsyncSession,
+    profile: Profile,
+    source_url: str,
+    source_name: str,
+    title_ko: str | None,
+    published_date: datetime | None = None,
+) -> ImportBatchAccepted:
+    """Shared by POST /imports?kind=editorial_article (admin types a URL
+    directly) and POST /editorial-candidates/{id}/ingest (admin picks one
+    of the RSS-discovered candidates instead — see app/api/routers/
+    editorial.py). No file to hash here, so `source_url` itself is the
+    dedup identity, same slot `file_hash` fills for the other three kinds:
+    resubmitting the same URL reuses the existing batch/job instead of
+    firing a second Gemini extraction."""
+    source_url = source_url.strip()
+    file_hash = hashlib.sha256(source_url.encode("utf-8")).hexdigest()
+    idempotency_key = f"editorial_article:{file_hash}"
+
+    existing_batch = await db.execute(
+        select(ImportBatch).where(ImportBatch.kind == "editorial_article", ImportBatch.file_hash == file_hash)
+    )
+    batch = existing_batch.scalar_one_or_none()
+    if batch is None:
+        batch = ImportBatch(
+            kind="editorial_article",
+            owner_id=profile.id,
+            status="queued",
+            source_file=source_url,
+            file_hash=file_hash,
+        )
+        db.add(batch)
+        await db.commit()
+        await db.refresh(batch)
+
+    existing_job = await db.execute(
+        select(Job).where(
+            Job.type == "extract_import_editorial_article",
+            Job.idempotency_key == idempotency_key,
+            Job.status.in_(["queued", "running", "succeeded"]),
+        )
+    )
+    job = existing_job.scalar_one_or_none()
+
+    if job is None:
+        job = Job(
+            type="extract_import_editorial_article",
+            owner_id=profile.id,
+            idempotency_key=idempotency_key,
+            status="queued",
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+        extract_editorial_import.delay(
+            str(job.id),
+            str(batch.id),
+            source_url,
+            source_name,
+            title_ko,
+            published_date.isoformat() if published_date else None,
+        )
+
+    return ImportBatchAccepted(
+        import_batch_id=batch.id,
+        job_id=job.id,
+        status=job.status,
+        poll_url=f"/api/v1/jobs/{job.id}",
+        events_url=f"/api/v1/jobs/{job.id}/events",
+    )
+
+
 @router.post("", response_model=ImportBatchAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def create_import_batch(
     db: Annotated[AsyncSession, Depends(get_db)],
     profile: Annotated[Profile, Depends(_editor_or_admin)],
-    file: UploadFile,
-    kind: Annotated[Literal["lesson", "corpus", "exam_paper"], Form()],
+    kind: Annotated[Literal["lesson", "corpus", "exam_paper", "editorial_article"], Form()],
+    file: UploadFile | None = None,
     film_title: Annotated[str | None, Form()] = None,
     exam_kind: Annotated[str | None, Form()] = None,
     session_label: Annotated[str | None, Form()] = None,
+    source_url: Annotated[str | None, Form()] = None,
+    source_name: Annotated[str | None, Form()] = None,
+    title_ko: Annotated[str | None, Form()] = None,
 ):
     """kind="corpus" requires film_title (which film this subtitle file is
     filed under; created on first use, per Film.title being the SRS's
     only field for it). kind="exam_paper" requires exam_kind + session_label
     (content.exam_paper's admin-typed fields — e.g. "TOPIK II" / "64회 읽기").
-    """
+    kind="editorial_article" takes a URL instead of a file upload — no
+    `file` at all, so it's handled separately before any of the upload
+    validation below runs."""
+    if kind == "editorial_article":
+        if not (source_url and source_name):
+            raise _problem(
+                status.HTTP_400_BAD_REQUEST,
+                "source_url and source_name are required for kind=editorial_article",
+                "validation_error",
+            )
+        return await start_editorial_import(db, profile, source_url, source_name, title_ko)
+
+    if file is None:
+        raise _problem(status.HTTP_400_BAD_REQUEST, "file is required for this kind", "validation_error")
+
     if kind == "corpus" and not film_title:
         raise _problem(status.HTTP_400_BAD_REQUEST, "film_title is required for kind=corpus", "validation_error")
     if kind == "exam_paper" and not (exam_kind and session_label):
@@ -146,7 +237,7 @@ async def create_import_batch(
 async def list_import_batches(
     db: Annotated[AsyncSession, Depends(get_db)],
     profile: Annotated[Profile, Depends(_editor_or_admin)],
-    kind: Annotated[Literal["lesson", "corpus", "exam_paper"] | None, Query()] = None,
+    kind: Annotated[Literal["lesson", "corpus", "exam_paper", "editorial_article"] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 30,
 ):
     """Backs the Studio screen's batch list — newest first."""

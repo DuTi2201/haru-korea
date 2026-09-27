@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     GEMINI_MODEL_LESSON_INGEST: str = "gemini-3.5-flash-lite"
     GEMINI_MODEL_CORPUS_INGEST: str = "gemini-3.5-flash-lite"
     GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-2"
+    # TTS: a real Gemini call (app/services/tts.py), not a stub — always
+    # cache the result (audio.lecture_audio / audio.corpus_item_audio) and
+    # never call this per-playback.
+    GEMINI_MODEL_TTS: str = "gemini-2.5-flash-preview-tts"
 
     # Content-ingestion tuning (Studio uploads — admin.py/ingest.py)
     MAX_INGEST_FILE_MB: int = 20

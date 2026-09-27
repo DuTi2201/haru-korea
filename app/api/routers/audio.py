@@ -1,23 +1,49 @@
 """Audio module — the ONE fully-wired example of the SDD's async-job
 pattern end to end: client POSTs -> 202 + job_id -> Celery task runs ->
 Redis publishes progress -> SSE streams it -> row lands in
-audio.lecture_audio. Every other AI-backed endpoint (writing grading,
-exam ingestion, placement scoring) should follow this exact shape.
+audio.lecture_audio (or audio.corpus_item_audio). Every other AI-backed
+endpoint (writing grading, exam ingestion, placement scoring) should
+follow this exact shape.
+
+Two resources share this pattern:
+- lecture audio: whole-lesson narration, gated behind login (Job.owner_id
+  is required) — matches the existing /lessons/{id} learner-progress flow.
+- corpus-item audio: one listening-screen sentence. Playback itself needs
+  no account, same as GET /corpus/items — only the "đã nhớ/chưa nhớ"
+  progress buttons require login, not hearing a sentence read aloud.
+
+Both are content-addressed (`cache_key = f"{id}:{voice}:{prompt_version}"`)
+so a repeat request short-circuits to the already-succeeded job instead of
+re-billing Gemini, and both are served back out through the GET streaming
+routes below — the frontend just points an <audio> tag at `opus_path`/
+`aac_path`, no separate fetch-then-blob dance needed.
 """
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_profile
 from app.db import get_db
-from app.models import Job, LectureAudio, Profile
-from app.schemas import JobAccepted, LectureAudioRequest
-from app.workers.tasks import generate_lecture_audio
+from app.models import CorpusItemAudio, Job, LectureAudio, Profile
+from app.schemas import CorpusAudioRequest, JobAccepted, LectureAudioRequest
+from app.workers.tasks import generate_corpus_audio, generate_lecture_audio
 
 router = APIRouter(prefix="/lessons", tags=["audio"])
+corpus_router = APIRouter(prefix="/corpus", tags=["audio"])
+
+_CACHE_CONTROL = "public, max-age=31536000, immutable"  # cache_key is content-addressed — never changes once written
+
+
+def _split_cache_filename(filename: str) -> tuple[str, str]:
+    """"{cache_key}.opus" / "{cache_key}.aac" -> (cache_key, media_type)."""
+    if filename.endswith(".opus"):
+        return filename[: -len(".opus")], "audio/ogg; codecs=opus"
+    if filename.endswith(".aac"):
+        return filename[: -len(".aac")], "audio/aac"
+    raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Unsupported audio format")
 
 
 @router.post("/{lesson_id}/lecture", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
@@ -75,3 +101,99 @@ async def request_lecture_audio(
         poll_url=f"/api/v1/jobs/{job.id}",
         events_url=f"/api/v1/jobs/{job.id}/events",
     )
+
+
+@router.get("/audio/{filename}")
+async def stream_lecture_audio(filename: str, db: Annotated[AsyncSession, Depends(get_db)]):
+    """Serves the bytes behind `LectureAudio.opus_path`/`aac_path` — those
+    columns are set to exactly this route at write time (see
+    app/workers/tasks.py generate_lecture_audio), so the frontend just
+    plays `<audio src={opus_path}>` with no separate fetch-then-blob step.
+    """
+    cache_key, media_type = _split_cache_filename(filename)
+    row = (
+        await db.execute(select(LectureAudio).where(LectureAudio.cache_key == cache_key))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not found")
+    data = row.opus_data if media_type.startswith("audio/ogg") else row.aac_data
+    if not data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not yet generated")
+    return Response(content=data, media_type=media_type, headers={"Cache-Control": _CACHE_CONTROL})
+
+
+@corpus_router.post("/{corpus_item_id}/audio", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
+async def request_corpus_audio(
+    corpus_item_id: str,
+    body: CorpusAudioRequest,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Same content-addressed cache-hit-shortcut as lecture audio, but for
+    one /listening sentence. No login required — hearing a sentence read
+    aloud is a public read like GET /corpus/items; only progress (đã nhớ/
+    chưa nhớ) needs an account, so `Job.owner_id` stays null here.
+    """
+    cache_key = f"{corpus_item_id}:{body.voice}:{body.prompt_version}"
+
+    cached = await db.execute(select(CorpusItemAudio).where(CorpusItemAudio.cache_key == cache_key))
+    hit = cached.scalar_one_or_none()
+
+    idempotency_key = request.headers.get("Idempotency-Key", cache_key)
+
+    existing_job = await db.execute(
+        select(Job).where(
+            Job.type == "generate_corpus_audio",
+            Job.idempotency_key == idempotency_key,
+            Job.status.in_(["queued", "running", "succeeded"]),
+        )
+    )
+    job = existing_job.scalar_one_or_none()
+
+    if job is None:
+        job = Job(
+            type="generate_corpus_audio",
+            owner_id=None,
+            idempotency_key=idempotency_key,
+            status="succeeded" if hit else "queued",
+            progress=1.0 if hit else 0.0,
+            result={
+                "cache_key": hit.cache_key,
+                "opus_path": f"/api/v1/corpus/audio/{hit.cache_key}.opus",
+                "aac_path": f"/api/v1/corpus/audio/{hit.cache_key}.aac",
+                "duration_sec": hit.duration_sec,
+            }
+            if hit
+            else None,
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+
+        if not hit:
+            generate_corpus_audio.delay(
+                str(job.id), corpus_item_id, body.text_ko, body.voice, body.prompt_version
+            )
+
+    return JobAccepted(
+        job_id=job.id,
+        status=job.status,
+        poll_url=f"/api/v1/jobs/{job.id}",
+        events_url=f"/api/v1/jobs/{job.id}/events",
+    )
+
+
+@corpus_router.get("/audio/{filename}")
+async def stream_corpus_audio(filename: str, db: Annotated[AsyncSession, Depends(get_db)]):
+    """Serves audio.corpus_item_audio bytes — same shape as
+    stream_lecture_audio, keyed by the corpus item's own cache_key."""
+    cache_key, media_type = _split_cache_filename(filename)
+    row = (
+        await db.execute(select(CorpusItemAudio).where(CorpusItemAudio.cache_key == cache_key))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not found")
+    data = row.opus_data if media_type.startswith("audio/ogg") else row.aac_data
+    if not data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not yet generated")
+    return Response(content=data, media_type=media_type, headers={"Cache-Control": _CACHE_CONTROL})

@@ -85,6 +85,16 @@ class LectureAudioRequest(BaseModel):
     prompt_version: str = "v1"
 
 
+class CorpusAudioRequest(BaseModel):
+    """No corpus_item_id field — it's the path param on POST
+    /corpus/{corpus_item_id}/audio (mirrors LectureAudioRequest's shape,
+    minus the redundant id)."""
+
+    text_ko: str
+    voice: str = "ko-female-1"
+    prompt_version: str = "v1"
+
+
 # ----------------------------------------------------------------- writing --
 class WritingSubmissionOut(BaseModel):
     id: uuid.UUID
@@ -121,7 +131,7 @@ class TopicOut(BaseModel):
 
 class VocabItemOut(BaseModel):
     id: int
-    lesson_id: int
+    lesson_id: int | None
     hangul: str
     pos: str | None
     meaning_vi: str
@@ -136,7 +146,7 @@ class VocabItemOut(BaseModel):
 
 class GrammarPointOut(BaseModel):
     id: int
-    lesson_id: int
+    lesson_id: int | None
     pattern: str
     meaning_vi: str
     level: int
@@ -198,6 +208,7 @@ class ImportBatchOut(BaseModel):
     source_file: str | None
     film_id: int | None
     exam_paper_id: uuid.UUID | None
+    editorial_article_id: uuid.UUID | None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -229,3 +240,98 @@ class ImportItemOut(BaseModel):
 class ImportItemPatch(BaseModel):
     payload: dict[str, Any] | None = None
     status: Literal["confirmed", "rejected"] | None = None
+
+
+# ---------------------------------------------------------------- editorial --
+class EditorialSourceCreate(BaseModel):
+    name: str
+    base_url: str
+    rss_url: str | None = None
+    license_note: str | None = None
+    active: bool = True
+
+
+class EditorialSourceUpdate(BaseModel):
+    base_url: str | None = None
+    rss_url: str | None = None
+    license_note: str | None = None
+    active: bool | None = None
+
+
+class EditorialSourceOut(BaseModel):
+    id: int
+    name: str
+    base_url: str
+    rss_url: str | None
+    license_note: str | None
+    active: bool
+
+    model_config = {"from_attributes": True}
+
+
+class EditorialArticleSummaryOut(BaseModel):
+    """GET /editorials list card — no body_ko (too big for a list) and no
+    model_outline (that's revealed only after the learner submits their
+    own outline attempt — see EditorialOutlineOut)."""
+
+    id: uuid.UUID
+    source_name: str
+    title_ko: str | None
+    level_estimate: int | None
+    topic_tags: list[str]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class EditorialArticleOut(BaseModel):
+    id: uuid.UUID
+    source_name: str
+    source_url: str
+    title_ko: str | None
+    level_estimate: int | None
+    topic_tags: list[str]
+    body_ko: str
+    vocab: list[VocabItemOut]
+    grammar: list[GrammarPointOut]
+    thinking_guide_text: str | None
+    created_at: datetime
+
+
+class EditorialOutlineSubmitRequest(BaseModel):
+    phenomenon_text: str | None = None
+    cause_text: str | None = None
+    consequence_text: str | None = None
+    solution_text: str | None = None
+
+
+class EditorialOutlineOut(BaseModel):
+    """The learner's own outline attempt. `model_outline` is included only
+    once revision_count > 0 — the point of "luyện dàn ý" is thinking it
+    through first, so the reference answer stays hidden until the learner
+    has actually written and saved their own attempt at least once."""
+
+    editorial_article_id: uuid.UUID
+    phenomenon_text: str | None
+    cause_text: str | None
+    consequence_text: str | None
+    solution_text: str | None
+    revision_count: int
+    updated_at: datetime
+    model_outline: dict[str, Any] | None = None
+
+    model_config = {"protected_namespaces": ()}
+
+
+class EditorialCandidateOut(BaseModel):
+    id: uuid.UUID
+    source_name: str
+    source_url: str
+    title_ko: str
+    snippet_ko: str | None
+    topic_tags: list[str]
+    published_date: datetime | None
+    status: str
+    discovered_at: datetime
+
+    model_config = {"from_attributes": True}

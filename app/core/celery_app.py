@@ -36,5 +36,9 @@ celery_app.conf.update(
             "task": "app.workers.tasks.reset_daily_ai_quota",
             "schedule": 3600.0,  # hourly tick; task itself checks UTC midnight
         },
+        "discover-editorial-candidates": {
+            "task": "app.workers.tasks.discover_editorial_candidates",
+            "schedule": 6 * 3600.0,  # every 6h — RSS feeds don't need finer polling than that
+        },
     },
 )

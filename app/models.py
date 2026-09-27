@@ -25,6 +25,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     JSON,
+    LargeBinary,
     SmallInteger,
     String,
     Text,
@@ -113,6 +114,13 @@ class AppConfig(Base):
 
 # ------------------------------------------------------------------- audio --
 class LectureAudio(Base):
+    """`opus_path`/`aac_path` hold this app's own streaming-route URLs
+    (e.g. `/api/v1/lessons/audio/{cache_key}.opus`), not filesystem paths —
+    Railway's containers are ephemeral, so the actual encoded bytes live
+    in `opus_data`/`aac_data` (Postgres bytea) instead of on disk. Simple,
+    and avoids standing up S3/a Railway volume for what is, so far, a
+    single-user/family-scale amount of audio."""
+
     __tablename__ = "lecture_audio"
     __table_args__ = {"schema": "audio"}
 
@@ -120,6 +128,28 @@ class LectureAudio(Base):
     cache_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     opus_path: Mapped[str] = mapped_column(String(500))
     aac_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    opus_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    aac_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    prompt_version: Mapped[str] = mapped_column(String(32))
+    voice: Mapped[str] = mapped_column(String(64))
+    duration_sec: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CorpusItemAudio(Base):
+    """Same content-addressed cache pattern as LectureAudio, but keyed to
+    one corpus.corpus_item (a single listening sentence) instead of a
+    whole lesson. `corpus_item_id` is a bare id — crosses from `audio`
+    into `corpus`, so no physical FK (SDD modular-monolith principle)."""
+
+    __tablename__ = "corpus_item_audio"
+    __table_args__ = {"schema": "audio"}
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    corpus_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
+    cache_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    opus_data: Mapped[bytes] = mapped_column(LargeBinary)
+    aac_data: Mapped[bytes] = mapped_column(LargeBinary)
     prompt_version: Mapped[str] = mapped_column(String(32))
     voice: Mapped[str] = mapped_column(String(64))
     duration_sec: Mapped[int] = mapped_column(Integer)
@@ -332,11 +362,18 @@ class LessonTopic(Base):
 
 
 class VocabItem(Base):
+    """`lesson_id` is nullable: a row created from a lesson import always
+    has one, but a row created from an editorial-article import (see
+    editorial.editorial_article, added later) does not belong to any
+    lesson — it's referenced only via that article's bare `vocab_ids`."""
+
     __tablename__ = "vocab_item"
     __table_args__ = {"schema": "content"}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    lesson_id: Mapped[int] = mapped_column(ForeignKey("content.lesson.id", ondelete="CASCADE"), index=True)
+    lesson_id: Mapped[int | None] = mapped_column(
+        ForeignKey("content.lesson.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     hangul: Mapped[str] = mapped_column(String(120))
     pos: Mapped[str | None] = mapped_column(String(32), nullable=True)
     meaning_vi: Mapped[str] = mapped_column(String(255))
@@ -349,11 +386,15 @@ class VocabItem(Base):
 
 
 class GrammarPoint(Base):
+    """`lesson_id` nullable — same reasoning as VocabItem.lesson_id above."""
+
     __tablename__ = "grammar_point"
     __table_args__ = {"schema": "content"}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    lesson_id: Mapped[int] = mapped_column(ForeignKey("content.lesson.id", ondelete="CASCADE"), index=True)
+    lesson_id: Mapped[int | None] = mapped_column(
+        ForeignKey("content.lesson.id", ondelete="CASCADE"), index=True, nullable=True
+    )
     pattern: Mapped[str] = mapped_column(String(255))  # V/A + hình thái, vd "V + -(으)ㄹ 뿐만 아니라"
     meaning_vi: Mapped[str] = mapped_column(String(255))
     level: Mapped[int] = mapped_column(SmallInteger)
@@ -452,7 +493,9 @@ class ImportBatch(Base):
     __tablename__ = "import_batch"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    kind: Mapped[str] = mapped_column(Enum("lesson", "corpus", "exam_paper", name="import_kind"))
+    kind: Mapped[str] = mapped_column(
+        Enum("lesson", "corpus", "exam_paper", "editorial_article", name="import_kind")
+    )
     owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"))
     status: Mapped[str] = mapped_column(
         Enum(
@@ -479,6 +522,12 @@ class ImportBatch(Base):
     # find-or-create-immediately timing as film_id, since exam_kind/
     # session_label are admin-typed, not AI-derived).
     exam_paper_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # Bare id, no FK — only meaningful for kind="editorial_article";
+    # crosses into the new `editorial` schema. Same immediate-creation
+    # timing as film_id/exam_paper_id: source_url/source_name are
+    # admin-typed at submission time, so find_or_create_editorial_article
+    # runs before extraction, not after.
+    editorial_article_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -500,3 +549,119 @@ class ImportItem(Base):
     )
     payload: Mapped[dict] = mapped_column(JSONB)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+# --------------------------------------------------------------- editorial --
+# New module (not in the original SRS/SDD): short Korean editorials/columns
+# (사설, 칼럼) as reading practice that scaffolds TOPIK 쓰기 question 54 —
+# see the "Đề xuất SRS/SDD" doc for the full proposal this implements.
+# Same staging convention as everything else: extraction stages
+# import_item rows (kind="editorial_meta"/"vocab_item"/"grammar_point"),
+# and only POST /imports/{id}/confirm writes here.
+class EditorialSource(Base):
+    """A registered outlet (KBS/Chosun Ilbo/Naver News...). Admin-managed
+    config, not staged — same immediacy as Film/ExamPaper naming."""
+
+    __tablename__ = "editorial_source"
+    __table_args__ = {"schema": "editorial"}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    base_url: Mapped[str] = mapped_column(String(500))
+    rss_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    license_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class EditorialArticle(Base):
+    """Created immediately (find_or_create, keyed by `source_url`) when an
+    editorial_article import_batch is submitted — same timing as Film/
+    ExamPaper, since source_url/source_name are admin-given, not
+    AI-derived. Enrichment fields (title_ko..thinking_guide_text) start
+    NULL and are filled in by apply_editorial_batch once the single
+    "editorial_meta" import_item is confirmed — `import_item_id` records
+    that lineage so rollback can reset them. `vocab_ids`/`grammar_ids` are
+    bare arrays into content.vocab_item/grammar_point (cross-schema — no
+    physical FK, same convention as corpus_item.topic_ids).
+
+    Full body text (not just an excerpt) is intentionally in scope here:
+    the owner has confirmed this deployment is for internal/family use
+    only, not published publicly, so the usual excerpt-only copyright
+    mitigation doesn't apply — see the proposal doc's §4 for the general
+    (public-deployment) recommendation this deliberately overrides.
+    """
+
+    __tablename__ = "editorial_article"
+    __table_args__ = {"schema": "editorial"}
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source_name: Mapped[str] = mapped_column(String(120))
+    source_url: Mapped[str] = mapped_column(String(1000), unique=True)
+    title_ko: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    topic_tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    level_estimate: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    published_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    body_ko: Mapped[str | None] = mapped_column(Text, nullable=True)
+    vocab_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
+    grammar_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
+    model_outline: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    thinking_guide_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    import_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class EditorialOutlineSubmission(Base):
+    """A learner's own 4-part outline/notes for one article (현상/원인/
+    결과/대책 — Hiện tượng/Nguyên nhân/Hậu quả/Giải pháp) — brainstorm
+    practice for TOPIK 쓰기 câu 54, not a graded essay. One row per
+    (learner, article); re-saving updates it in place and bumps
+    `revision_count`. `editorial_article_id` is a bare id (cross-schema,
+    no FK); `learner_id` DOES get a real FK — `profiles` is the shared
+    identity table every module is allowed to FK into (same convention as
+    analytics.learning_event.learner_id)."""
+
+    __tablename__ = "editorial_outline_submission"
+    __table_args__ = (
+        UniqueConstraint("learner_id", "editorial_article_id", name="uq_editorial_outline_learner_article"),
+        {"schema": "editorial"},
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    learner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), index=True
+    )
+    editorial_article_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), index=True)
+    phenomenon_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cause_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    consequence_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    solution_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    revision_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class EditorialCandidate(Base):
+    """RSS auto-discovery staging (SRS/SDD proposal doc §3, "Giai đoạn
+    sau" — implemented now per owner's request). A periodic Celery task
+    (discover_editorial_candidates) upserts rows here from official RSS
+    feeds; nothing here is ever auto-published — an admin browses these in
+    Studio and picks one, which POSTs it through the normal
+    `imports?kind=editorial_article` flow (marking this row "ingested").
+    Keeps the SDD's "nguồn staged, con người xác nhận" rule: only the
+    *search* step is automated."""
+
+    __tablename__ = "editorial_candidate"
+    __table_args__ = {"schema": "editorial"}
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    source_name: Mapped[str] = mapped_column(String(120))
+    source_url: Mapped[str] = mapped_column(String(1000), unique=True)
+    title_ko: Mapped[str] = mapped_column(String(500))
+    snippet_ko: Mapped[str | None] = mapped_column(Text, nullable=True)
+    topic_tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    published_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(
+        Enum("new", "dismissed", "ingested", name="editorial_candidate_status"), default="new"
+    )
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

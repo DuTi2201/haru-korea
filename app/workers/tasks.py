@@ -3,16 +3,16 @@ Sync SQLAlchemy session (Celery workers are sync by default); the API
 process uses the async session instead (see app/db.py AsyncSessionLocal).
 """
 import base64
-import time
 import uuid
+from datetime import datetime
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
-from app.models import ImportBatch
-from app.services import ingestion
+from app.models import CorpusItemAudio, ImportBatch, LectureAudio
+from app.services import ingestion, tts
 from app.services.job_events import publish_job_event
 
 # Separate sync engine for worker-side DB access.
@@ -21,25 +21,31 @@ _sync_engine = create_engine(settings.SYNC_DATABASE_URL, pool_pre_ping=True)
 
 @celery_app.task(name="app.workers.tasks.generate_lecture_audio", bind=True, max_retries=3)
 def generate_lecture_audio(self, job_id: str, lesson_id: str, text_ko: str, voice: str, prompt_version: str):
-    """Example end-to-end async job, wired to prove the 202+job_id+SSE
-    pattern: text -> Gemini TTS/script (stub) -> ffmpeg transcode to
-    opus+aac -> row in audio.lecture_audio -> job.succeeded.
-
-    Swap the two `time.sleep` placeholders for the real Gemini call and
-    an actual ffmpeg subprocess once the audio module is implemented.
-    """
+    """text -> Gemini TTS -> ffmpeg transcode to opus+aac -> row in
+    audio.lecture_audio -> job.succeeded. Real pipeline (app/services/tts.py);
+    this task is now just the job/cache bookkeeping around it — the ONE
+    fully-wired example of the SDD's async-job pattern end to end, for
+    real this time."""
     jid = uuid.UUID(job_id)
+    cache_key = f"{lesson_id}:{voice}:{prompt_version}"
     with Session(_sync_engine) as db:
         try:
-            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo lời thoại")
-            time.sleep(1)  # placeholder for the Gemini call
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc với Gemini")
+            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(text_ko, voice)
 
-            publish_job_event(db, jid, progress=0.5, step="Đang chuyển đổi âm thanh (ffmpeg)")
-            time.sleep(1)  # placeholder for the ffmpeg opus/aac transcode
-
-            publish_job_event(db, jid, progress=0.9, step="Đang lưu file")
-            cache_key = f"{lesson_id}:{voice}:{prompt_version}"
-            opus_path = f"audio/{cache_key}.opus"
+            publish_job_event(db, jid, progress=0.8, step="Đang lưu âm thanh")
+            row = LectureAudio(
+                cache_key=cache_key,
+                opus_path=f"/api/v1/lessons/audio/{cache_key}.opus",
+                aac_path=f"/api/v1/lessons/audio/{cache_key}.aac",
+                opus_data=opus_bytes,
+                aac_data=aac_bytes,
+                prompt_version=prompt_version,
+                voice=voice,
+                duration_sec=duration_sec,
+            )
+            db.add(row)
+            db.commit()
 
             publish_job_event(
                 db,
@@ -47,9 +53,56 @@ def generate_lecture_audio(self, job_id: str, lesson_id: str, text_ko: str, voic
                 status="succeeded",
                 progress=1.0,
                 step="Hoàn tất",
-                result={"cache_key": cache_key, "opus_path": opus_path, "duration_sec": 0},
+                result={"cache_key": cache_key, "opus_path": row.opus_path, "duration_sec": duration_sec},
             )
         except Exception as exc:  # noqa: BLE001 — report to job row, then re-raise for Celery retry bookkeeping
+            db.rollback()
+            publish_job_event(
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
+            )
+            raise
+
+
+@celery_app.task(name="app.workers.tasks.generate_corpus_audio", bind=True, max_retries=3)
+def generate_corpus_audio(self, job_id: str, corpus_item_id: str, text_ko: str, voice: str, prompt_version: str):
+    """Same pattern as generate_lecture_audio, keyed to one corpus_item
+    (a single listening sentence) instead of a whole lesson — backs the
+    /listening screen's playback button."""
+    jid = uuid.UUID(job_id)
+    cache_key = f"{corpus_item_id}:{voice}:{prompt_version}"
+    with Session(_sync_engine) as db:
+        try:
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc với Gemini")
+            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(text_ko, voice)
+
+            publish_job_event(db, jid, progress=0.8, step="Đang lưu âm thanh")
+            row = CorpusItemAudio(
+                corpus_item_id=uuid.UUID(corpus_item_id),
+                cache_key=cache_key,
+                opus_data=opus_bytes,
+                aac_data=aac_bytes,
+                prompt_version=prompt_version,
+                voice=voice,
+                duration_sec=duration_sec,
+            )
+            db.add(row)
+            db.commit()
+
+            publish_job_event(
+                db,
+                jid,
+                status="succeeded",
+                progress=1.0,
+                step="Hoàn tất",
+                result={
+                    "cache_key": cache_key,
+                    "opus_path": f"/api/v1/corpus/audio/{cache_key}.opus",
+                    "aac_path": f"/api/v1/corpus/audio/{cache_key}.aac",
+                    "duration_sec": duration_sec,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
             publish_job_event(
                 db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
             )
@@ -208,6 +261,78 @@ def extract_exam_paper_import(
             raise
 
 
+@celery_app.task(name="app.workers.tasks.extract_editorial_import", bind=True, max_retries=2)
+def extract_editorial_import(
+    self,
+    job_id: str,
+    batch_id: str,
+    source_url: str,
+    source_name: str,
+    title_ko: str | None,
+    published_date_iso: str | None = None,
+):
+    """URL bài xã luận/chuyên mục -> tải + làm sạch HTML (không gọi AI ở
+    bước này) -> Gemini phân loại từ vựng/ngữ pháp/cấp độ + soạn dàn ý mẫu
+    -> đề xuất vào khu chờ duyệt (import_item, kind=editorial_meta/
+    vocab_item/grammar_point). editorial_article được tạo ngay (giống
+    film/exam_paper — source_url/source_name do admin/candidate cung cấp
+    chứ không phải AI suy ra); body_ko/level_estimate/... vẫn NULL cho
+    tới khi POST /imports/{id}/confirm ghi vào (app/services/ingestion.py
+    apply_editorial_batch)."""
+    jid, bid = uuid.UUID(job_id), uuid.UUID(batch_id)
+    with Session(_sync_engine) as db:
+        batch = db.get(ImportBatch, bid)
+        if batch is None:
+            publish_job_event(db, jid, status="failed", error={"code": "not_found", "message": "batch not found"})
+            return
+        try:
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tải bài viết")
+            body_ko, parsed_title = ingestion.fetch_article_text(source_url)
+            resolved_title = title_ko or parsed_title
+            published_date = datetime.fromisoformat(published_date_iso) if published_date_iso else None
+
+            article = ingestion.find_or_create_editorial_article(
+                db,
+                source_url=source_url,
+                source_name=source_name,
+                title_ko=resolved_title,
+                published_date=published_date,
+            )
+            batch.editorial_article_id = article.id
+            batch.status = "extracting"
+            db.add(batch)
+            db.commit()
+            publish_job_event(db, jid, progress=0.4, step="Đang phân tích với Gemini")
+
+            staged, flagged = ingestion.run_editorial_extraction(db, batch, body_ko, resolved_title)
+
+            batch.status = "awaiting_review"
+            batch.flagged_count = flagged
+            db.add(batch)
+            db.commit()
+            publish_job_event(
+                db,
+                jid,
+                status="succeeded",
+                progress=1.0,
+                step="Hoàn tất phân tích bài xã luận",
+                result={
+                    "import_batch_id": str(bid),
+                    "editorial_article_id": str(article.id),
+                    "staged": staged,
+                    "flagged": flagged,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            batch.status = "failed"
+            db.add(batch)
+            db.commit()
+            publish_job_event(
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
+            )
+            raise
+
+
 @celery_app.task(name="app.workers.tasks.apply_import_batch", bind=True, max_retries=2)
 def apply_import_batch_task(self, job_id: str, batch_id: str):
     """Ghi các import_item đã confirmed vào bảng chính (content.lesson/
@@ -233,6 +358,19 @@ def apply_import_batch_task(self, job_id: str, batch_id: str):
                 db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
             )
             raise
+
+
+@celery_app.task(name="app.workers.tasks.discover_editorial_candidates")
+def discover_editorial_candidates():
+    """Celery-beat periodic task (Phase 2 của tính năng đọc xã luận): kéo
+    RSS của các nguồn đã đăng ký (editorial.editorial_source), lọc theo
+    từ khóa chủ đề, và tạo sẵn editorial_candidate ở trạng thái "new" để
+    admin duyệt trong Studio — không bao giờ tự động publish, chỉ tự động
+    hoá bước tìm kiếm (xem app/services/ingestion.py discover_editorial_
+    candidates). Không có Job/job_id — cùng dạng "chạy nền, không ai chờ
+    kết quả trực tiếp" như reset_daily_ai_quota, vì không gọi Gemini."""
+    with Session(_sync_engine) as db:
+        return ingestion.discover_editorial_candidates(db)
 
 
 @celery_app.task(name="app.workers.tasks.reset_daily_ai_quota")
