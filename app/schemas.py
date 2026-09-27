@@ -105,6 +105,17 @@ class VocabAudioRequest(BaseModel):
     prompt_version: str = "v1"
 
 
+class PodcastRequest(BaseModel):
+    """POST /lessons/{id}/podcast and /editorials/{id}/podcast: no text
+    from the caller at all — unlike lecture/corpus/vocab audio, THIS
+    endpoint generates its own script (Gemini synthesizes the lesson's/
+    article's vocab+grammar into one consolidated teaching script) before
+    handing it to TTS. See app.workers.tasks.generate_content_podcast."""
+
+    voice: str = "ko-female-1"
+    prompt_version: str = "podcast-v1"
+
+
 # ----------------------------------------------------------------- writing --
 class WritingSubmissionOut(BaseModel):
     id: uuid.UUID
@@ -161,6 +172,8 @@ class GrammarPointOut(BaseModel):
     meaning_vi: str
     level: int
     example_ko: str | None
+    usage_context_vi: str | None = None
+    topik_tip_vi: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -351,6 +364,11 @@ class EditorialOutlineOut(BaseModel):
     revision_count: int
     updated_at: datetime
     model_outline: dict[str, Any] | None = None
+    # Real Gemini analysis of the learner's OWN outline (not the static
+    # model_outline reference) — "none" until the first save triggers
+    # grade_editorial_outline, "pending" while it runs, then "ready"/"failed".
+    feedback_status: str = "none"
+    feedback_text: str | None = None
 
     model_config = {"protected_namespaces": ()}
 

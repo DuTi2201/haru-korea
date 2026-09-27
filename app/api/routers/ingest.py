@@ -54,6 +54,8 @@ async def start_editorial_import(
     source_name: str,
     title_ko: str | None,
     published_date: datetime | None = None,
+    *,
+    force: bool = False,
 ) -> ImportBatchAccepted:
     """Shared by POST /imports?kind=editorial_article (admin types a URL
     directly) and POST /editorial-candidates/{id}/ingest (admin picks one
@@ -61,15 +63,30 @@ async def start_editorial_import(
     editorial.py). No file to hash here, so `source_url` itself is the
     dedup identity, same slot `file_hash` fills for the other three kinds:
     resubmitting the same URL reuses the existing batch/job instead of
-    firing a second Gemini extraction."""
+    firing a second Gemini extraction.
+
+    `force=True` skips that reuse and always stages a FRESH batch (still
+    against the SAME editorial_article row — find_or_create_editorial_article
+    dedupes by source_url regardless) — the one legitimate reason to want a
+    second extraction of a URL already ingested: re-scraping/re-analyzing to
+    pick up a pipeline fix (e.g. the improved fetch_article_text boilerplate
+    stripping + og:site_name outlet-name suggestion), not a duplicate."""
     source_url = source_url.strip()
     file_hash = hashlib.sha256(source_url.encode("utf-8")).hexdigest()
     idempotency_key = f"editorial_article:{file_hash}"
+    if force:
+        idempotency_key = f"{idempotency_key}:refresh:{uuid.uuid4()}"
 
-    existing_batch = await db.execute(
-        select(ImportBatch).where(ImportBatch.kind == "editorial_article", ImportBatch.file_hash == file_hash)
+    existing_batch = (
+        None
+        if force
+        else (
+            await db.execute(
+                select(ImportBatch).where(ImportBatch.kind == "editorial_article", ImportBatch.file_hash == file_hash)
+            )
+        ).scalar_one_or_none()
     )
-    batch = existing_batch.scalar_one_or_none()
+    batch = existing_batch
     if batch is None:
         batch = ImportBatch(
             kind="editorial_article",
@@ -125,12 +142,14 @@ async def create_import_batch(
     profile: Annotated[Profile, Depends(_editor_or_admin)],
     kind: Annotated[Literal["lesson", "corpus", "exam_paper", "editorial_article"], Form()],
     file: UploadFile | None = None,
+    files: list[UploadFile] | None = None,
     film_title: Annotated[str | None, Form()] = None,
     exam_kind: Annotated[str | None, Form()] = None,
     session_label: Annotated[str | None, Form()] = None,
     source_url: Annotated[str | None, Form()] = None,
     source_name: Annotated[str | None, Form()] = None,
     title_ko: Annotated[str | None, Form()] = None,
+    force: Annotated[bool, Form()] = False,
 ):
     """kind="corpus" requires film_title (which film this subtitle file is
     filed under; created on first use, per Film.title being the SRS's
@@ -154,7 +173,14 @@ async def create_import_batch(
     to extraction: an image/PDF upload (a photographed/screenshotted
     subtitle list) gets OCR'd via Gemini vision first instead of being
     silently base64-decoded as garbage text (see
-    ingestion.extract_corpus_source_text)."""
+    ingestion.extract_corpus_source_text).
+
+    "exam_paper" is the one kind that takes MULTIPLE files under the same
+    `files` field — a real TOPIK paper is often split into a reading-passage
+    file, a listening/writing file, and a separate answer-key file, and an
+    admin shouldn't have to run three separate uploads/reviews for what is
+    really one đề thi. `file` (singular) still works for a single-file exam
+    upload too, for backward compat."""
     if kind == "editorial_article":
         if not (source_url and source_name):
             raise _problem(
@@ -162,19 +188,16 @@ async def create_import_batch(
                 "source_url and source_name are required for kind=editorial_article",
                 "validation_error",
             )
-        return await start_editorial_import(db, profile, source_url, source_name, title_ko)
+        return await start_editorial_import(db, profile, source_url, source_name, title_ko, force=force)
+
+    if kind == "exam_paper":
+        return await _create_exam_paper_batch(db, profile, files or ([file] if file else []), exam_kind, session_label)
 
     if file is None:
         raise _problem(status.HTTP_400_BAD_REQUEST, "file is required for this kind", "validation_error")
 
     if kind == "corpus" and not film_title:
         raise _problem(status.HTTP_400_BAD_REQUEST, "film_title is required for kind=corpus", "validation_error")
-    if kind == "exam_paper" and not (exam_kind and session_label):
-        raise _problem(
-            status.HTTP_400_BAD_REQUEST,
-            "exam_kind and session_label are required for kind=exam_paper",
-            "validation_error",
-        )
 
     raw = await file.read()
     if len(raw) > _MAX_BYTES:
@@ -185,14 +208,13 @@ async def create_import_batch(
             f"limit is {settings.MAX_INGEST_FILE_MB} MB",
         )
     mime_type: str | None = file.content_type or mimetypes.guess_type(file.filename or "")[0]
-    if kind in ("lesson", "exam_paper"):
-        if mime_type not in _LESSON_MIME_TYPES:
-            raise _problem(
-                status.HTTP_400_BAD_REQUEST,
-                "Unsupported file type",
-                "unsupported_media_type",
-                f"expected one of {sorted(_LESSON_MIME_TYPES)}, got {mime_type!r}",
-            )
+    if kind == "lesson" and mime_type not in _LESSON_MIME_TYPES:
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST,
+            "Unsupported file type",
+            "unsupported_media_type",
+            f"expected one of {sorted(_LESSON_MIME_TYPES)}, got {mime_type!r}",
+        )
 
     file_hash = hashlib.sha256(raw).hexdigest()
 
@@ -235,10 +257,110 @@ async def create_import_batch(
         file_b64 = base64.b64encode(raw).decode("ascii")
         if kind == "lesson":
             extract_lesson_import.delay(str(job.id), str(batch.id), file_b64, mime_type)
-        elif kind == "corpus":
-            extract_corpus_import.delay(str(job.id), str(batch.id), file_b64, film_title, mime_type)
         else:
-            extract_exam_paper_import.delay(str(job.id), str(batch.id), file_b64, mime_type, exam_kind, session_label)
+            extract_corpus_import.delay(str(job.id), str(batch.id), file_b64, film_title, mime_type)
+
+    return ImportBatchAccepted(
+        import_batch_id=batch.id,
+        job_id=job.id,
+        status=job.status,
+        poll_url=f"/api/v1/jobs/{job.id}",
+        events_url=f"/api/v1/jobs/{job.id}/events",
+    )
+
+
+async def _create_exam_paper_batch(
+    db: AsyncSession,
+    profile: Profile,
+    upload_files: list[UploadFile],
+    exam_kind: str | None,
+    session_label: str | None,
+) -> ImportBatchAccepted:
+    """Reading passage / listening+writing / answer-key files (1-3 of
+    them) for ONE đề thi, all staged as a single import_batch and sent to
+    Gemini as separate multimodal parts of ONE call (see
+    ingestion.build_exam_prompt_parts) so it can cross-reference an answer
+    key against the actual questions. `file_hash` covers the whole set
+    (sorted by filename first, so upload ORDER never changes the dedup
+    identity), which is what both ImportBatch's and ExamPaper's
+    (owner_id, file_hash) uniqueness keys off."""
+    if not upload_files:
+        raise _problem(status.HTTP_400_BAD_REQUEST, "file is required for this kind", "validation_error")
+    if len(upload_files) > 3:
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST, "At most 3 files per exam paper", "validation_error"
+        )
+    if not (exam_kind and session_label):
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST,
+            "exam_kind and session_label are required for kind=exam_paper",
+            "validation_error",
+        )
+
+    read_files: list[tuple[bytes, str, str]] = []  # (raw, mime_type, filename)
+    for f in upload_files:
+        raw = await f.read()
+        if len(raw) > _MAX_BYTES:
+            raise _problem(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                "File too large",
+                "file_too_large",
+                f"{f.filename}: limit is {settings.MAX_INGEST_FILE_MB} MB",
+            )
+        mime_type = f.content_type or mimetypes.guess_type(f.filename or "")[0]
+        if mime_type not in _LESSON_MIME_TYPES:
+            raise _problem(
+                status.HTTP_400_BAD_REQUEST,
+                "Unsupported file type",
+                "unsupported_media_type",
+                f"{f.filename}: expected one of {sorted(_LESSON_MIME_TYPES)}, got {mime_type!r}",
+            )
+        read_files.append((raw, mime_type, f.filename or "file"))
+
+    read_files.sort(key=lambda t: t[2])
+    file_hash = hashlib.sha256(b"".join(r for r, _, _ in read_files)).hexdigest()
+    source_label = ", ".join(fn for _, _, fn in read_files)
+
+    existing_batch = await db.execute(
+        select(ImportBatch).where(ImportBatch.kind == "exam_paper", ImportBatch.file_hash == file_hash)
+    )
+    batch = existing_batch.scalar_one_or_none()
+    idempotency_key = f"exam_paper:{file_hash}"
+
+    if batch is None:
+        batch = ImportBatch(
+            kind="exam_paper",
+            owner_id=profile.id,
+            status="queued",
+            source_file=source_label,
+            file_hash=file_hash,
+        )
+        db.add(batch)
+        await db.commit()
+        await db.refresh(batch)
+
+    existing_job = await db.execute(
+        select(Job).where(
+            Job.type == "extract_import_exam_paper",
+            Job.idempotency_key == idempotency_key,
+            Job.status.in_(["queued", "running", "succeeded"]),
+        )
+    )
+    job = existing_job.scalar_one_or_none()
+
+    if job is None:
+        job = Job(
+            type="extract_import_exam_paper", owner_id=profile.id, idempotency_key=idempotency_key, status="queued"
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+
+        files_b64 = [
+            {"data": base64.b64encode(raw).decode("ascii"), "mime_type": mime_type}
+            for raw, mime_type, _ in read_files
+        ]
+        extract_exam_paper_import.delay(str(job.id), str(batch.id), files_b64, exam_kind, session_label)
 
     return ImportBatchAccepted(
         import_batch_id=batch.id,

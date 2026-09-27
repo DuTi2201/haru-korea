@@ -18,11 +18,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import _problem, get_current_profile, require_role
+from app.api.routers.audio import _request_podcast
 from app.api.routers.ingest import start_editorial_import
 from app.db import get_db
 from app.models import (
@@ -31,6 +32,7 @@ from app.models import (
     EditorialOutlineSubmission,
     EditorialSource,
     GrammarPoint,
+    Job,
     Profile,
     VocabItem,
 )
@@ -45,8 +47,11 @@ from app.schemas import (
     EditorialSourceUpdate,
     GrammarPointOut,
     ImportBatchAccepted,
+    JobAccepted,
+    PodcastRequest,
     VocabItemOut,
 )
+from app.workers.tasks import grade_editorial_outline
 
 router = APIRouter(tags=["editorial"])
 
@@ -111,6 +116,25 @@ async def get_editorial(article_id: uuid.UUID, db: Annotated[AsyncSession, Depen
     )
 
 
+@router.post("/editorials/{article_id}/podcast", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
+async def request_editorial_podcast(
+    article_id: uuid.UUID,
+    body: PodcastRequest,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Same consolidated "bài giảng" podcast as POST /lessons/{id}/podcast
+    (see app.workers.tasks.generate_content_podcast), but for one editorial
+    article's vocab/grammar instead of a lesson's. No login required —
+    same rationale as GET /editorials/{id} itself."""
+    article = await db.get(EditorialArticle, article_id)
+    if article is None or article.body_ko is None:
+        raise _problem(status.HTTP_404_NOT_FOUND, "Editorial article not found", "not_found")
+    return await _request_podcast(
+        db, "article", str(article_id), body, request, article.vocab_ids, article.grammar_ids
+    )
+
+
 async def _get_or_init_outline(
     db: AsyncSession, article: EditorialArticle, learner_id: uuid.UUID
 ) -> EditorialOutlineSubmission | None:
@@ -148,6 +172,8 @@ async def get_editorial_outline(
             revision_count=0,
             updated_at=datetime.now(timezone.utc),
             model_outline=None,
+            feedback_status="none",
+            feedback_text=None,
         )
 
     return EditorialOutlineOut(
@@ -159,6 +185,8 @@ async def get_editorial_outline(
         revision_count=submission.revision_count,
         updated_at=submission.updated_at,
         model_outline=article.model_outline if submission.revision_count > 0 else None,
+        feedback_status=submission.feedback_status,
+        feedback_text=submission.feedback_text,
     )
 
 
@@ -193,9 +221,21 @@ async def submit_editorial_outline(
         submission.consequence_text = body.consequence_text
         submission.solution_text = body.solution_text
         submission.revision_count += 1
+    # Every save gets a REAL Gemini pass over what the learner actually
+    # wrote (grade_editorial_outline) — previously this endpoint only ever
+    # persisted the text and handed back the static model_outline, with no
+    # analysis of the learner's own attempt at all.
+    submission.feedback_status = "pending"
+    submission.feedback_text = None
     db.add(submission)
     await db.commit()
     await db.refresh(submission)
+
+    job = Job(type="grade_editorial_outline", owner_id=profile.id, status="queued")
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    grade_editorial_outline.delay(str(job.id), str(submission.id))
 
     return EditorialOutlineOut(
         editorial_article_id=article_id,
@@ -206,6 +246,8 @@ async def submit_editorial_outline(
         revision_count=submission.revision_count,
         updated_at=submission.updated_at,
         model_outline=article.model_outline,  # always revealed after a save — revision_count is now >= 1
+        feedback_status=submission.feedback_status,
+        feedback_text=submission.feedback_text,
     )
 
 

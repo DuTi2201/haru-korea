@@ -9,9 +9,21 @@ from datetime import datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from sqlalchemy import select
+
 from app.core.celery_app import celery_app
 from app.core.config import settings
-from app.models import CorpusItemAudio, ImportBatch, LectureAudio, VocabItemAudio
+from app.models import (
+    CorpusItemAudio,
+    EditorialArticle,
+    EditorialOutlineSubmission,
+    GrammarPoint,
+    ImportBatch,
+    LectureAudio,
+    Lesson,
+    VocabItem,
+    VocabItemAudio,
+)
 from app.services import ingestion, tts
 from app.services.job_events import publish_job_event
 
@@ -157,6 +169,154 @@ def generate_vocab_audio(self, job_id: str, vocab_item_id: str, text_ko: str, vo
             raise
 
 
+@celery_app.task(name="app.workers.tasks.generate_content_podcast", bind=True, max_retries=3)
+def generate_content_podcast(
+    self, job_id: str, owner_kind: str, owner_id: str, voice: str, prompt_version: str, cache_key: str
+):
+    """Gemini synthesizes a lesson's/article's ENTIRE vocab+grammar into
+    one consolidated "bài giảng" script (ingestion.generate_podcast_script)
+    -> TTS -> row in audio.lecture_audio (script_text set, cache_key
+    prefixed "podcast:lesson:..."/"podcast:article:..." so it shares that
+    table/route instead of a parallel one — see LectureAudio's docstring).
+    Reuses the SAME "content-addressed job" pattern as generate_lecture_audio,
+    except the cache_key here is computed by the API route from a hash of
+    the owner's CURRENT vocab/grammar ids (see app/api/routers/audio.py and
+    editorial.py), so adding a word later naturally busts the cache instead
+    of serving a stale lecture.
+
+    `owner_kind` is "lesson" or "article" — re-queries vocab/grammar fresh
+    from the DB rather than trusting caller-supplied payloads, same as
+    every other extraction task here."""
+    jid = uuid.UUID(job_id)
+    with Session(_sync_engine) as db:
+        try:
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tổng hợp nội dung bài giảng")
+
+            if owner_kind == "lesson":
+                lesson = db.get(Lesson, int(owner_id))
+                if lesson is None:
+                    raise RuntimeError(f"lesson {owner_id} not found")
+                title = lesson.title
+                vocab_rows = db.execute(select(VocabItem).where(VocabItem.lesson_id == lesson.id)).scalars().all()
+                grammar_rows = (
+                    db.execute(select(GrammarPoint).where(GrammarPoint.lesson_id == lesson.id)).scalars().all()
+                )
+            else:
+                article = db.get(EditorialArticle, uuid.UUID(owner_id))
+                if article is None:
+                    raise RuntimeError(f"editorial_article {owner_id} not found")
+                title = article.title_ko or article.source_name
+                vocab_rows = (
+                    db.execute(select(VocabItem).where(VocabItem.id.in_(article.vocab_ids))).scalars().all()
+                    if article.vocab_ids
+                    else []
+                )
+                grammar_rows = (
+                    db.execute(select(GrammarPoint).where(GrammarPoint.id.in_(article.grammar_ids))).scalars().all()
+                    if article.grammar_ids
+                    else []
+                )
+
+            vocab = [(v.hangul, v.pos, v.meaning_vi, v.example_ko) for v in vocab_rows]
+            grammar = [
+                (g.pattern, g.meaning_vi, g.example_ko, g.usage_context_vi, g.topik_tip_vi) for g in grammar_rows
+            ]
+
+            publish_job_event(db, jid, progress=0.3, step="Đang viết kịch bản với Gemini")
+            script = ingestion.generate_podcast_script(title, vocab, grammar)
+
+            publish_job_event(db, jid, progress=0.6, step="Đang tạo giọng đọc với Gemini")
+            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(script, voice)
+
+            publish_job_event(db, jid, progress=0.9, step="Đang lưu bài giảng")
+            row = LectureAudio(
+                cache_key=cache_key,
+                opus_path=f"/api/v1/lessons/audio/{cache_key}.opus",
+                aac_path=f"/api/v1/lessons/audio/{cache_key}.aac",
+                opus_data=opus_bytes,
+                aac_data=aac_bytes,
+                prompt_version=prompt_version,
+                voice=voice,
+                duration_sec=duration_sec,
+                script_text=script,
+            )
+            db.add(row)
+            db.commit()
+
+            publish_job_event(
+                db,
+                jid,
+                status="succeeded",
+                progress=1.0,
+                step="Hoàn tất",
+                result={
+                    "cache_key": cache_key,
+                    "opus_path": row.opus_path,
+                    "aac_path": row.aac_path,
+                    "duration_sec": duration_sec,
+                    "script_text": script,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            publish_job_event(
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
+            )
+            raise
+
+
+@celery_app.task(name="app.workers.tasks.grade_editorial_outline", bind=True, max_retries=3)
+def grade_editorial_outline(self, job_id: str, submission_id: str):
+    """Real Gemini feedback on the learner's OWN "luyện dàn ý" attempt —
+    previously POST /editorials/{id}/outline only ever persisted the text
+    and returned the static, ingestion-time model_outline (a reference
+    answer, not feedback on what the learner actually wrote). Runs after
+    every save (see app/api/routers/editorial.py submit_editorial_outline).
+    """
+    jid, sid = uuid.UUID(job_id), uuid.UUID(submission_id)
+    with Session(_sync_engine) as db:
+        submission = db.get(EditorialOutlineSubmission, sid)
+        if submission is None:
+            publish_job_event(db, jid, status="failed", error={"code": "not_found", "message": "submission not found"})
+            return
+        try:
+            article = db.get(EditorialArticle, submission.editorial_article_id)
+            if article is None:
+                raise RuntimeError(f"editorial_article {submission.editorial_article_id} not found")
+
+            publish_job_event(db, jid, status="running", progress=0.2, step="Đang phân tích dàn ý với Gemini")
+            feedback = ingestion.generate_outline_feedback(
+                article_title=article.title_ko or article.source_name,
+                article_body=article.body_ko or "",
+                reference_outline=article.model_outline or {},
+                learner_outline={
+                    "phenomenon_text": submission.phenomenon_text,
+                    "cause_text": submission.cause_text,
+                    "consequence_text": submission.consequence_text,
+                    "solution_text": submission.solution_text,
+                },
+            )
+
+            submission.feedback_status = "ready"
+            submission.feedback_text = feedback
+            db.add(submission)
+            db.commit()
+
+            publish_job_event(
+                db, jid, status="succeeded", progress=1.0, step="Hoàn tất",
+                result={"submission_id": submission_id, "feedback_text": feedback},
+            )
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            submission.feedback_status = "failed"
+            db.add(submission)
+            db.commit()
+            publish_job_event(
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
+            )
+            raise
+
+
 @celery_app.task(name="app.workers.tasks.grade_writing_submission")
 def grade_writing_submission(job_id: str, submission_id: str):
     """Stub for the Xưởng viết grading step (OCR transcript already
@@ -277,13 +437,20 @@ def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_
 
 @celery_app.task(name="app.workers.tasks.extract_exam_paper_import", bind=True, max_retries=2)
 def extract_exam_paper_import(
-    self, job_id: str, batch_id: str, file_b64: str, mime_type: str, exam_kind: str, session_label: str
+    self, job_id: str, batch_id: str, files_b64: list[dict], exam_kind: str, session_label: str
 ):
     """Đề thi ảnh/PDF -> Gemini (đa phương thức) -> đề xuất exam_passage/
     exam_item vào khu chờ duyệt. exam_paper được tạo ngay (giống film,
     exam_kind/session_label do admin gõ chứ không phải AI suy ra) trước khi
     trích xuất; không ghi content.exam_passage/exam_item ở đây — chỉ POST
-    /imports/{id}/confirm mới ghi."""
+    /imports/{id}/confirm mới ghi.
+
+    `files_b64` is 1-3 files (Studio's exam_paper upload now accepts a
+    reading-passage file, a listening/writing file, and/or a separate
+    answer-key file for the SAME đề thi — see app/api/routers/ingest.py),
+    each `{"data": <base64>, "mime_type": <str>}`. All of them go into ONE
+    Gemini call as separate multimodal parts (ingestion.build_exam_prompt_parts)
+    so it can cross-reference an answer key against the actual questions."""
     jid, bid = uuid.UUID(job_id), uuid.UUID(batch_id)
     with Session(_sync_engine) as db:
         batch = db.get(ImportBatch, bid)
@@ -298,8 +465,8 @@ def extract_exam_paper_import(
             db.commit()
             publish_job_event(db, jid, status="running", progress=0.2, step="Đang đọc đề thi với Gemini")
 
-            file_bytes = base64.b64decode(file_b64)
-            staged, flagged = ingestion.run_exam_extraction(db, batch, file_bytes, mime_type)
+            files = [(base64.b64decode(f["data"]), f["mime_type"]) for f in files_b64]
+            staged, flagged = ingestion.run_exam_extraction(db, batch, files)
 
             batch.status = "awaiting_review"
             batch.flagged_count = flagged
@@ -349,7 +516,7 @@ def extract_editorial_import(
             return
         try:
             publish_job_event(db, jid, status="running", progress=0.1, step="Đang tải bài viết")
-            body_ko, parsed_title = ingestion.fetch_article_text(source_url)
+            body_ko, parsed_title, suggested_source_name = ingestion.fetch_article_text(source_url)
             resolved_title = title_ko or parsed_title
             published_date = datetime.fromisoformat(published_date_iso) if published_date_iso else None
 
@@ -366,7 +533,9 @@ def extract_editorial_import(
             db.commit()
             publish_job_event(db, jid, progress=0.4, step="Đang phân tích với Gemini")
 
-            staged, flagged = ingestion.run_editorial_extraction(db, batch, body_ko, resolved_title)
+            staged, flagged = ingestion.run_editorial_extraction(
+                db, batch, body_ko, resolved_title, suggested_source_name
+            )
 
             batch.status = "awaiting_review"
             batch.flagged_count = flagged

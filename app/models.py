@@ -133,6 +133,13 @@ class LectureAudio(Base):
     prompt_version: Mapped[str] = mapped_column(String(32))
     voice: Mapped[str] = mapped_column(String(64))
     duration_sec: Mapped[int] = mapped_column(Integer)
+    # Transcript of what was actually synthesized. NULL for the original
+    # arbitrary-text lecture use (the caller already has that text), but
+    # ALWAYS set for a generated "bài giảng tổng hợp" (see
+    # app.workers.tasks.generate_content_podcast) — cache_key there is
+    # prefixed "podcast:lesson:.../podcast:article:..." so it shares this
+    # same table/route instead of standing up a parallel one.
+    script_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -421,6 +428,14 @@ class GrammarPoint(Base):
     meaning_vi: Mapped[str] = mapped_column(String(255))
     level: Mapped[int] = mapped_column(SmallInteger)
     example_ko: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Added per owner feedback: a bare "V/A + form" pattern + one example
+    # sentence isn't enough to actually use a grammar point — usage_context_vi
+    # explains WHEN/in what situation it's used (Vietnamese), topik_tip_vi
+    # explains how it actually shows up in TOPIK exam questions. Nullable so
+    # existing rows (extracted before this field existed) degrade gracefully
+    # until backfilled/re-extracted.
+    usage_context_vi: Mapped[str | None] = mapped_column(Text, nullable=True)
+    topik_tip_vi: Mapped[str | None] = mapped_column(Text, nullable=True)
     import_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
@@ -658,6 +673,12 @@ class EditorialOutlineSubmission(Base):
     consequence_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     solution_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     revision_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Real Gemini feedback on the learner's OWN outline (added per owner
+    # feedback — previously saving an outline never actually analyzed it).
+    # "none" until a save first triggers grade_editorial_outline, "pending"
+    # while that Celery job runs, then "ready"/"failed".
+    feedback_status: Mapped[str] = mapped_column(String(16), default="none")
+    feedback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

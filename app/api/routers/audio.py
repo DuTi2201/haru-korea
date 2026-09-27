@@ -18,6 +18,7 @@ re-billing Gemini, and both are served back out through the GET streaming
 routes below — the frontend just points an <audio> tag at `opus_path`/
 `aac_path`, no separate fetch-then-blob dance needed.
 """
+import hashlib
 import uuid
 from typing import Annotated
 
@@ -27,15 +28,92 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_profile
 from app.db import get_db
-from app.models import CorpusItemAudio, Job, LectureAudio, Profile, VocabItemAudio
-from app.schemas import CorpusAudioRequest, JobAccepted, LectureAudioRequest, VocabAudioRequest
-from app.workers.tasks import generate_corpus_audio, generate_lecture_audio, generate_vocab_audio
+from app.models import CorpusItemAudio, GrammarPoint, Job, LectureAudio, Lesson, Profile, VocabItem, VocabItemAudio
+from app.schemas import CorpusAudioRequest, JobAccepted, LectureAudioRequest, PodcastRequest, VocabAudioRequest
+from app.workers.tasks import (
+    generate_content_podcast,
+    generate_corpus_audio,
+    generate_lecture_audio,
+    generate_vocab_audio,
+)
 
 router = APIRouter(prefix="/lessons", tags=["audio"])
 corpus_router = APIRouter(prefix="/corpus", tags=["audio"])
 vocab_router = APIRouter(prefix="/vocab-items", tags=["audio"])
 
 _CACHE_CONTROL = "public, max-age=31536000, immutable"  # cache_key is content-addressed — never changes once written
+
+
+async def _podcast_cache_key(
+    db: AsyncSession, owner_kind: str, owner_id: str, voice: str, prompt_version: str, vocab_ids: list[int], grammar_ids: list[int]
+) -> str:
+    """Includes a short hash of the CURRENT vocab/grammar id set so the
+    cache naturally busts if an admin adds/removes a word later — unlike
+    plain lecture/corpus/vocab audio, a podcast's content can change out
+    from under a stable owner id (a lesson/article gets edited in Studio),
+    so `{owner_id}:{voice}:{prompt_version}` alone would keep serving a
+    stale recording forever."""
+    sig_src = "v:" + ",".join(str(i) for i in sorted(vocab_ids)) + "|g:" + ",".join(str(i) for i in sorted(grammar_ids))
+    content_sig = hashlib.sha256(sig_src.encode("utf-8")).hexdigest()[:16]
+    return f"podcast:{owner_kind}:{owner_id}:{voice}:{prompt_version}:{content_sig}"
+
+
+async def _request_podcast(
+    db: AsyncSession,
+    owner_kind: str,
+    owner_id: str,
+    body: PodcastRequest,
+    request: Request,
+    vocab_ids: list[int],
+    grammar_ids: list[int],
+) -> JobAccepted:
+    cache_key = await _podcast_cache_key(db, owner_kind, owner_id, body.voice, body.prompt_version, vocab_ids, grammar_ids)
+
+    cached = await db.execute(select(LectureAudio).where(LectureAudio.cache_key == cache_key))
+    hit = cached.scalar_one_or_none()
+
+    idempotency_key = request.headers.get("Idempotency-Key", cache_key)
+    existing_job = await db.execute(
+        select(Job).where(
+            Job.type == "generate_content_podcast",
+            Job.idempotency_key == idempotency_key,
+            Job.status.in_(["queued", "running", "succeeded"]),
+        )
+    )
+    job = existing_job.scalar_one_or_none()
+
+    if job is None:
+        job = Job(
+            type="generate_content_podcast",
+            owner_id=None,
+            idempotency_key=idempotency_key,
+            status="succeeded" if hit else "queued",
+            progress=1.0 if hit else 0.0,
+            result={
+                "cache_key": hit.cache_key,
+                "opus_path": hit.opus_path,
+                "aac_path": hit.aac_path,
+                "duration_sec": hit.duration_sec,
+                "script_text": hit.script_text,
+            }
+            if hit
+            else None,
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+
+        if not hit:
+            generate_content_podcast.delay(
+                str(job.id), owner_kind, owner_id, body.voice, body.prompt_version, cache_key
+            )
+
+    return JobAccepted(
+        job_id=job.id,
+        status=job.status,
+        poll_url=f"/api/v1/jobs/{job.id}",
+        events_url=f"/api/v1/jobs/{job.id}/events",
+    )
 
 
 def _split_cache_filename(filename: str) -> tuple[str, str]:
@@ -102,6 +180,28 @@ async def request_lecture_audio(
         poll_url=f"/api/v1/jobs/{job.id}",
         events_url=f"/api/v1/jobs/{job.id}/events",
     )
+
+
+@router.post("/{lesson_id}/podcast", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
+async def request_lesson_podcast(
+    lesson_id: int,
+    body: PodcastRequest,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Gemini writes ONE consolidated teaching script covering every vocab
+    word + grammar point of this lesson, then TTS's it — see
+    app.workers.tasks.generate_content_podcast and ingestion.
+    generate_podcast_script. No login required, same rationale as vocab/
+    corpus audio (hearing content is a public read)."""
+    lesson = await db.get(Lesson, lesson_id)
+    if lesson is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lesson not found")
+    vocab_ids = [i for (i,) in (await db.execute(select(VocabItem.id).where(VocabItem.lesson_id == lesson_id))).all()]
+    grammar_ids = [
+        i for (i,) in (await db.execute(select(GrammarPoint.id).where(GrammarPoint.lesson_id == lesson_id))).all()
+    ]
+    return await _request_podcast(db, "lesson", str(lesson_id), body, request, vocab_ids, grammar_ids)
 
 
 @router.get("/audio/{filename}")

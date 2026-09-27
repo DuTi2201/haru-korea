@@ -99,9 +99,18 @@ LESSON_SCHEMA: dict[str, Any] = {
                     "meaning_vi": {"type": "STRING"},
                     "level": {"type": "INTEGER"},
                     "example_ko": {"type": "STRING", "nullable": True},
+                    "usage_context_vi": {
+                        "type": "STRING",
+                        "description": "Giải thích bằng tiếng Việt: dùng KHI NÀO, trong HOÀN CẢNH/tình huống nào, với sắc thái gì — không chỉ định nghĩa suông",
+                    },
+                    "topik_tip_vi": {
+                        "type": "STRING",
+                        "nullable": True,
+                        "description": "Mẹo bằng tiếng Việt: mẫu này thường xuất hiện ở dạng câu hỏi TOPIK nào, cách nhận diện/dùng khi làm bài thi",
+                    },
                     "confidence": {"type": "NUMBER"},
                 },
-                "required": ["pattern", "meaning_vi", "level", "confidence"],
+                "required": ["pattern", "meaning_vi", "level", "usage_context_vi", "confidence"],
             },
         },
         "confidence": {"type": "NUMBER"},
@@ -244,9 +253,18 @@ EDITORIAL_SCHEMA: dict[str, Any] = {
                     "meaning_vi": {"type": "STRING"},
                     "level": {"type": "INTEGER"},
                     "example_ko": {"type": "STRING", "nullable": True},
+                    "usage_context_vi": {
+                        "type": "STRING",
+                        "description": "Giải thích bằng tiếng Việt: dùng KHI NÀO, trong HOÀN CẢNH/tình huống nào — không chỉ định nghĩa suông",
+                    },
+                    "topik_tip_vi": {
+                        "type": "STRING",
+                        "nullable": True,
+                        "description": "Mẹo bằng tiếng Việt: mẫu này thường xuất hiện ở dạng câu hỏi TOPIK nào (đặc biệt viết câu 54), cách dùng khi làm bài thi",
+                    },
                     "confidence": {"type": "NUMBER"},
                 },
-                "required": ["pattern", "meaning_vi", "level", "confidence"],
+                "required": ["pattern", "meaning_vi", "level", "usage_context_vi", "confidence"],
             },
         },
         "model_outline": {
@@ -297,6 +315,8 @@ class GrammarExtraction(BaseModel):
     meaning_vi: str
     level: int = Field(ge=1, le=6)
     example_ko: str | None = None
+    usage_context_vi: str | None = None
+    topik_tip_vi: str | None = None
     confidence: float = Field(ge=0, le=1, default=0.5)
 
 
@@ -397,7 +417,13 @@ LESSON_PROMPT = """Bạn là biên tập viên nội dung học tiếng Hàn cho
   nghĩa tiếng Hàn ngắn gọn (nếu có), từ loại, Hán tự và âm Hán Việt (nếu là
   từ Hán Hàn), câu ví dụ trong bài.
 - Toàn bộ mẫu ngữ pháp xuất hiện, viết pattern theo dạng "V/A + hình thái"
-  (ví dụ: "V + -(으)ㄹ 뿐만 아니라"), kèm nghĩa tiếng Việt và câu ví dụ.
+  (ví dụ: "V + -(으)ㄹ 뿐만 아니라"), kèm nghĩa tiếng Việt và câu ví dụ. QUAN
+  TRỌNG: đừng chỉ liệt kê công thức như sách giáo khoa — với mỗi mẫu ngữ
+  pháp, viết THÊM usage_context_vi giải thích bằng tiếng Việt: dùng khi nào,
+  trong hoàn cảnh/tình huống nào, với sắc thái/thái độ gì so với các mẫu gần
+  nghĩa khác (người học cần biết ÁP DỤNG chứ không chỉ nhớ công thức). Nếu
+  mẫu này thường gặp trong đề thi TOPIK, thêm topik_tip_vi: dạng câu hỏi hay
+  gặp, cách nhận diện/vận dụng khi làm bài.
 Trả về đúng JSON schema đã cho, không thêm giải thích. Với mỗi mục, tự đánh
 giá độ tự tin (confidence, 0-1) dựa trên độ rõ ràng của tài liệu gốc."""
 
@@ -489,13 +515,29 @@ def extract_corpus_source_text(file_bytes: bytes, mime_type: str | None) -> str:
     return file_bytes.decode("utf-8", errors="replace")
 
 
-def build_exam_prompt(known_qtypes: list[tuple[str, str]]) -> str:
+def build_exam_prompt(known_qtypes: list[tuple[str, str]], *, multi_file: bool = False) -> str:
     qtype_hint = "\n".join(f"- {code}: {name_vi}" for code, name_vi in known_qtypes) or (
         "(chưa có loại câu hỏi nào trong hệ thống — để qtype_code trống cho mọi câu)"
     )
+    multi_file_note = (
+        """
+Đề thi này được cung cấp dưới dạng NHIỀU TỆP riêng biệt cho CÙNG MỘT đề thi
+(vd: một tệp đề đọc hiểu, một tệp đề nghe/viết, và một tệp đáp án riêng —
+thứ tự các tệp không nói lên tệp nào là gì, hãy tự nhận diện qua nội dung).
+Hãy đọc TẤT CẢ các tệp và kết hợp chúng thành MỘT đề thi thống nhất (số thứ
+tự câu hỏi không được trùng lặp giữa các tệp — nếu hai tệp đều có "câu 1",
+đó là hai câu hỏi khác nhau thuộc hai phần khác nhau của đề, không phải bản
+sao). Nếu một trong các tệp là bảng đáp án riêng (chỉ liệt kê số câu + đáp
+án đúng, không có đề bài), hãy dùng nó để điền answer/answer_from_key=true
+cho các câu hỏi tương ứng đọc được từ (các) tệp còn lại — đừng tạo exam_item
+riêng cho bản thân tệp đáp án đó.
+"""
+        if multi_file
+        else ""
+    )
     return f"""Bạn là biên tập viên đề thi TOPIK cho người Việt học tiếng Hàn.
 Đọc ảnh/tài liệu đề thi được đính kèm (có thể nhiều trang) và trích xuất:
-
+{multi_file_note}
 1) Các đoạn văn/bài nghe (passages): mỗi đoạn đọc hiểu, kịch bản nghe, hoặc
    biểu đồ/quảng cáo dùng chung cho một hoặc nhiều câu hỏi. Đặt cho mỗi đoạn
    một local_ref ngắn tự chọn (vd "P1", "P2") để các câu hỏi tham chiếu tới.
@@ -506,41 +548,54 @@ Với qtype_code, CHỈ chọn từ danh sách mã đã có trong hệ thống d
 đúng khớp; để trống nếu không có mã nào khớp (không tự đặt mã mới):
 {qtype_hint}
 
-Với đáp án: nếu tài liệu có in kèm bảng đáp án (answer key), đọc chính xác
-đáp án cho từng câu và đánh dấu answer_from_key=true. Nếu KHÔNG có bảng đáp
-án trong tài liệu, có thể tự suy luận đáp án khả dĩ nhất (answer_from_key=
-false) hoặc để answer trống nếu không đủ căn cứ — không suy đoán bừa.
+Với đáp án: nếu tài liệu có in kèm bảng đáp án (answer key, kể cả khi đó là
+một tệp riêng), đọc chính xác đáp án cho từng câu và đánh dấu
+answer_from_key=true. Nếu KHÔNG có bảng đáp án ở đâu cả, có thể tự suy luận
+đáp án khả dĩ nhất (answer_from_key=false) hoặc để answer trống nếu không đủ
+căn cứ — không suy đoán bừa.
 
 Trả về đúng JSON schema đã cho, không thêm giải thích. Tự đánh giá độ tự tin
 (confidence, 0-1) cho từng đoạn văn và từng câu hỏi."""
 
 
-def build_exam_prompt_parts(file_bytes: bytes, mime_type: str, known_qtypes: list[tuple[str, str]]) -> list[Any]:
-    return [gemini_client.part_from_bytes(file_bytes, mime_type), build_exam_prompt(known_qtypes)]
+def build_exam_prompt_parts(
+    files: list[tuple[bytes, str]], known_qtypes: list[tuple[str, str]]
+) -> list[Any]:
+    """`files` is (bytes, mime_type) per uploaded file — 1 to 3 of them
+    (reading passage / listening+writing / answer key; see Studio's
+    exam_paper upload form), all handed to Gemini as separate multimodal
+    parts of the SAME call so it can cross-reference an answer key against
+    the actual questions (FR-19/Gate G6 doesn't apply here — an exam paper
+    is a fixed handful of pages regardless of how many files it's split
+    across)."""
+    parts: list[Any] = [gemini_client.part_from_bytes(data, mime) for data, mime in files]
+    parts.append(build_exam_prompt(known_qtypes, multi_file=len(files) > 1))
+    return parts
 
 
-def extract_exam_paper(file_bytes: bytes, mime_type: str, known_qtypes: list[tuple[str, str]]) -> ExamExtraction:
+def extract_exam_paper(files: list[tuple[bytes, str]], known_qtypes: list[tuple[str, str]]) -> ExamExtraction:
     result = gemini_client.generate_structured(
         model=settings.GEMINI_MODEL_LESSON_INGEST,
-        prompt=build_exam_prompt_parts(file_bytes, mime_type, known_qtypes),
+        prompt=build_exam_prompt_parts(files, known_qtypes),
         response_schema=EXAM_SCHEMA,
         prompt_version="exam-v1",
     )
     return ExamExtraction.model_validate(_parse_json(result["text"]))
 
 
-def run_exam_extraction(db: Session, batch: ImportBatch, file_bytes: bytes, mime_type: str) -> tuple[int, int]:
+def run_exam_extraction(db: Session, batch: ImportBatch, files: list[tuple[bytes, str]]) -> tuple[int, int]:
     """Stages one ImportItem per extracted passage (kind="exam_passage")
     and per extracted question (kind="exam_item"). A question whose answer
     is the model's own guess (no printed answer key found) is ALWAYS
     flagged for review regardless of confidence — getting an exam answer
     wrong is worse than a wrong vocab gloss, so it never slips through on
     a high self-reported confidence alone (same force_flag idea as
-    corpus's is_crude)."""
+    corpus's is_crude). `files` is 1-3 (bytes, mime_type) pairs — see
+    build_exam_prompt_parts."""
     known_qtypes = db.execute(
         select(QuestionType.code, QuestionType.name_vi).where(QuestionType.active.is_(True))
     ).all()
-    extraction = extract_exam_paper(file_bytes, mime_type, known_qtypes)
+    extraction = extract_exam_paper(files, known_qtypes)
     staged = 0
     flagged = 0
 
@@ -727,18 +782,69 @@ _ARTICLE_FETCH_TIMEOUT = 15.0
 _ARTICLE_MAX_BODY_CHARS = 20000
 _ARTICLE_USER_AGENT = "Mozilla/5.0 (compatible; HaruBot/1.0; +family-use-only, not for redistribution)"
 
+# Class/id substrings that mark a container as boilerplate on typical
+# Korean news CMSes (comments, share buttons, related-article lists,
+# byline/reporter cards, tag/hashtag rows, copyright footers) — none of
+# this is the article's own text, but it usually isn't inside <nav>/
+# <footer>/<aside> either, so the plain tag-name strip below misses it.
+# Matched case-insensitively against the element's own class+id string.
+_BOILERPLATE_CONTAINER_HINTS = (
+    "comment", "reply", "disqus",
+    "sns", "share", "sharing", "social",
+    "relate", "related", "recommend", "popular", "ranking",
+    "tag_area", "taglist", "tag-list", "hashtag",
+    "byline", "reporter", "journalist", "author-info",
+    "copyright", "ⓒ",
+    "ad_area", "ad-area", "adbanner", "banner_area", "promotion", "subscribe", "newsletter",
+    "print_area", "btn_area", "util_area",
+)
 
-def fetch_article_text(url: str) -> tuple[str, str | None]:
+# Whole-line boilerplate that slips through even after container stripping
+# (inline share/comment/related-article widgets some CMSes render as plain
+# text nodes, not their own tagged container). Matched against a line's
+# full stripped text.
+_BOILERPLATE_LINE_RE = re.compile(
+    r"^#\S+"  # a lone hashtag line, e.g. "#고령화 #저출산"
+    r"|^(공유하기|공유|스크랩|인쇄하기|글자크기|가|기사원문|기사 원문)$"
+    r"|(페이스북|트위터|카카오\s?톡|카카오스토리|네이버\s?블로그|밴드|URL\s?복사|링크\s?복사)"
+    r"|^(관련\s?기사|관련기사|많이\s?본\s?기사|인기\s?기사|추천\s?기사|이전\s?기사|다음\s?기사)"
+    r"|^(댓글|댓글쓰기|댓글\s?\d+)$"
+    r"|^ⓒ.*무단.*전재",
+    re.IGNORECASE,
+)
+
+# og:site_name (or the plain <meta name="application-name">) is the outlet
+# self-reporting its own name — far more reliable than guessing from a
+# byline in the body text, which is the exact bug this fixes (a sample
+# article ended up with the author's name as source_name instead of the
+# outlet's).
+def _guess_site_name(soup: BeautifulSoup, url: str) -> str | None:
+    for attrs in ({"property": "og:site_name"}, {"name": "application-name"}):
+        tag = soup.find("meta", attrs=attrs)
+        if tag and tag.get("content"):
+            return tag["content"].strip()
+    host = httpx.URL(url).host or ""
+    host = host.removeprefix("www.")
+    return host or None
+
+
+def fetch_article_text(url: str) -> tuple[str, str | None, str | None]:
     """Fetches one editorial/column page and strips it to plain text —
-    script/style/nav/footer/ad-ish tags removed, whitespace collapsed,
-    truncated to _ARTICLE_MAX_BODY_CHARS (a TOPIK 쓰기 54 사설 is a few
-    hundred words; this only guards against an unexpectedly huge page).
-    Returns (body_ko, parsed_title) — parsed_title is a fallback only,
-    used when the admin/candidate didn't already supply one. Deliberately
-    NOT written straight onto EditorialArticle: it becomes part of a
-    staged `editorial_meta` ImportItem instead, so an admin can review —
-    and hand-fix a messy scrape — before it ever reaches a learner (same
-    "staged, human confirms" principle as everything else here)."""
+    script/style/nav/footer/ad-ish TAGS removed first, then containers
+    whose class/id names a known boilerplate widget (comments, share
+    buttons, related-article lists, byline cards, hashtag rows — see
+    _BOILERPLATE_CONTAINER_HINTS), then any straggler lines matching
+    _BOILERPLATE_LINE_RE. Whitespace collapsed, truncated to
+    _ARTICLE_MAX_BODY_CHARS (a TOPIK 쓰기 54 사설 is a few hundred words;
+    this only guards against an unexpectedly huge page).
+
+    Returns (body_ko, parsed_title, suggested_source_name) — the last two
+    are fallbacks/suggestions only, never written straight onto
+    EditorialArticle: they become part of a staged `editorial_meta`
+    ImportItem instead, so an admin can review — and hand-fix a messy
+    scrape or a wrong outlet-name guess — before any of it ever reaches a
+    learner (same "staged, human confirms" principle as everything else
+    here)."""
     resp = httpx.get(
         url,
         timeout=_ARTICLE_FETCH_TIMEOUT,
@@ -758,13 +864,20 @@ def fetch_article_text(url: str) -> tuple[str, str | None]:
     if og_title and og_title.get("content"):
         title = og_title["content"].strip()
 
+    site_name = _guess_site_name(soup, url)
+
     # get_text() on the whole document would also pick up <title>/<meta>
     # text sitting in <head> — read from <body> alone so that never leaks
     # into the article body.
     root = soup.body or soup
+    for el in root.find_all(True):
+        ident = f"{' '.join(el.get('class', []))} {el.get('id', '')}".lower()
+        if any(hint in ident for hint in _BOILERPLATE_CONTAINER_HINTS):
+            el.decompose()
+
     lines = [ln.strip() for ln in root.get_text("\n").splitlines()]
-    body = "\n".join(ln for ln in lines if ln)
-    return body[:_ARTICLE_MAX_BODY_CHARS], title
+    body = "\n".join(ln for ln in lines if ln and not _BOILERPLATE_LINE_RE.search(ln))
+    return body[:_ARTICLE_MAX_BODY_CHARS], title, site_name
 
 
 def build_editorial_prompt(body_ko: str) -> str:
@@ -781,7 +894,10 @@ vào nội dung bài xã luận/chuyên mục chính.
 1. Ước lượng cấp độ TOPIK (1-6) và đề xuất 2-4 chủ đề ngắn gọn bằng tiếng Việt.
 2. Trích xuất từ vựng và mẫu ngữ pháp đáng học (cùng tiêu chí như trích xuất
    bài học thông thường: nghĩa tiếng Việt, định nghĩa tiếng Hàn ngắn gọn nếu
-   có, Hán tự/âm Hán Việt nếu là từ Hán Hàn, câu ví dụ).
+   có, Hán tự/âm Hán Việt nếu là từ Hán Hàn, câu ví dụ). Với MỖI mẫu ngữ
+   pháp: viết usage_context_vi (tiếng Việt) giải thích dùng khi nào/hoàn
+   cảnh nào — không chỉ nêu công thức; và topik_tip_vi nếu mẫu này thường
+   gặp trong đề thi TOPIK (đặc biệt viết câu 54) — nêu cách vận dụng thực tế.
 3. Viết MỘT dàn ý mẫu bằng tiếng Hàn theo đúng cấu trúc 4 phần của câu 54:
    hiện tượng, nguyên nhân, kết quả/ảnh hưởng, giải pháp/kiến nghị — mỗi
    phần 2-4 câu, lấy cảm hứng từ chủ đề bài xã luận này (không cần bám sát
@@ -807,14 +923,24 @@ def extract_editorial(body_ko: str) -> EditorialExtraction:
 
 
 def run_editorial_extraction(
-    db: Session, batch: ImportBatch, body_ko: str, title_ko: str | None
+    db: Session,
+    batch: ImportBatch,
+    body_ko: str,
+    title_ko: str | None,
+    suggested_source_name: str | None = None,
 ) -> tuple[int, int]:
     """Stages the fetched body + Gemini's classification as one
     kind="editorial_meta" ImportItem (body_ko included, so an admin can
     review/edit the scraped text before confirm — see fetch_article_text),
     plus one kind="vocab_item"/"grammar_point" ImportItem per extracted
     word/pattern (lesson_id left null at confirm time — see
-    apply_editorial_batch). Returns (staged_count, flagged_count)."""
+    apply_editorial_batch). `suggested_source_name` (og:site_name/domain,
+    see fetch_article_text) rides along in the same payload so an admin can
+    correct the article's real outlet name at review time too — EditorialArticle.
+    source_name is admin-typed at submission and otherwise never editable
+    again (see find_or_create_editorial_article's docstring), which is
+    exactly how a sample article ended up with an author's byline stored
+    as source_name. Returns (staged_count, flagged_count)."""
     extraction = extract_editorial(body_ko)
     staged = 0
     flagged = 0
@@ -831,6 +957,7 @@ def run_editorial_extraction(
             payload={
                 "body_ko": body_ko,
                 "title_ko": title_ko,
+                "source_name": suggested_source_name,
                 "level_estimate": extraction.level_estimate,
                 "topic_tags": extraction.topic_tags,
                 "model_outline": extraction.model_outline.model_dump(),
@@ -876,7 +1003,7 @@ def run_editorial_extraction(
 
 # ================================================================ confirm ==
 _VOCAB_FIELDS = {"hangul", "pos", "meaning_vi", "definition_ko", "level", "hanja", "sino_vietnamese", "example_ko"}
-_GRAMMAR_FIELDS = {"pattern", "meaning_vi", "level", "example_ko"}
+_GRAMMAR_FIELDS = {"pattern", "meaning_vi", "level", "example_ko", "usage_context_vi", "topik_tip_vi"}
 
 
 def _find_or_create_topic(db: Session, name: str) -> int:
@@ -1103,6 +1230,11 @@ def apply_editorial_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
         payload = meta_item.payload
         article.body_ko = payload["body_ko"]
         article.title_ko = payload.get("title_ko") or article.title_ko
+        # An admin who noticed/edited a wrong source_name (e.g. an author
+        # byline scraped in as the outlet name) in this item's payload
+        # before confirming gets that correction applied here — see
+        # run_editorial_extraction's docstring.
+        article.source_name = payload.get("source_name") or article.source_name
         article.level_estimate = payload["level_estimate"]
         article.topic_tags = payload.get("topic_tags", [])
         article.model_outline = payload["model_outline"]
@@ -1387,3 +1519,175 @@ def discover_editorial_candidates(db: Session) -> dict[str, Any]:
         per_source[source.name] = n
         total += n
     return {"total_inserted": total, "per_source": per_source, "errors": errors}
+
+
+# ==================================================== consolidated podcast ==
+# Owner feedback: per-word TTS ("Nghe" buttons on vocab_item/corpus_item)
+# misses the point — studying should be "nghe và nhại lại" (listen and
+# shadow) from ONE consolidated lecture that actually teaches each word/
+# grammar point in context, not flip through isolated flashcards read aloud
+# ("như hiện tại thì tôi dùng quizlet cho nhanh chứ build app mới làm gì").
+# This generates that lecture script; app.workers.tasks.generate_content_podcast
+# then feeds it into the existing tts.synthesize_korean_tts and stores both
+# script + audio in audio.lecture_audio (cache_key prefixed "podcast:...").
+PODCAST_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "script": {
+            "type": "STRING",
+            "description": "Toàn bộ kịch bản bài giảng audio, xen kẽ tiếng Hàn và tiếng Việt, có nhắc học viên lặp lại",
+        },
+    },
+    "required": ["script"],
+}
+
+
+def build_podcast_prompt(
+    title: str,
+    vocab: list[tuple[str, str | None, str, str | None]],
+    grammar: list[tuple[str, str, str | None, str | None, str | None]],
+) -> str:
+    """vocab: (hangul, pos, meaning_vi, example_ko).
+    grammar: (pattern, meaning_vi, example_ko, usage_context_vi, topik_tip_vi)."""
+    vocab_lines = (
+        "\n".join(
+            f"- {hangul}" + (f" ({pos})" if pos else "") + f": {meaning_vi}"
+            + (f" — ví dụ: {ex}" if ex else "")
+            for hangul, pos, meaning_vi, ex in vocab
+        )
+        or "(không có từ vựng)"
+    )
+    grammar_lines = (
+        "\n".join(
+            f"- {pattern}: {meaning_vi}"
+            + (f"\n  Cách dùng: {usage}" if usage else "")
+            + (f"\n  Mẹo TOPIK: {tip}" if tip else "")
+            + (f"\n  Ví dụ: {ex}" if ex else "")
+            for pattern, meaning_vi, ex, usage, tip in grammar
+        )
+        or "(không có ngữ pháp)"
+    )
+
+    return f"""Bạn là giáo viên tiếng Hàn thu âm một bài giảng audio (kiểu podcast) cho
+người Việt học tiếng Hàn, học theo phương pháp NGHE VÀ NHẠI LẠI (shadowing) —
+KHÔNG phải học từng thẻ từ vựng rời rạc như flashcard/từ điển đọc to.
+
+Chủ đề bài học: {title}
+
+Hãy viết MỘT kịch bản audio liền mạch, nói xen kẽ tiếng Việt (giải thích,
+dẫn dắt) và tiếng Hàn (từ/câu để học viên nhại lại), theo đúng cấu trúc:
+1. Mở đầu ngắn gọn bằng tiếng Việt giới thiệu bài học sẽ nói về gì.
+2. Với TỪNG từ vựng dưới đây: đọc từ đó, nói "Nhắc lại nào:" rồi đọc lại từ
+   đó, giải thích nghĩa bằng tiếng Việt, rồi đọc câu ví dụ (nếu có) kèm
+   "Nhắc lại nào:" và đọc lại câu ví dụ.
+3. Với TỪNG mẫu ngữ pháp dưới đây: đọc mẫu ngữ pháp, giải thích bằng tiếng
+   Việt NGHĨA LÀ GÌ và QUAN TRỌNG HƠN — dùng khi nào/trong hoàn cảnh nào
+   (dựa vào phần "Cách dùng" bên dưới, diễn giải lại tự nhiên chứ không đọc
+   y nguyên như liệt kê), nếu có mẹo thi TOPIK thì nói luôn cách vận dụng
+   thực tế khi làm bài thi, rồi đọc câu ví dụ kèm "Nhắc lại nào:" và đọc lại.
+4. Kết thúc bằng một câu động viên ngắn bằng tiếng Việt.
+
+Giọng văn: thân thiện, chậm rãi, như một giáo viên thật đang giảng bài trực
+tiếp — không liệt kê khô khan như tra từ điển. Đây là văn bản sẽ được đọc
+thành tiếng (text-to-speech), nên viết câu ngắn, tự nhiên khi đọc lên, dùng
+dấu câu (dấu chấm, dấu phẩy, dấu ba chấm "...") để tạo khoảng dừng tự nhiên
+thay vì dùng thẻ định dạng.
+
+DANH SÁCH TỪ VỰNG:
+{vocab_lines}
+
+DANH SÁCH NGỮ PHÁP:
+{grammar_lines}
+
+Trả về đúng JSON schema đã cho (trường "script"), không thêm giải thích."""
+
+
+def generate_podcast_script(
+    title: str,
+    vocab: list[tuple[str, str | None, str, str | None]],
+    grammar: list[tuple[str, str, str | None, str | None, str | None]],
+) -> str:
+    result = gemini_client.generate_structured(
+        model=settings.GEMINI_MODEL_LESSON_INGEST,
+        prompt=build_podcast_prompt(title, vocab, grammar),
+        response_schema=PODCAST_SCHEMA,
+        prompt_version="podcast-v1",
+    )
+    return _parse_json(result["text"])["script"]
+
+
+# ============================================== editorial outline feedback ==
+# Owner feedback: saving a "luyện dàn ý" attempt never actually got
+# analyzed — only a static, ingestion-time model_outline was ever shown.
+# This is the real per-submission Gemini call app.workers.tasks.
+# grade_editorial_outline runs after every save.
+OUTLINE_FEEDBACK_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "feedback_vi": {
+            "type": "STRING",
+            "description": "Nhận xét chi tiết bằng tiếng Việt cho dàn ý của học viên",
+        },
+    },
+    "required": ["feedback_vi"],
+}
+
+
+def build_outline_feedback_prompt(
+    article_title: str,
+    article_body: str,
+    reference_outline: dict[str, str],
+    learner_outline: dict[str, str | None],
+) -> str:
+    learner_lines = "\n".join(
+        f"- {label}: {learner_outline.get(key) or '(chưa viết)'}"
+        for key, label in (
+            ("phenomenon_text", "Hiện tượng (현상)"),
+            ("cause_text", "Nguyên nhân (원인)"),
+            ("consequence_text", "Kết quả/ảnh hưởng (결과)"),
+            ("solution_text", "Giải pháp/kiến nghị (해결 방안)"),
+        )
+    )
+    return f"""Bạn là giáo viên chấm bài luyện viết TOPIK II câu 54 (dàn ý theo cấu trúc
+hiện tượng - nguyên nhân - kết quả - giải pháp) cho người Việt học tiếng Hàn.
+
+Bài xã luận học viên đang luyện đọc, tựa đề: {article_title}
+Trích bài xã luận (để bạn hiểu ngữ cảnh, không cần nhắc lại nguyên văn):
+{article_body[:3000]}
+
+Dàn ý THAM KHẢO (chỉ để bạn đối chiếu — KHÔNG chép lại nguyên văn cho học
+viên, học viên có thể chưa xem dàn ý này):
+- Hiện tượng: {reference_outline.get("phenomenon", "")}
+- Nguyên nhân: {reference_outline.get("cause", "")}
+- Kết quả: {reference_outline.get("consequence", "")}
+- Giải pháp: {reference_outline.get("solution", "")}
+
+Dàn ý CỦA HỌC VIÊN (tiếng Hàn, có thể còn sơ sài hoặc có lỗi):
+{learner_lines}
+
+Viết nhận xét bằng tiếng Việt (feedback_vi), khoảng 4-8 câu, thẳng thắn
+nhưng khích lệ:
+1. Học viên đã bám đúng cấu trúc 4 phần chưa, ý tưởng có hợp lý/liên quan
+   bài xã luận không.
+2. Chỉ ra 1-2 lỗi ngữ pháp/từ vựng/chính tả tiếng Hàn CỤ THỂ nếu có (trích
+   nguyên văn phần sai, kèm cách sửa).
+3. Gợi ý CỤ THỂ cách phát triển/làm rõ ý còn thiếu hoặc còn chung chung
+   (không chỉ nói "cần chi tiết hơn" mà nói rõ chi tiết hơn LÀ GÌ).
+4. Nếu học viên chưa viết phần nào, nhắc nhở nhẹ nhàng, không chê bai.
+
+Trả về đúng JSON schema đã cho, không thêm giải thích."""
+
+
+def generate_outline_feedback(
+    article_title: str,
+    article_body: str,
+    reference_outline: dict[str, str],
+    learner_outline: dict[str, str | None],
+) -> str:
+    result = gemini_client.generate_structured(
+        model=settings.GEMINI_MODEL_LESSON_INGEST,
+        prompt=build_outline_feedback_prompt(article_title, article_body, reference_outline, learner_outline),
+        response_schema=OUTLINE_FEEDBACK_SCHEMA,
+        prompt_version="outline-feedback-v1",
+    )
+    return _parse_json(result["text"])["feedback_vi"]
