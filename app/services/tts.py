@@ -37,15 +37,12 @@ DEFAULT_GEMINI_VOICE = "Kore"
 
 _RATE_RE = re.compile(r"rate=(\d+)")
 
-# Native Gemini TTS (audio-out generate_content, not the classic text-only
-# API) reliably 500s on a long single-shot input — confirmed in production:
-# every podcast attempt (a whole-lesson script covering ALL vocab+grammar,
-# easily several thousand characters) failed with a generic
-# "500 INTERNAL" every single time, while every short caller (one
-# word/sentence — lecture-per-line, corpus-per-cue, vocab-per-word) always
-# succeeded. There's no documented hard limit, so this is a conservative
-# budget (~a minute of speech) chosen to stay well clear of it rather than
-# a number from Google's docs. Below this, text is sent as one chunk
+# The actual cause of the podcast 500s turned out to be the (now-removed)
+# system_instruction field, not length — a ~1600-char chunk reproduced the
+# same 500 regardless. Kept as a defensive ceiling anyway: Google doesn't
+# document a hard input limit for native TTS, and a whole-lesson script
+# can run to several thousand characters, so this keeps each request to
+# roughly a minute of speech. Below this, text is sent as one chunk
 # exactly like before (so short callers are unaffected); above it, text is
 # split at sentence boundaries and synthesized as multiple chunks whose
 # raw PCM gets concatenated before a single transcode.
@@ -173,22 +170,21 @@ def synthesize_korean_tts(text_ko: str, voice: str = "ko-female-1") -> tuple[byt
     # match this pinned SDK's proven-working style in gemini_client.py —
     # the SDK's dict->proto conversion accepts snake_case keys here.
     #
-    # `system_instruction` matters more here than for a single word/sentence
-    # (the pre-existing corpus/vocab/lecture-audio callers): a longer,
-    # conversational script (the podcast feature) can otherwise read enough
-    # like a request/task to the model that it tries to *answer* instead of
-    # just voicing it, which the TTS-only model rejects outright with a 400
-    # ("Model tried to generate text, but it should only be used for TTS").
-    # Framing the call explicitly as read-this-verbatim avoids that for any
-    # caller, short or long.
+    # NOTE: this used to also send `system_instruction`, added to stop a
+    # long conversational script (the podcast feature) from reading enough
+    # like a request/task that the model tried to *answer* it instead of
+    # voicing it (400 "Model tried to generate text, but it should only be
+    # used for TTS"). That turned out to be the wrong fix: Gemini's native
+    # TTS docs (response_modalities=["AUDIO"]) document only
+    # response_modalities/speech_config for these models — no
+    # system_instruction — and every podcast call started failing with a
+    # generic 500 INTERNAL the moment system_instruction was added,
+    # reproducing on the very first ~1600-char chunk regardless of content.
+    # Removed; the actual fix for the 400 is at the source — the script
+    # PROMPT (build_podcast_prompt in ingestion.py) already forbids the
+    # model from writing instruction-like phrasing into the script itself,
+    # so the text handed to TTS is already plain narration.
     config = {
-        "system_instruction": (
-            "Bạn là một công cụ chuyển văn bản thành giọng nói (text-to-speech). "
-            "Nhiệm vụ DUY NHẤT của bạn là đọc to, nguyên văn đoạn văn bản người dùng "
-            "cung cấp bên dưới bằng giọng tự nhiên. TUYỆT ĐỐI không trả lời, không "
-            "diễn giải, không bình luận, không thêm hay bớt bất kỳ nội dung nào ngoài "
-            "việc đọc chính xác đoạn văn bản đó."
-        ),
         "response_modalities": ["AUDIO"],
         "speech_config": {
             "voice_config": {"prebuilt_voice_config": {"voice_name": voice_name}},
