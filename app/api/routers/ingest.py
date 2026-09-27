@@ -142,6 +142,21 @@ async def create_import_batch(
     )
 
 
+@router.get("", response_model=list[ImportBatchOut])
+async def list_import_batches(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile, Depends(_editor_or_admin)],
+    kind: Annotated[Literal["lesson", "corpus", "exam_paper"] | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 30,
+):
+    """Backs the Studio screen's batch list — newest first."""
+    query = select(ImportBatch).order_by(ImportBatch.created_at.desc()).limit(limit)
+    if kind:
+        query = query.where(ImportBatch.kind == kind)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
 @router.get("/{import_id}", response_model=ImportBatchOut)
 async def get_import_batch(
     import_id: uuid.UUID,
