@@ -1591,13 +1591,14 @@ dẫn dắt) và tiếng Hàn (từ/câu để học viên nhại lại), theo �
 3. Với TỪNG mẫu ngữ pháp dưới đây: đọc mẫu ngữ pháp, giải thích bằng tiếng
    Việt NGHĨA LÀ GÌ và QUAN TRỌNG HƠN — dùng khi nào/trong hoàn cảnh nào
    (dựa vào phần "Cách dùng" bên dưới, diễn giải lại tự nhiên chứ không đọc
-   y nguyên như liệt kê). Nếu có mẹo thi TOPIK, hãy TƯỜNG THUẬT nó dưới
-   dạng một NHẬN XÉT/THÔNG TIN khách quan (ví dụ: "Trong đề thi TOPIK, câu
-   có chủ ngữ là người lớn tuổi thường có đáp án đúng chứa -(으)시") —
-   TUYỆT ĐỐI KHÔNG viết dưới dạng câu MỆNH LỆNH bảo người nghe làm gì, đặc
-   biệt tránh các cụm như "hãy chọn/chú ý chọn/nhớ chọn đáp án..." (những
-   câu nghe giống đang ra đề/yêu cầu chọn đáp án trắc nghiệm dễ khiến máy
-   đọc hiểu nhầm thành một tác vụ cần thực hiện thay vì lời thoại cần đọc).
+   y nguyên như liệt kê). Nếu có mẹo thi TOPIK, hãy kể nó như một QUAN SÁT
+   VỀ NGÔN NGỮ, KHÔNG PHẢI về việc thi cử hay trả lời câu hỏi — ví dụ nói
+   "Mẫu -(으)시 này rất hay xuất hiện khi câu nói về ông bà, cha mẹ hoặc
+   người lớn tuổi trong đề TOPIK" thay vì nhắc đến việc chọn/xác định câu
+   trả lời. TUYỆT ĐỐI CẤM các từ "đáp án", "chọn", "trả lời", "câu hỏi" và
+   bất kỳ câu nào mô phỏng một đề thi trắc nghiệm (nghe giống đang ra đề
+   hoặc yêu cầu chọn phương án dễ khiến máy đọc hiểu nhầm thành một tác vụ
+   cần thực hiện thay vì lời thoại cần đọc, thay vì chỉ đơn thuần đọc to).
    Sau đó đọc câu ví dụ kèm "Nhắc lại nào:" và đọc lại.
 4. Kết thúc bằng một câu động viên ngắn bằng tiếng Việt.
 
@@ -1614,9 +1615,10 @@ tuyệt đối không viết những câu như "giải thích nghĩa bằng ti�
 thẳng lời giải thích và lời nhắc thật ra). Không được có bất kỳ câu nào
 nghe giống một yêu cầu/câu hỏi/chỉ thị gửi tới người đọc máy — toàn bộ phải
 là câu nói trực tiếp của người giáo viên. Điều này áp dụng cả với phần mẹo
-TOPIK: không viết "hãy chọn đáp án có chứa..." hay bất kỳ câu mệnh lệnh
-bảo "chọn"/"chú ý chọn" nào — hãy nói dưới dạng nhận xét ("đáp án đúng
-thường chứa...") thay vì ra lệnh.
+TOPIK: tuyệt đối không dùng các từ "đáp án", "chọn", "trả lời", "câu hỏi"
+và không mô phỏng bất kỳ câu hỏi trắc nghiệm nào — hãy kể mẹo TOPIK như một
+quan sát thuần về ngôn ngữ (mẫu này hay xuất hiện trong ngữ cảnh/chủ đề
+nào), không nhắc gì đến việc thi cử, chọn hay trả lời.
 
 DANH SÁCH TỪ VỰNG:
 {vocab_lines}
