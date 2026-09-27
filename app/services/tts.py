@@ -19,6 +19,7 @@ import re
 import subprocess
 
 from google import genai
+from google.genai import errors as genai_errors
 
 from app.core.config import settings
 
@@ -112,7 +113,25 @@ def synthesize_korean_tts(text_ko: str, voice: str = "ko-female-1") -> tuple[byt
             "voice_config": {"prebuilt_voice_config": {"voice_name": voice_name}},
         },
     }
-    response = client.models.generate_content(model=settings.GEMINI_MODEL_TTS, contents=text_ko, config=config)
+    try:
+        response = client.models.generate_content(model=settings.GEMINI_MODEL_TTS, contents=text_ko, config=config)
+    except genai_errors.APIError as exc:
+        # Surface a clean, actionable message instead of the raw SDK repr
+        # (a huge nested-dict string) — this is what ends up verbatim in
+        # job.error.message and is shown to the end user. Free-tier Gemini
+        # API keys have a very low daily request cap per TTS model
+        # (observed: 10 requests/day for gemini-2.5-flash-tts), so this is
+        # the failure mode every TTS caller (lecture/corpus/vocab/podcast)
+        # will hit repeatedly during active testing once that cap is spent.
+        if exc.status == "RESOURCE_EXHAUSTED" or exc.code == 429:
+            raise RuntimeError(
+                "Đã hết hạn mức Gemini TTS miễn phí trong hôm nay. Thử lại vào ngày mai, "
+                "hoặc bật billing (pay-as-you-go) cho API key trong Google AI Studio / "
+                "Google Cloud Console để tăng hạn mức."
+            ) from exc
+        raise RuntimeError(
+            f"Gemini TTS tạm thời gặp lỗi ({exc.code} {exc.status or 'unknown'}), thử lại sau ít phút."
+        ) from exc
 
     candidates = response.candidates or []
     parts = candidates[0].content.parts if candidates and candidates[0].content else None
