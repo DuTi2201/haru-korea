@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     # cache the result (audio.lecture_audio / audio.corpus_item_audio) and
     # never call this per-playback.
     GEMINI_MODEL_TTS: str = "gemini-2.5-flash-preview-tts"
+    # Gemini's free-tier TTS quota is tracked per-model (e.g. a hard 10
+    # requests/day cap on gemini-2.5-flash-tts alone), so a fallback model
+    # is a genuinely separate quota bucket, not just cosmetic redundancy.
+    # synthesize_korean_tts only fails over to this on a RESOURCE_EXHAUSTED
+    # (429) from the primary model — kept a same-generation TTS model (not
+    # one of the newer 3.x models) since it's confirmed to use the exact
+    # same generate_content/response_modalities/speech_config call shape.
+    GEMINI_MODEL_TTS_FALLBACK: str = "gemini-2.5-pro-preview-tts"
 
     # Content-ingestion tuning (Studio uploads — admin.py/ingest.py)
     MAX_INGEST_FILE_MB: int = 20

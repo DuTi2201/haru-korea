@@ -113,25 +113,41 @@ def synthesize_korean_tts(text_ko: str, voice: str = "ko-female-1") -> tuple[byt
             "voice_config": {"prebuilt_voice_config": {"voice_name": voice_name}},
         },
     }
-    try:
-        response = client.models.generate_content(model=settings.GEMINI_MODEL_TTS, contents=text_ko, config=config)
-    except genai_errors.APIError as exc:
-        # Surface a clean, actionable message instead of the raw SDK repr
-        # (a huge nested-dict string) — this is what ends up verbatim in
-        # job.error.message and is shown to the end user. Free-tier Gemini
-        # API keys have a very low daily request cap per TTS model
-        # (observed: 10 requests/day for gemini-2.5-flash-tts), so this is
-        # the failure mode every TTS caller (lecture/corpus/vocab/podcast)
-        # will hit repeatedly during active testing once that cap is spent.
-        if exc.status == "RESOURCE_EXHAUSTED" or exc.code == 429:
+    # Gemini's free-tier TTS quota is a hard per-model daily cap (observed:
+    # 10 requests/day for gemini-2.5-flash-tts) — every TTS caller
+    # (lecture/corpus/vocab/podcast audio) shares this same call, so one
+    # busy test day exhausts it for all of them at once. The quota is
+    # tracked per model, so a same-shape fallback model is a genuinely
+    # separate bucket, not just a retry of the same failure. Only a
+    # RESOURCE_EXHAUSTED (429) falls through to the next model — any other
+    # APIError (bad request, transient 5xx, etc.) is the same regardless of
+    # model, so it's raised immediately instead of burning a second call.
+    models_to_try = [settings.GEMINI_MODEL_TTS]
+    if settings.GEMINI_MODEL_TTS_FALLBACK and settings.GEMINI_MODEL_TTS_FALLBACK not in models_to_try:
+        models_to_try.append(settings.GEMINI_MODEL_TTS_FALLBACK)
+
+    response = None
+    for i, model_name in enumerate(models_to_try):
+        try:
+            response = client.models.generate_content(model=model_name, contents=text_ko, config=config)
+            break
+        except genai_errors.APIError as exc:
+            is_quota = exc.status == "RESOURCE_EXHAUSTED" or exc.code == 429
+            if is_quota and i < len(models_to_try) - 1:
+                continue
+            if is_quota:
+                # Surface a clean, actionable message instead of the raw SDK
+                # repr (a huge nested-dict string) — this is what ends up
+                # verbatim in job.error.message and is shown to the user.
+                raise RuntimeError(
+                    "Đã hết hạn mức Gemini TTS miễn phí trong hôm nay (đã thử cả model dự phòng). "
+                    "Thử lại vào ngày mai, hoặc bật billing (pay-as-you-go) cho API key trong "
+                    "Google AI Studio / Google Cloud Console để tăng hạn mức."
+                ) from exc
             raise RuntimeError(
-                "Đã hết hạn mức Gemini TTS miễn phí trong hôm nay. Thử lại vào ngày mai, "
-                "hoặc bật billing (pay-as-you-go) cho API key trong Google AI Studio / "
-                "Google Cloud Console để tăng hạn mức."
+                f"Gemini TTS tạm thời gặp lỗi ({exc.code} {exc.status or 'unknown'}), thử lại sau ít phút."
             ) from exc
-        raise RuntimeError(
-            f"Gemini TTS tạm thời gặp lỗi ({exc.code} {exc.status or 'unknown'}), thử lại sau ít phút."
-        ) from exc
+    assert response is not None  # loop always either returns via break or raises
 
     candidates = response.candidates or []
     parts = candidates[0].content.parts if candidates and candidates[0].content else None
