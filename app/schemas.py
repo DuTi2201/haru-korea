@@ -24,6 +24,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
 class TokenPair(BaseModel):
     access_token: str
     refresh_token: str
