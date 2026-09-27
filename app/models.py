@@ -156,6 +156,28 @@ class CorpusItemAudio(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class VocabItemAudio(Base):
+    """Same content-addressed cache pattern as CorpusItemAudio, but keyed
+    to one content.vocab_item — backs the "nghe" (listen) button on a
+    vocab flashcard (SRS/SDD: vocab study must offer audio, not just the
+    written hangul). `vocab_item_id` is a plain integer (content.vocab_item
+    uses an autoincrement int PK, not a UUID) and stays a bare id for the
+    same cross-module reason as corpus_item_id above — no physical FK."""
+
+    __tablename__ = "vocab_item_audio"
+    __table_args__ = {"schema": "audio"}
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    vocab_item_id: Mapped[int] = mapped_column(Integer, index=True)
+    cache_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    opus_data: Mapped[bytes] = mapped_column(LargeBinary)
+    aac_data: Mapped[bytes] = mapped_column(LargeBinary)
+    prompt_version: Mapped[str] = mapped_column(String(32))
+    voice: Mapped[str] = mapped_column(String(64))
+    duration_sec: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 # ------------------------------------------------------------------ corpus --
 class Film(Base):
     """SRS §5 FILM — the registry a subtitle upload is filed under. Named

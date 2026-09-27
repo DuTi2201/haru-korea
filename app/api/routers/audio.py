@@ -27,12 +27,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_profile
 from app.db import get_db
-from app.models import CorpusItemAudio, Job, LectureAudio, Profile
-from app.schemas import CorpusAudioRequest, JobAccepted, LectureAudioRequest
-from app.workers.tasks import generate_corpus_audio, generate_lecture_audio
+from app.models import CorpusItemAudio, Job, LectureAudio, Profile, VocabItemAudio
+from app.schemas import CorpusAudioRequest, JobAccepted, LectureAudioRequest, VocabAudioRequest
+from app.workers.tasks import generate_corpus_audio, generate_lecture_audio, generate_vocab_audio
 
 router = APIRouter(prefix="/lessons", tags=["audio"])
 corpus_router = APIRouter(prefix="/corpus", tags=["audio"])
+vocab_router = APIRouter(prefix="/vocab-items", tags=["audio"])
 
 _CACHE_CONTROL = "public, max-age=31536000, immutable"  # cache_key is content-addressed — never changes once written
 
@@ -190,6 +191,84 @@ async def stream_corpus_audio(filename: str, db: Annotated[AsyncSession, Depends
     cache_key, media_type = _split_cache_filename(filename)
     row = (
         await db.execute(select(CorpusItemAudio).where(CorpusItemAudio.cache_key == cache_key))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not found")
+    data = row.opus_data if media_type.startswith("audio/ogg") else row.aac_data
+    if not data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not yet generated")
+    return Response(content=data, media_type=media_type, headers={"Cache-Control": _CACHE_CONTROL})
+
+
+@vocab_router.post("/{vocab_item_id}/audio", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
+async def request_vocab_audio(
+    vocab_item_id: int,
+    body: VocabAudioRequest,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Same content-addressed cache-hit-shortcut as corpus-item audio, but
+    for one vocab flashcard's hangul. No login required — same rationale
+    as corpus: hearing a word read aloud is a public read, only the "đã
+    nhớ/chưa nhớ" progress button needs an account. Covers both the
+    lesson-flashcard screen and an editorial article's vocab list, since
+    both read from the exact same content.vocab_item rows."""
+    cache_key = f"{vocab_item_id}:{body.voice}:{body.prompt_version}"
+
+    cached = await db.execute(select(VocabItemAudio).where(VocabItemAudio.cache_key == cache_key))
+    hit = cached.scalar_one_or_none()
+
+    idempotency_key = request.headers.get("Idempotency-Key", cache_key)
+
+    existing_job = await db.execute(
+        select(Job).where(
+            Job.type == "generate_vocab_audio",
+            Job.idempotency_key == idempotency_key,
+            Job.status.in_(["queued", "running", "succeeded"]),
+        )
+    )
+    job = existing_job.scalar_one_or_none()
+
+    if job is None:
+        job = Job(
+            type="generate_vocab_audio",
+            owner_id=None,
+            idempotency_key=idempotency_key,
+            status="succeeded" if hit else "queued",
+            progress=1.0 if hit else 0.0,
+            result={
+                "cache_key": hit.cache_key,
+                "opus_path": f"/api/v1/vocab-items/audio/{hit.cache_key}.opus",
+                "aac_path": f"/api/v1/vocab-items/audio/{hit.cache_key}.aac",
+                "duration_sec": hit.duration_sec,
+            }
+            if hit
+            else None,
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+
+        if not hit:
+            generate_vocab_audio.delay(
+                str(job.id), str(vocab_item_id), body.text_ko, body.voice, body.prompt_version
+            )
+
+    return JobAccepted(
+        job_id=job.id,
+        status=job.status,
+        poll_url=f"/api/v1/jobs/{job.id}",
+        events_url=f"/api/v1/jobs/{job.id}/events",
+    )
+
+
+@vocab_router.get("/audio/{filename}")
+async def stream_vocab_audio(filename: str, db: Annotated[AsyncSession, Depends(get_db)]):
+    """Serves audio.vocab_item_audio bytes — same shape as
+    stream_corpus_audio, keyed by the vocab item's own cache_key."""
+    cache_key, media_type = _split_cache_filename(filename)
+    row = (
+        await db.execute(select(VocabItemAudio).where(VocabItemAudio.cache_key == cache_key))
     ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not found")

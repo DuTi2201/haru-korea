@@ -145,7 +145,16 @@ async def create_import_batch(
     so a plain-text lesson (typed/pasted, or a real .txt file) goes through
     the exact same multimodal extraction call as a photographed page,
     letting an admin skip the photo step entirely when they already have
-    the lesson as text."""
+    the lesson as text.
+
+    "corpus" (phụ đề phim) has no mime whitelist — a real .srt/.vtt file
+    often reports an unregistered/empty content_type in the browser, so
+    enforcing one here would reject legitimate subtitle uploads. It DOES
+    now compute mime_type (same as lesson/exam_paper) and pass it through
+    to extraction: an image/PDF upload (a photographed/screenshotted
+    subtitle list) gets OCR'd via Gemini vision first instead of being
+    silently base64-decoded as garbage text (see
+    ingestion.extract_corpus_source_text)."""
     if kind == "editorial_article":
         if not (source_url and source_name):
             raise _problem(
@@ -175,8 +184,8 @@ async def create_import_batch(
             "file_too_large",
             f"limit is {settings.MAX_INGEST_FILE_MB} MB",
         )
+    mime_type: str | None = file.content_type or mimetypes.guess_type(file.filename or "")[0]
     if kind in ("lesson", "exam_paper"):
-        mime_type = file.content_type or mimetypes.guess_type(file.filename or "")[0]
         if mime_type not in _LESSON_MIME_TYPES:
             raise _problem(
                 status.HTTP_400_BAD_REQUEST,
@@ -227,7 +236,7 @@ async def create_import_batch(
         if kind == "lesson":
             extract_lesson_import.delay(str(job.id), str(batch.id), file_b64, mime_type)
         elif kind == "corpus":
-            extract_corpus_import.delay(str(job.id), str(batch.id), file_b64, film_title)
+            extract_corpus_import.delay(str(job.id), str(batch.id), file_b64, film_title, mime_type)
         else:
             extract_exam_paper_import.delay(str(job.id), str(batch.id), file_b64, mime_type, exam_kind, session_label)
 

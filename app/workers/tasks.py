@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
-from app.models import CorpusItemAudio, ImportBatch, LectureAudio
+from app.models import CorpusItemAudio, ImportBatch, LectureAudio, VocabItemAudio
 from app.services import ingestion, tts
 from app.services.job_events import publish_job_event
 
@@ -109,6 +109,54 @@ def generate_corpus_audio(self, job_id: str, corpus_item_id: str, text_ko: str, 
             raise
 
 
+@celery_app.task(name="app.workers.tasks.generate_vocab_audio", bind=True, max_retries=3)
+def generate_vocab_audio(self, job_id: str, vocab_item_id: str, text_ko: str, voice: str, prompt_version: str):
+    """Same pattern as generate_corpus_audio, keyed to one content.vocab_item
+    (a single flashcard's hangul) instead of a listening sentence — backs
+    the "nghe" (listen) button on the vocab-study screen (both the lesson
+    flashcards and an editorial article's vocab list use the same
+    VocabItem rows, so this one endpoint covers both)."""
+    jid = uuid.UUID(job_id)
+    cache_key = f"{vocab_item_id}:{voice}:{prompt_version}"
+    with Session(_sync_engine) as db:
+        try:
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc với Gemini")
+            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(text_ko, voice)
+
+            publish_job_event(db, jid, progress=0.8, step="Đang lưu âm thanh")
+            row = VocabItemAudio(
+                vocab_item_id=int(vocab_item_id),
+                cache_key=cache_key,
+                opus_data=opus_bytes,
+                aac_data=aac_bytes,
+                prompt_version=prompt_version,
+                voice=voice,
+                duration_sec=duration_sec,
+            )
+            db.add(row)
+            db.commit()
+
+            publish_job_event(
+                db,
+                jid,
+                status="succeeded",
+                progress=1.0,
+                step="Hoàn tất",
+                result={
+                    "cache_key": cache_key,
+                    "opus_path": f"/api/v1/vocab-items/audio/{cache_key}.opus",
+                    "aac_path": f"/api/v1/vocab-items/audio/{cache_key}.aac",
+                    "duration_sec": duration_sec,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            publish_job_event(
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
+            )
+            raise
+
+
 @celery_app.task(name="app.workers.tasks.grade_writing_submission")
 def grade_writing_submission(job_id: str, submission_id: str):
     """Stub for the Xưởng viết grading step (OCR transcript already
@@ -169,11 +217,18 @@ def extract_lesson_import(self, job_id: str, batch_id: str, file_b64: str, mime_
 
 
 @celery_app.task(name="app.workers.tasks.extract_corpus_import", bind=True, max_retries=2)
-def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_title: str):
+def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_title: str, mime_type: str | None = None):
     """Phụ đề phim -> phân đoạn theo lô cố định (chunk_cues) -> mỗi lô gọi
     Gemini phân loại câu/cụm/mẫu ngữ pháp riêng, KHÔNG dồn cả kịch bản vào
     một prompt (FR-19, Gate G6: kích thước prompt không phình theo độ dài
-    kịch bản) -> đề xuất corpus_item vào khu chờ duyệt."""
+    kịch bản) -> đề xuất corpus_item vào khu chờ duyệt.
+
+    `mime_type` decides how the raw bytes become text: a real .srt/.vtt file
+    or plain text is just decoded, but an image/PDF (a photographed or
+    screenshotted subtitle list) goes through a Gemini-vision OCR pass first
+    — see ingestion.extract_corpus_source_text. `mime_type=None` (older
+    enqueued jobs / callers that don't pass it) falls back to the previous
+    plain-decode-only behavior, so this stays backward compatible."""
     jid, bid = uuid.UUID(job_id), uuid.UUID(batch_id)
     with Session(_sync_engine) as db:
         batch = db.get(ImportBatch, bid)
@@ -186,9 +241,16 @@ def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_
             batch.status = "extracting"
             db.add(batch)
             db.commit()
-            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tách câu thoại")
+            is_image = bool(mime_type) and (mime_type.startswith("image/") or mime_type == "application/pdf")
+            publish_job_event(
+                db, jid, status="running", progress=0.1,
+                step="Đang nhận diện văn bản từ ảnh" if is_image else "Đang tách câu thoại",
+            )
 
-            raw_text = base64.b64decode(file_b64).decode("utf-8", errors="replace")
+            file_bytes = base64.b64decode(file_b64)
+            raw_text = ingestion.extract_corpus_source_text(file_bytes, mime_type)
+            if is_image:
+                publish_job_event(db, jid, progress=0.4, step="Đang tách câu thoại")
             staged, flagged = ingestion.run_corpus_extraction(db, batch, raw_text)
 
             batch.status = "awaiting_review"

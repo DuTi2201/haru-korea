@@ -71,6 +71,25 @@ def parse_subtitles(raw: str) -> list[Cue]:
     return cues
 
 
+def parse_plain_lines(raw: str) -> list[Cue]:
+    """Fallback for corpus input that isn't real timestamped .srt/.vtt — a
+    plain-text paste, or the raw text Gemini-OCR recovers from a photographed
+    /screenshotted subtitle list (neither carries real timecodes). Every
+    non-empty, non-music-only line becomes its own cue with a synthetic
+    sequential source_ref, so this kind of upload doesn't silently stage
+    zero items just because parse_subtitles found no timecode blocks."""
+    cues: list[Cue] = []
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    for i, raw_line in enumerate(text.split("\n")):
+        line = _clean_line(raw_line)
+        if not line or line.upper().startswith("WEBVTT"):
+            continue
+        if _MUSIC_ONLY_RE.match(line):
+            continue
+        cues.append(Cue(source_ref=f"line-{i}", text=line))
+    return cues
+
+
 def chunk_cues(cues: list[Cue], chunk_size: int) -> list[list[Cue]]:
     """Fixed-size chunks — see config.CORPUS_CHUNK_SIZE: this is what
     keeps each Gemini call's prompt a constant size regardless of how

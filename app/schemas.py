@@ -95,6 +95,16 @@ class CorpusAudioRequest(BaseModel):
     prompt_version: str = "v1"
 
 
+class VocabAudioRequest(BaseModel):
+    """Same shape as CorpusAudioRequest — text_ko is the vocab item's own
+    `hangul` (the frontend sends it, same as the corpus/listening screen
+    does, so the backend never needs to re-look up the word itself)."""
+
+    text_ko: str
+    voice: str = "ko-female-1"
+    prompt_version: str = "v1"
+
+
 # ----------------------------------------------------------------- writing --
 class WritingSubmissionOut(BaseModel):
     id: uuid.UUID

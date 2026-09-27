@@ -49,7 +49,7 @@ from app.models import (
     VocabItem,
 )
 from app.services import gemini_client
-from app.services.subtitles import Cue, chunk_cues, parse_subtitles
+from app.services.subtitles import Cue, chunk_cues, parse_plain_lines, parse_subtitles
 
 # ============================================================ extraction ==
 # Response schemas as plain Gemini-Schema dicts (uppercase `type`s, no
@@ -438,6 +438,57 @@ Danh sách câu thoại:
 {cue_lines}"""
 
 
+CORPUS_OCR_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "raw_text": {
+            "type": "STRING",
+            "description": (
+                "Toàn bộ văn bản/phụ đề nhận diện được trong ảnh/tài liệu, giữ "
+                "đúng thứ tự xuất hiện, mỗi câu/dòng thoại một dòng riêng."
+            ),
+        },
+    },
+    "required": ["raw_text"],
+}
+
+CORPUS_OCR_PROMPT = """Bạn đang đọc một ảnh/tài liệu chứa phụ đề hoặc lời thoại phim tiếng Hàn
+(có thể là ảnh chụp/màn hình chụp tệp phụ đề, hoặc ảnh chụp cảnh phim có phụ đề).
+Hãy nhận diện TOÀN BỘ văn bản tiếng Hàn xuất hiện, giữ đúng thứ tự xuất hiện.
+Nếu tài liệu có hiển thị mã thời gian dạng phụ đề chuẩn (vd
+"00:00:01,000 --> 00:00:03,000"), hãy giữ nguyên định dạng đó kèm số thứ tự
+để tái tạo đúng cấu trúc tệp .srt gốc. Nếu KHÔNG có mã thời gian hiển thị, chỉ
+cần liệt kê từng câu thoại theo đúng thứ tự xuất hiện, mỗi câu một dòng —
+KHÔNG tự bịa mã thời gian giả.
+Trả về đúng JSON schema đã cho, không thêm giải thích."""
+
+
+def build_corpus_ocr_prompt_parts(file_bytes: bytes, mime_type: str) -> list[Any]:
+    return [gemini_client.part_from_bytes(file_bytes, mime_type), CORPUS_OCR_PROMPT]
+
+
+def extract_corpus_source_text(file_bytes: bytes, mime_type: str | None) -> str:
+    """kind="corpus" uploads now come in three shapes: a real .srt/.vtt
+    file, plain typed/pasted dialogue text, or an image/PDF (a photographed
+    or screenshotted subtitle list) — the Studio upload form's file picker
+    already accepted image mime types before this function existed, but the
+    old code path just base64-decoded the bytes as UTF-8 text regardless,
+    which silently turned an image upload into garbage. An image/PDF now
+    gets a Gemini-vision OCR pass first (Part.from_bytes is mime-agnostic,
+    same as lesson/exam_paper's multimodal extraction) to recover the raw
+    text; anything else is decoded as text exactly as before. Either way,
+    run_corpus_extraction parses whatever text comes back the same way."""
+    if mime_type and (mime_type.startswith("image/") or mime_type == "application/pdf"):
+        result = gemini_client.generate_structured(
+            model=settings.GEMINI_MODEL_LESSON_INGEST,
+            prompt=build_corpus_ocr_prompt_parts(file_bytes, mime_type),
+            response_schema=CORPUS_OCR_SCHEMA,
+            prompt_version="corpus-ocr-v1",
+        )
+        return _parse_json(result["text"]).get("raw_text", "")
+    return file_bytes.decode("utf-8", errors="replace")
+
+
 def build_exam_prompt(known_qtypes: list[tuple[str, str]]) -> str:
     qtype_hint = "\n".join(f"- {code}: {name_vi}" for code, name_vi in known_qtypes) or (
         "(chưa có loại câu hỏi nào trong hệ thống — để qtype_code trống cho mọi câu)"
@@ -564,6 +615,12 @@ def run_corpus_extraction(db: Session, batch: ImportBatch, raw_subtitle_text: st
     length — FR-19/Gate G6), and stages one ImportItem per kept cue.
     Returns (staged_count, flagged_count)."""
     cues = parse_subtitles(raw_subtitle_text)
+    if not cues:
+        # Not real timestamped .srt/.vtt — a plain-text paste or an
+        # image/PDF's OCR output (see extract_corpus_source_text), neither
+        # of which has timecodes for parse_subtitles to key off. Fall back
+        # to one cue per line instead of silently staging nothing.
+        cues = parse_plain_lines(raw_subtitle_text)
     known_topics = [t for (t,) in db.execute(select(Topic.name)).all()]
     known_grammar = [p for (p,) in db.execute(select(GrammarPoint.pattern)).all()][:200]
 
