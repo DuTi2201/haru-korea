@@ -871,7 +871,15 @@ def fetch_article_text(url: str) -> tuple[str, str | None, str | None]:
     # into the article body.
     root = soup.body or soup
     for el in root.find_all(True):
-        ident = f"{' '.join(el.get('class', []))} {el.get('id', '')}".lower()
+        # find_all(True) snapshots every tag up front. Decomposing a
+        # boilerplate CONTAINER also decomposes its descendants (bs4 clears
+        # their internal state), so a later iteration can land on a tag
+        # that's already dead — .get() on it then blows up with
+        # AttributeError: 'NoneType' object has no attribute 'get'. Skip
+        # anything no longer attached to the tree.
+        if getattr(el, "attrs", None) is None:
+            continue
+        ident = f"{' '.join(el.get('class', []) or [])} {el.get('id', '') or ''}".lower()
         if any(hint in ident for hint in _BOILERPLATE_CONTAINER_HINTS):
             el.decompose()
 
