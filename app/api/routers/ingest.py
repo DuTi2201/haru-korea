@@ -43,7 +43,7 @@ router = APIRouter(prefix="/imports", tags=["ingest"])
 
 _editor_or_admin = require_role("editor", "admin")
 
-_LESSON_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+_LESSON_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf", "text/plain"}
 _MAX_BYTES = settings.MAX_INGEST_FILE_MB * 1024 * 1024
 
 
@@ -138,7 +138,14 @@ async def create_import_batch(
     (content.exam_paper's admin-typed fields — e.g. "TOPIK II" / "64회 읽기").
     kind="editorial_article" takes a URL instead of a file upload — no
     `file` at all, so it's handled separately before any of the upload
-    validation below runs."""
+    validation below runs.
+
+    "lesson"/"exam_paper" accept text/plain as well as image/PDF — Gemini's
+    Part.from_bytes is mime-agnostic (see gemini_client.part_from_bytes),
+    so a plain-text lesson (typed/pasted, or a real .txt file) goes through
+    the exact same multimodal extraction call as a photographed page,
+    letting an admin skip the photo step entirely when they already have
+    the lesson as text."""
     if kind == "editorial_article":
         if not (source_url and source_name):
             raise _problem(
