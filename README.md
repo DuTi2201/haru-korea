@@ -79,18 +79,45 @@ alembic upgrade head   # first time, or after a schema change
 Real and tested: auth (signup/login/JWT/roles), the generic `jobs`
 read+SSE endpoints, the full `generate_lecture_audio` job end-to-end,
 the writing-submission state machine's shape, problem+json error
-responses, CORS for the Lovable origin, and — as of this pass — the full
-lesson (image/PDF) and film-subtitle (corpus) ingestion pipeline:
-`POST /api/v1/imports` (multipart upload, kind=lesson|corpus) → Gemini
-extraction/classification (Celery) → `GET .../items` + `PATCH .../items/
-{id}` review queue → `POST .../confirm` (Celery, writes content.lesson/
-vocab_item/grammar_point or corpus.corpus_item+embedding) → `POST
-.../rollback` (lesson: full undo via import_item_id lineage; corpus:
-only before confirm — see `CorpusItem`'s docstring in `app/models.py`
-for why). Verified end-to-end against a local Postgres+pgvector+Redis
-with the Gemini calls mocked (real network calls need a live API key,
-which this sandbox doesn't have) — see the two ingestion Pydantic
-extraction schemas and prompts in `app/services/ingestion.py`.
+responses, CORS for the Lovable origin, and the full ingestion pipeline
+for all three `import_batch` kinds: `POST /api/v1/imports` (multipart
+upload, `kind=lesson|corpus|exam_paper`) → Gemini extraction/
+classification (Celery) → `GET .../items` + `PATCH .../items/{id}`
+review queue → `POST .../confirm` (Celery, writes content.lesson/
+vocab_item/grammar_point, corpus.corpus_item+embedding, or content.
+exam_passage/exam_item) → `POST .../rollback` (lesson and exam_paper:
+full undo, even after confirm, via import_item lineage; corpus: only
+before confirm — see `CorpusItem`'s docstring in `app/models.py` for
+why). `kind=exam_paper` requires `exam_kind`/`session_label` form fields
+and classifies each question against a starter `content.question_type`
+taxonomy seeded by the `d1a4e9f2b6c7` migration (12 common TOPIK I/II
+reading+listening categories — extend that table directly for more);
+an answer is only trusted as `answer_source="editor"` when the model
+read it off a printed answer key in the document, otherwise it's staged
+as `ai_guess` and always force-flagged for review regardless of
+confidence, since a wrong exam answer is worse than most other content
+errors. This is a single-pass multimodal extraction (passages + items +
+answer resolution in one Gemini call per paper), not literally a
+"3-pass pipeline" — that phrase in an earlier pass of this README was
+this project's own draft label, never a verbatim SRS/SDD requirement,
+so it's corrected here.
+
+Also real: learner-facing reads for the content this pipeline produces —
+`GET /api/v1/lessons/{id}` (accepts a numeric id or the literal `today`,
+which just picks the earliest confirmed lesson as a placeholder "next
+lesson" — real adaptive scheduling is still stubbed, see below) returns
+the lesson with its topics/vocab/grammar; `GET /api/v1/corpus/items`
+returns a random sample of corpus.corpus_item for listening practice,
+with film/topic/grammar-pattern names resolved via separate bulk queries
+in application code rather than a cross-schema SQL join (SDD module-
+boundary principle); `POST /api/v1/progress/reviews` nudges a learner's
+`item_state.strength` up/down after a quick vocab/grammar check (not a
+full SM-2 scheduler — see `ItemState`'s docstring in `app/models.py`).
+
+Verified end-to-end against a local Postgres+pgvector+Redis with the
+Gemini calls mocked (real network calls need a live API key, which this
+sandbox doesn't have) — see the ingestion Pydantic extraction schemas
+and prompts in `app/services/ingestion.py`.
 
 File uploads are base64'd straight through the Celery/Redis message
 (no object storage provisioned yet) — fine for admin-tool volumes, capped
@@ -98,13 +125,14 @@ by `MAX_INGEST_FILE_MB`; swap for real object storage if that stops
 being true. Subtitle files are classified in fixed-size chunks
 (`CORPUS_CHUNK_SIZE`) specifically so each Gemini call's prompt stays a
 constant size regardless of film length (FR-19 / Gate G6's "kích thước
-prompt không phình theo độ dài kịch bản").
+prompt không phình theo độ dài kịch bản"); exam papers don't need this
+(bounded page count), so they're extracted in one call per paper.
 
 Stubbed (`TODO` in code, intentionally — this is a first scaffold, not
 the finished app): ffmpeg audio transcoding (currently a `sleep`),
 Storage integration for writing-submission photo/audio uploads
-(image_key/opus_path are placeholder strings — the lesson/corpus
-ingestion above solved this differently, see above), the 3-pass
-exam-ingestion pipeline (kind=exam_paper isn't handled by `POST /imports`
-yet), SRS scheduling logic, AI cost logging / admin usage dashboard, and
-per-learner daily AI quota enforcement.
+(image_key/opus_path are placeholder strings — the lesson/corpus/exam
+ingestion above solved this differently, see above), real adaptive
+next-lesson/SRS scheduling (`lessons/today` is a placeholder heuristic,
+`ItemState.strength` is a nudge not a scheduler), AI cost logging /
+admin usage dashboard, and per-learner daily AI quota enforcement.

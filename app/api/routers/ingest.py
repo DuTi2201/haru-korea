@@ -1,8 +1,9 @@
 """Import / review-queue module — data NEVER auto-writes to main
 tables (SDD principle: "dữ liệu vào hệ thống chỉ qua khu chờ duyệt").
 This router covers the generic import_batch/import_item flow that backs
-the Studio "lô nhập" screen: lesson image/PDF ingestion (FR-42..FR-51)
-and film-subtitle/corpus ingestion (FR-17..FR-21, Gate G6), both staging
+the Studio "lô nhập" screen: lesson image/PDF ingestion (FR-42..FR-51),
+film-subtitle/corpus ingestion (FR-17..FR-21, Gate G6), and exam-paper
+ingestion (content.exam_paper/exam_passage/exam_item), all staging
 Gemini's proposals into import_item for a human editor/admin to review,
 edit and confirm before anything reaches content.*/corpus.*.
 
@@ -29,7 +30,12 @@ from app.db import get_db
 from app.models import ImportBatch, ImportItem, Job, Profile
 from app.schemas import ImportBatchAccepted, ImportBatchOut, ImportItemOut, ImportItemPatch
 from app.services import ingestion
-from app.workers.tasks import apply_import_batch_task, extract_corpus_import, extract_lesson_import
+from app.workers.tasks import (
+    apply_import_batch_task,
+    extract_corpus_import,
+    extract_exam_paper_import,
+    extract_lesson_import,
+)
 
 router = APIRouter(prefix="/imports", tags=["ingest"])
 
@@ -44,17 +50,24 @@ async def create_import_batch(
     db: Annotated[AsyncSession, Depends(get_db)],
     profile: Annotated[Profile, Depends(_editor_or_admin)],
     file: UploadFile,
-    kind: Annotated[Literal["lesson", "corpus"], Form()],
+    kind: Annotated[Literal["lesson", "corpus", "exam_paper"], Form()],
     film_title: Annotated[str | None, Form()] = None,
+    exam_kind: Annotated[str | None, Form()] = None,
+    session_label: Annotated[str | None, Form()] = None,
 ):
-    """kind="exam_paper" isn't handled by this endpoint yet (its own
-    ingestion pass hasn't been built) — only lesson/corpus, today's ask.
-    kind="corpus" requires film_title (which film this subtitle file is
+    """kind="corpus" requires film_title (which film this subtitle file is
     filed under; created on first use, per Film.title being the SRS's
-    only field for it).
+    only field for it). kind="exam_paper" requires exam_kind + session_label
+    (content.exam_paper's admin-typed fields — e.g. "TOPIK II" / "64회 읽기").
     """
     if kind == "corpus" and not film_title:
         raise _problem(status.HTTP_400_BAD_REQUEST, "film_title is required for kind=corpus", "validation_error")
+    if kind == "exam_paper" and not (exam_kind and session_label):
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST,
+            "exam_kind and session_label are required for kind=exam_paper",
+            "validation_error",
+        )
 
     raw = await file.read()
     if len(raw) > _MAX_BYTES:
@@ -64,7 +77,7 @@ async def create_import_batch(
             "file_too_large",
             f"limit is {settings.MAX_INGEST_FILE_MB} MB",
         )
-    if kind == "lesson":
+    if kind in ("lesson", "exam_paper"):
         mime_type = file.content_type or mimetypes.guess_type(file.filename or "")[0]
         if mime_type not in _LESSON_MIME_TYPES:
             raise _problem(
@@ -115,8 +128,10 @@ async def create_import_batch(
         file_b64 = base64.b64encode(raw).decode("ascii")
         if kind == "lesson":
             extract_lesson_import.delay(str(job.id), str(batch.id), file_b64, mime_type)
-        else:
+        elif kind == "corpus":
             extract_corpus_import.delay(str(job.id), str(batch.id), file_b64, film_title)
+        else:
+            extract_exam_paper_import.delay(str(job.id), str(batch.id), file_b64, mime_type, exam_kind, session_label)
 
     return ImportBatchAccepted(
         import_batch_id=batch.id,

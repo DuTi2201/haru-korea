@@ -110,6 +110,85 @@ class WritingScoreOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ------------------------------------------------------------------ content --
+class TopicOut(BaseModel):
+    id: int
+    name: str
+    quizlet_url: str | None
+
+    model_config = {"from_attributes": True}
+
+
+class VocabItemOut(BaseModel):
+    id: int
+    lesson_id: int
+    hangul: str
+    pos: str | None
+    meaning_vi: str
+    definition_ko: str | None
+    level: int
+    hanja: str | None
+    sino_vietnamese: str | None
+    example_ko: str | None
+
+    model_config = {"from_attributes": True}
+
+
+class GrammarPointOut(BaseModel):
+    id: int
+    lesson_id: int
+    pattern: str
+    meaning_vi: str
+    level: int
+    example_ko: str | None
+
+    model_config = {"from_attributes": True}
+
+
+class LessonOut(BaseModel):
+    id: int
+    title: str
+    level: int
+    content: str
+    created_at: datetime
+    topics: list[TopicOut]
+    vocab: list[VocabItemOut]
+    grammar: list[GrammarPointOut]
+
+
+class CorpusItemOut(BaseModel):
+    id: uuid.UUID
+    film_id: int
+    film_title: str
+    text_ko: str
+    kind: str
+    level: int
+    register: str
+    topics: list[str]
+    grammar_patterns: list[str]
+
+    model_config = {"from_attributes": True}
+
+
+class ItemStateReviewRequest(BaseModel):
+    """Records a learner's quick in-app check on one vocab/grammar item —
+    SRS §5 ITEM_STATE's `strength` nudge, not a full SM-2 scheduler (see
+    ItemState's docstring in app/models.py)."""
+
+    item_type: Literal["vocab_item", "grammar_point"]
+    item_id: int
+    correct: bool
+
+
+class ItemStateOut(BaseModel):
+    item_type: str
+    item_id: int
+    strength: float
+    last_seen: datetime
+
+    model_config = {"from_attributes": True}
+
+
 # ------------------------------------------------------------------- ingest --
 class ImportBatchOut(BaseModel):
     id: uuid.UUID
@@ -118,6 +197,7 @@ class ImportBatchOut(BaseModel):
     flagged_count: int
     source_file: str | None
     film_id: int | None
+    exam_paper_id: uuid.UUID | None
     created_at: datetime
 
     model_config = {"from_attributes": True}

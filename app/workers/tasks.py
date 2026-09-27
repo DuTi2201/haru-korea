@@ -160,6 +160,54 @@ def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_
             raise
 
 
+@celery_app.task(name="app.workers.tasks.extract_exam_paper_import", bind=True, max_retries=2)
+def extract_exam_paper_import(
+    self, job_id: str, batch_id: str, file_b64: str, mime_type: str, exam_kind: str, session_label: str
+):
+    """Đề thi ảnh/PDF -> Gemini (đa phương thức) -> đề xuất exam_passage/
+    exam_item vào khu chờ duyệt. exam_paper được tạo ngay (giống film,
+    exam_kind/session_label do admin gõ chứ không phải AI suy ra) trước khi
+    trích xuất; không ghi content.exam_passage/exam_item ở đây — chỉ POST
+    /imports/{id}/confirm mới ghi."""
+    jid, bid = uuid.UUID(job_id), uuid.UUID(batch_id)
+    with Session(_sync_engine) as db:
+        batch = db.get(ImportBatch, bid)
+        if batch is None:
+            publish_job_event(db, jid, status="failed", error={"code": "not_found", "message": "batch not found"})
+            return
+        try:
+            paper = ingestion.find_or_create_exam_paper(db, batch.owner_id, batch.file_hash, exam_kind, session_label)
+            batch.exam_paper_id = paper.id
+            batch.status = "extracting"
+            db.add(batch)
+            db.commit()
+            publish_job_event(db, jid, status="running", progress=0.2, step="Đang đọc đề thi với Gemini")
+
+            file_bytes = base64.b64decode(file_b64)
+            staged, flagged = ingestion.run_exam_extraction(db, batch, file_bytes, mime_type)
+
+            batch.status = "awaiting_review"
+            batch.flagged_count = flagged
+            db.add(batch)
+            db.commit()
+            publish_job_event(
+                db,
+                jid,
+                status="succeeded",
+                progress=1.0,
+                step="Hoàn tất trích xuất đề thi",
+                result={"import_batch_id": str(bid), "exam_paper_id": str(paper.id), "staged": staged, "flagged": flagged},
+            )
+        except Exception as exc:  # noqa: BLE001
+            batch.status = "failed"
+            db.add(batch)
+            db.commit()
+            publish_job_event(
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
+            )
+            raise
+
+
 @celery_app.task(name="app.workers.tasks.apply_import_batch", bind=True, max_retries=2)
 def apply_import_batch_task(self, job_id: str, batch_id: str):
     """Ghi các import_item đã confirmed vào bảng chính (content.lesson/

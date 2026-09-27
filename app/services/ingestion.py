@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
@@ -27,12 +28,16 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models import (
     CorpusItem,
+    ExamItem,
+    ExamPaper,
+    ExamPassage,
     Film,
     GrammarPoint,
     ImportBatch,
     ImportItem,
     Lesson,
     LessonTopic,
+    QuestionType,
     Topic,
     VocabItem,
 )
@@ -129,6 +134,65 @@ CORPUS_CHUNK_SCHEMA: dict[str, Any] = {
     "required": ["items"],
 }
 
+# Exam-paper extraction: one multimodal call per uploaded paper (bounded
+# size — an exam paper is a fixed handful of pages, not open-ended like a
+# film script, so FR-19/Gate G6's chunking constraint doesn't apply here).
+# Passages carry a `local_ref` the model invents (e.g. "P1") purely so it
+# can point items at the passage they belong to within the SAME response;
+# apply_exam_batch resolves local_ref -> real content.exam_passage.id.
+EXAM_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "passages": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "local_ref": {"type": "STRING", "description": "id tạm, vd 'P1', để items tham chiếu tới"},
+                    "kind": {"type": "STRING", "enum": ["đọc hiểu", "nghe", "biểu đồ"]},
+                    "body_ko": {"type": "STRING", "nullable": True, "description": "toàn văn đoạn văn/kịch bản nghe"},
+                    "source_page": {"type": "INTEGER"},
+                    "confidence": {"type": "NUMBER"},
+                },
+                "required": ["local_ref", "kind", "source_page", "confidence"],
+            },
+        },
+        "items": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "number": {"type": "INTEGER", "description": "số thứ tự câu hỏi trong đề"},
+                    "passage_ref": {
+                        "type": "STRING",
+                        "nullable": True,
+                        "description": "local_ref của đoạn văn/bài nghe liên quan, để trống nếu câu hỏi độc lập",
+                    },
+                    "qtype_code": {
+                        "type": "STRING",
+                        "nullable": True,
+                        "description": "CHỈ chọn từ danh sách mã loại câu hỏi đã cho, để trống nếu không khớp mã nào",
+                    },
+                    "stem_ko": {"type": "STRING"},
+                    "options": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "các lựa chọn, thường 4"},
+                    "answer": {
+                        "type": "INTEGER",
+                        "nullable": True,
+                        "description": "số thứ tự đáp án đúng (1-based), để trống nếu không xác định được",
+                    },
+                    "answer_from_key": {
+                        "type": "BOOLEAN",
+                        "description": "true nếu đáp án đọc được từ bảng đáp án in trong tài liệu, false nếu là suy đoán của mô hình",
+                    },
+                    "confidence": {"type": "NUMBER"},
+                },
+                "required": ["number", "stem_ko", "options", "answer_from_key", "confidence"],
+            },
+        },
+    },
+    "required": ["passages", "items"],
+}
+
 
 class VocabExtraction(BaseModel):
     hangul: str
@@ -174,6 +238,30 @@ class CorpusCueClassification(BaseModel):
 
 class CorpusChunkClassification(BaseModel):
     items: list[CorpusCueClassification] = Field(default_factory=list)
+
+
+class ExamPassageExtraction(BaseModel):
+    local_ref: str
+    kind: Literal["đọc hiểu", "nghe", "biểu đồ"]
+    body_ko: str | None = None
+    source_page: int = 1
+    confidence: float = Field(ge=0, le=1, default=0.5)
+
+
+class ExamItemExtraction(BaseModel):
+    number: int
+    passage_ref: str | None = None
+    qtype_code: str | None = None
+    stem_ko: str
+    options: list[str] = Field(default_factory=list)
+    answer: int | None = Field(default=None, ge=1, le=5)
+    answer_from_key: bool = False
+    confidence: float = Field(ge=0, le=1, default=0.5)
+
+
+class ExamExtraction(BaseModel):
+    passages: list[ExamPassageExtraction] = Field(default_factory=list)
+    items: list[ExamItemExtraction] = Field(default_factory=list)
 
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -243,6 +331,104 @@ source_ref của câu tương ứng), không thêm giải thích.
 
 Danh sách câu thoại:
 {cue_lines}"""
+
+
+def build_exam_prompt(known_qtypes: list[tuple[str, str]]) -> str:
+    qtype_hint = "\n".join(f"- {code}: {name_vi}" for code, name_vi in known_qtypes) or (
+        "(chưa có loại câu hỏi nào trong hệ thống — để qtype_code trống cho mọi câu)"
+    )
+    return f"""Bạn là biên tập viên đề thi TOPIK cho người Việt học tiếng Hàn.
+Đọc ảnh/tài liệu đề thi được đính kèm (có thể nhiều trang) và trích xuất:
+
+1) Các đoạn văn/bài nghe (passages): mỗi đoạn đọc hiểu, kịch bản nghe, hoặc
+   biểu đồ/quảng cáo dùng chung cho một hoặc nhiều câu hỏi. Đặt cho mỗi đoạn
+   một local_ref ngắn tự chọn (vd "P1", "P2") để các câu hỏi tham chiếu tới.
+2) Từng câu hỏi (items): số thứ tự, đoạn văn liên quan (passage_ref, để
+   trống nếu câu hỏi độc lập không cần đoạn văn), đề bài, các lựa chọn.
+
+Với qtype_code, CHỈ chọn từ danh sách mã đã có trong hệ thống dưới đây nếu
+đúng khớp; để trống nếu không có mã nào khớp (không tự đặt mã mới):
+{qtype_hint}
+
+Với đáp án: nếu tài liệu có in kèm bảng đáp án (answer key), đọc chính xác
+đáp án cho từng câu và đánh dấu answer_from_key=true. Nếu KHÔNG có bảng đáp
+án trong tài liệu, có thể tự suy luận đáp án khả dĩ nhất (answer_from_key=
+false) hoặc để answer trống nếu không đủ căn cứ — không suy đoán bừa.
+
+Trả về đúng JSON schema đã cho, không thêm giải thích. Tự đánh giá độ tự tin
+(confidence, 0-1) cho từng đoạn văn và từng câu hỏi."""
+
+
+def build_exam_prompt_parts(file_bytes: bytes, mime_type: str, known_qtypes: list[tuple[str, str]]) -> list[Any]:
+    return [gemini_client.part_from_bytes(file_bytes, mime_type), build_exam_prompt(known_qtypes)]
+
+
+def extract_exam_paper(file_bytes: bytes, mime_type: str, known_qtypes: list[tuple[str, str]]) -> ExamExtraction:
+    result = gemini_client.generate_structured(
+        model=settings.GEMINI_MODEL_LESSON_INGEST,
+        prompt=build_exam_prompt_parts(file_bytes, mime_type, known_qtypes),
+        response_schema=EXAM_SCHEMA,
+        prompt_version="exam-v1",
+    )
+    return ExamExtraction.model_validate(_parse_json(result["text"]))
+
+
+def run_exam_extraction(db: Session, batch: ImportBatch, file_bytes: bytes, mime_type: str) -> tuple[int, int]:
+    """Stages one ImportItem per extracted passage (kind="exam_passage")
+    and per extracted question (kind="exam_item"). A question whose answer
+    is the model's own guess (no printed answer key found) is ALWAYS
+    flagged for review regardless of confidence — getting an exam answer
+    wrong is worse than a wrong vocab gloss, so it never slips through on
+    a high self-reported confidence alone (same force_flag idea as
+    corpus's is_crude)."""
+    known_qtypes = db.execute(
+        select(QuestionType.code, QuestionType.name_vi).where(QuestionType.active.is_(True))
+    ).all()
+    extraction = extract_exam_paper(file_bytes, mime_type, known_qtypes)
+    staged = 0
+    flagged = 0
+
+    for p in extraction.passages:
+        status = confidence_status(p.confidence)
+        if status != "pending":
+            flagged += 1
+        db.add(
+            ImportItem(
+                import_batch_id=batch.id,
+                kind="exam_passage",
+                status=status,
+                confidence=p.confidence,
+                payload={"local_ref": p.local_ref, "kind": p.kind, "body_ko": p.body_ko, "source_page": p.source_page},
+            )
+        )
+        staged += 1
+
+    for it in extraction.items:
+        needs_human_answer_check = it.answer is not None and not it.answer_from_key
+        status = confidence_status(it.confidence, force_flag=needs_human_answer_check)
+        if status != "pending":
+            flagged += 1
+        db.add(
+            ImportItem(
+                import_batch_id=batch.id,
+                kind="exam_item",
+                status=status,
+                confidence=it.confidence,
+                payload={
+                    "number": it.number,
+                    "passage_ref": it.passage_ref,
+                    "qtype_code": it.qtype_code,
+                    "stem_ko": it.stem_ko,
+                    "options": it.options,
+                    "answer": it.answer,
+                    "answer_from_key": it.answer_from_key,
+                },
+            )
+        )
+        staged += 1
+
+    db.flush()
+    return staged, flagged
 
 
 def extract_lesson(file_bytes: bytes, mime_type: str) -> LessonExtraction:
@@ -499,11 +685,93 @@ def apply_corpus_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
     return {"applied": applied}
 
 
+def apply_exam_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
+    """Writes confirmed exam_passage/exam_item proposals into content.
+    exam_passage/exam_item. content.exam_passage is one of the tables
+    transcribed VERBATIM from the SDD's CREATE TABLE snippet (see
+    models.py's module docstring), so it deliberately does NOT get an
+    import_item_id column added just for our own bookkeeping — instead,
+    the applied passage's real id is stashed back onto the *ImportItem's*
+    own payload (`_applied_id`), which is purely ingest-internal staging,
+    not spec-constrained. That's what makes both idempotent re-apply and
+    rollback-after-confirm possible without touching the verbatim shape.
+    qtype_code is resolved against content.question_type's controlled
+    vocabulary; an item whose qtype_code doesn't resolve (model left it
+    blank, or picked something stale) is simply left unapplied — the
+    reviewer edits the item's payload with a valid code and calls confirm
+    again, same re-callable pattern as everything else here.
+    """
+    if batch.exam_paper_id is None:
+        return {"applied": 0, "reason": "batch_has_no_exam_paper_id"}
+
+    items = db.execute(select(ImportItem).where(ImportItem.import_batch_id == batch.id)).scalars().all()
+    passage_items = [i for i in items if i.kind == "exam_passage" and i.status == "confirmed"]
+    exam_items = [i for i in items if i.kind == "exam_item" and i.status == "confirmed"]
+
+    qtype_by_code = {code: qid for qid, code in db.execute(select(QuestionType.id, QuestionType.code)).all()}
+    local_to_real: dict[str, uuid.UUID] = {}
+    applied = 0
+
+    for p in passage_items:
+        applied_id = p.payload.get("_applied_id")
+        if applied_id:
+            local_to_real[p.payload["local_ref"]] = uuid.UUID(applied_id)
+            continue
+        passage = ExamPassage(
+            paper_id=batch.exam_paper_id,
+            kind=p.payload["kind"],
+            body_ko=p.payload.get("body_ko"),
+            chart_data=None,
+            image_key=None,
+            audio_key=None,
+            source_page=p.payload.get("source_page", 1),
+            source_bbox={},
+        )
+        db.add(passage)
+        db.flush()
+        local_to_real[p.payload["local_ref"]] = passage.id
+        p.payload = {**p.payload, "_applied_id": str(passage.id)}
+        db.add(p)
+        applied += 1
+
+    for it in exam_items:
+        already = db.execute(select(ExamItem).where(ExamItem.import_item_id == it.id)).scalar_one_or_none()
+        if already is not None:
+            continue
+        qtype_id = qtype_by_code.get(it.payload.get("qtype_code"))
+        if qtype_id is None:
+            continue  # unresolved qtype — reviewer must patch qtype_code, then confirm again
+        passage_ref = it.payload.get("passage_ref")
+        answer_from_key = bool(it.payload.get("answer_from_key"))
+        answer = it.payload.get("answer")
+        db.add(
+            ExamItem(
+                paper_id=batch.exam_paper_id,
+                passage_id=local_to_real.get(passage_ref) if passage_ref else None,
+                number=it.payload["number"],
+                qtype_id=qtype_id,
+                stem_ko=it.payload["stem_ko"],
+                options=it.payload.get("options", []),
+                answer=answer,
+                answer_source=("editor" if answer_from_key else "ai_guess") if answer is not None else None,
+                difficulty_est=0.5,
+                confidence=it.confidence,
+                import_item_id=it.id,
+            )
+        )
+        applied += 1
+
+    db.flush()
+    return {"applied": applied, "exam_paper_id": str(batch.exam_paper_id)}
+
+
 def apply_import_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
     if batch.kind == "lesson":
         outcome = apply_lesson_batch(db, batch)
     elif batch.kind == "corpus":
         outcome = apply_corpus_batch(db, batch)
+    elif batch.kind == "exam_paper":
+        outcome = apply_exam_batch(db, batch)
     else:
         outcome = {"applied": 0, "reason": f"confirm not implemented for kind={batch.kind!r}"}
 
@@ -538,6 +806,28 @@ async def rollback_import_batch(db: AsyncSession, batch: ImportBatch) -> dict[st
             "corpus_rollback_unsupported_after_confirm: corpus_item không lưu import_item_id theo SRS §5 — "
             "chỉ có thể huỷ lô câu phim trước khi xác nhận"
         )
+    elif batch.kind == "exam_paper":
+        # exam_item carries import_item_id directly (delete-by-lineage,
+        # same as lesson). exam_passage is verbatim-SDD and has no such
+        # column, so its lineage lives on the *ImportItem's* own payload
+        # (`_applied_id`, set by apply_exam_batch) instead — read that
+        # back to find which real exam_passage rows to remove.
+        rows = await db.execute(
+            select(ImportItem.id, ImportItem.kind, ImportItem.payload).where(
+                ImportItem.import_batch_id == batch.id
+            )
+        )
+        all_rows = rows.all()
+        item_ids = [row[0] for row in all_rows]
+        passage_ids = [
+            uuid.UUID(row[2]["_applied_id"])
+            for row in all_rows
+            if row[1] == "exam_passage" and row[2].get("_applied_id")
+        ]
+        if item_ids:
+            await db.execute(delete(ExamItem).where(ExamItem.import_item_id.in_(item_ids)))
+        if passage_ids:
+            await db.execute(delete(ExamPassage).where(ExamPassage.id.in_(passage_ids)))
 
     batch.status = "rolled_back"
     db.add(batch)
@@ -554,3 +844,26 @@ def find_or_create_film(db: Session, title: str) -> Film:
     db.add(film)
     db.flush()
     return film
+
+
+def find_or_create_exam_paper(
+    db: Session, owner_id: uuid.UUID, file_hash: str, exam_kind: str, session_label: str
+) -> ExamPaper:
+    """Same immediate-creation timing as find_or_create_film: exam_kind/
+    session_label are admin-typed at upload time, not AI-derived, so this
+    row is created up front rather than staged through import_item."""
+    existing = db.execute(
+        select(ExamPaper).where(ExamPaper.owner_id == owner_id, ExamPaper.file_hash == file_hash)
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+    paper = ExamPaper(
+        exam_kind=exam_kind.strip(),
+        session_label=session_label.strip(),
+        owner_id=owner_id,
+        file_hash=file_hash,
+        prompt_version="exam-v1",
+    )
+    db.add(paper)
+    db.flush()
+    return paper

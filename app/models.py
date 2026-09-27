@@ -474,6 +474,11 @@ class ImportBatch(Base):
     # Bare id, no FK — only meaningful for kind="corpus"; crosses into
     # `corpus` schema, same bare-id convention as corpus_item.topic_ids.
     film_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Bare id, no FK — only meaningful for kind="exam_paper"; crosses into
+    # `content` schema. Set inside extract_exam_paper_import (same
+    # find-or-create-immediately timing as film_id, since exam_kind/
+    # session_label are admin-typed, not AI-derived).
+    exam_paper_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
