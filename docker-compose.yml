@@ -1,0 +1,39 @@
+# Local dev only. On Railway, Postgres/Redis are separate managed services
+# (pgvector-railway, Redis) — this compose file is NOT used in production.
+services:
+  db:
+    image: pgvector/pgvector:0.8.6-pg18
+    environment:
+      POSTGRES_USER: haru
+      POSTGRES_PASSWORD: haru
+      POSTGRES_DB: haru
+    ports: ["5432:5432"]
+    volumes: ["haru_pgdata:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:8.2
+    ports: ["6379:6379"]
+
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://haru:haru@db:5432/haru
+      REDIS_URL: redis://redis:6379/0
+    ports: ["8000:8000"]
+    depends_on: [db, redis]
+    volumes: [".:/srv"]
+
+  worker:
+    build: .
+    command: celery -A app.core.celery_app worker --loglevel=info --concurrency=2
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://haru:haru@db:5432/haru
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [db, redis]
+    volumes: [".:/srv"]
+
+volumes:
+  haru_pgdata:
