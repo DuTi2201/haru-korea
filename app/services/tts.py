@@ -90,7 +90,23 @@ def synthesize_korean_tts(text_ko: str, voice: str = "ko-female-1") -> tuple[byt
     # Plain dict config (not typed types.GenerateContentConfig(...)) to
     # match this pinned SDK's proven-working style in gemini_client.py —
     # the SDK's dict->proto conversion accepts snake_case keys here.
+    #
+    # `system_instruction` matters more here than for a single word/sentence
+    # (the pre-existing corpus/vocab/lecture-audio callers): a longer,
+    # conversational script (the podcast feature) can otherwise read enough
+    # like a request/task to the model that it tries to *answer* instead of
+    # just voicing it, which the TTS-only model rejects outright with a 400
+    # ("Model tried to generate text, but it should only be used for TTS").
+    # Framing the call explicitly as read-this-verbatim avoids that for any
+    # caller, short or long.
     config = {
+        "system_instruction": (
+            "Bạn là một công cụ chuyển văn bản thành giọng nói (text-to-speech). "
+            "Nhiệm vụ DUY NHẤT của bạn là đọc to, nguyên văn đoạn văn bản người dùng "
+            "cung cấp bên dưới bằng giọng tự nhiên. TUYỆT ĐỐI không trả lời, không "
+            "diễn giải, không bình luận, không thêm hay bớt bất kỳ nội dung nào ngoài "
+            "việc đọc chính xác đoạn văn bản đó."
+        ),
         "response_modalities": ["AUDIO"],
         "speech_config": {
             "voice_config": {"prebuilt_voice_config": {"voice_name": voice_name}},

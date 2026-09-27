@@ -1593,6 +1593,14 @@ thành tiếng (text-to-speech), nên viết câu ngắn, tự nhiên khi đọc
 dấu câu (dấu chấm, dấu phẩy, dấu ba chấm "...") để tạo khoảng dừng tự nhiên
 thay vì dùng thẻ định dạng.
 
+QUAN TRỌNG: trường "script" PHẢI là lời thoại thật sự, TỰ NÓ ĐÃ LÀ bài giảng
+hoàn chỉnh — không được chép lại hay diễn giải các chỉ dẫn ở trên (ví dụ:
+tuyệt đối không viết những câu như "giải thích nghĩa bằng tiếng Việt" hay
+"đọc câu ví dụ kèm nhắc lại nào" — hãy TỰ THỰC HIỆN điều đó, tức là viết
+thẳng lời giải thích và lời nhắc thật ra). Không được có bất kỳ câu nào
+nghe giống một yêu cầu/câu hỏi/chỉ thị gửi tới người đọc máy — toàn bộ phải
+là câu nói trực tiếp của người giáo viên.
+
 DANH SÁCH TỪ VỰNG:
 {vocab_lines}
 

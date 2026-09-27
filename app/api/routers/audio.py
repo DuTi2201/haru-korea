@@ -74,13 +74,19 @@ async def _request_podcast(
 
     idempotency_key = request.headers.get("Idempotency-Key", cache_key)
     existing_job = await db.execute(
-        select(Job).where(
-            Job.type == "generate_content_podcast",
-            Job.idempotency_key == idempotency_key,
-            Job.status.in_(["queued", "running", "succeeded"]),
-        )
+        select(Job).where(Job.type == "generate_content_podcast", Job.idempotency_key == idempotency_key)
     )
     job = existing_job.scalar_one_or_none()
+    if job is not None and job.status not in ("queued", "running", "succeeded"):
+        # A prior attempt with this exact idempotency key ended in "failed"
+        # (or another terminal-but-not-usable state). `idempotency_key` has
+        # a DB-level unique constraint per job type, so leaving that row in
+        # place would permanently wedge every future retry behind an
+        # unrelated 500 (IntegrityError on insert) instead of ever trying
+        # Gemini again — clear it out so a retry actually retries.
+        await db.delete(job)
+        await db.flush()
+        job = None
 
     if job is None:
         job = Job(
@@ -146,13 +152,15 @@ async def request_lecture_audio(
     idempotency_key = request.headers.get("Idempotency-Key", cache_key)
 
     existing_job = await db.execute(
-        select(Job).where(
-            Job.type == "generate_lecture_audio",
-            Job.idempotency_key == idempotency_key,
-            Job.status.in_(["queued", "running", "succeeded"]),
-        )
+        select(Job).where(Job.type == "generate_lecture_audio", Job.idempotency_key == idempotency_key)
     )
     job = existing_job.scalar_one_or_none()
+    if job is not None and job.status not in ("queued", "running", "succeeded"):
+        # See _request_podcast's identical comment: a failed row would
+        # otherwise permanently block retries behind a unique-constraint 500.
+        await db.delete(job)
+        await db.flush()
+        job = None
 
     if job is None:
         job = Job(
@@ -243,13 +251,15 @@ async def request_corpus_audio(
     idempotency_key = request.headers.get("Idempotency-Key", cache_key)
 
     existing_job = await db.execute(
-        select(Job).where(
-            Job.type == "generate_corpus_audio",
-            Job.idempotency_key == idempotency_key,
-            Job.status.in_(["queued", "running", "succeeded"]),
-        )
+        select(Job).where(Job.type == "generate_corpus_audio", Job.idempotency_key == idempotency_key)
     )
     job = existing_job.scalar_one_or_none()
+    if job is not None and job.status not in ("queued", "running", "succeeded"):
+        # See _request_podcast's identical comment: a failed row would
+        # otherwise permanently block retries behind a unique-constraint 500.
+        await db.delete(job)
+        await db.flush()
+        job = None
 
     if job is None:
         job = Job(
@@ -321,13 +331,15 @@ async def request_vocab_audio(
     idempotency_key = request.headers.get("Idempotency-Key", cache_key)
 
     existing_job = await db.execute(
-        select(Job).where(
-            Job.type == "generate_vocab_audio",
-            Job.idempotency_key == idempotency_key,
-            Job.status.in_(["queued", "running", "succeeded"]),
-        )
+        select(Job).where(Job.type == "generate_vocab_audio", Job.idempotency_key == idempotency_key)
     )
     job = existing_job.scalar_one_or_none()
+    if job is not None and job.status not in ("queued", "running", "succeeded"):
+        # See _request_podcast's identical comment: a failed row would
+        # otherwise permanently block retries behind a unique-constraint 500.
+        await db.delete(job)
+        await db.flush()
+        job = None
 
     if job is None:
         job = Job(

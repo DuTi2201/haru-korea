@@ -101,12 +101,19 @@ async def start_editorial_import(
 
     existing_job = await db.execute(
         select(Job).where(
-            Job.type == "extract_import_editorial_article",
-            Job.idempotency_key == idempotency_key,
-            Job.status.in_(["queued", "running", "succeeded"]),
+            Job.type == "extract_import_editorial_article", Job.idempotency_key == idempotency_key
         )
     )
     job = existing_job.scalar_one_or_none()
+    if job is not None and job.status not in ("queued", "running", "succeeded"):
+        # A failed extraction (bad URL, Gemini error, ...) must not
+        # permanently block retrying the same URL — `idempotency_key` has a
+        # unique constraint per job type, so leaving the old row in place
+        # would 500 (IntegrityError) on every future attempt instead of
+        # actually retrying.
+        await db.delete(job)
+        await db.flush()
+        job = None
 
     if job is None:
         job = Job(
@@ -238,13 +245,15 @@ async def create_import_batch(
         await db.refresh(batch)
 
     existing_job = await db.execute(
-        select(Job).where(
-            Job.type == f"extract_import_{kind}",
-            Job.idempotency_key == idempotency_key,
-            Job.status.in_(["queued", "running", "succeeded"]),
-        )
+        select(Job).where(Job.type == f"extract_import_{kind}", Job.idempotency_key == idempotency_key)
     )
     job = existing_job.scalar_one_or_none()
+    if job is not None and job.status not in ("queued", "running", "succeeded"):
+        # See the editorial_article branch above: a failed row must not
+        # permanently block retrying the same file upload.
+        await db.delete(job)
+        await db.flush()
+        job = None
 
     if job is None:
         job = Job(
@@ -340,13 +349,15 @@ async def _create_exam_paper_batch(
         await db.refresh(batch)
 
     existing_job = await db.execute(
-        select(Job).where(
-            Job.type == "extract_import_exam_paper",
-            Job.idempotency_key == idempotency_key,
-            Job.status.in_(["queued", "running", "succeeded"]),
-        )
+        select(Job).where(Job.type == "extract_import_exam_paper", Job.idempotency_key == idempotency_key)
     )
     job = existing_job.scalar_one_or_none()
+    if job is not None and job.status not in ("queued", "running", "succeeded"):
+        # See the editorial_article branch above: a failed row must not
+        # permanently block retrying the same upload.
+        await db.delete(job)
+        await db.flush()
+        job = None
 
     if job is None:
         job = Job(
