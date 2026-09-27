@@ -37,6 +37,21 @@ DEFAULT_GEMINI_VOICE = "Kore"
 
 _RATE_RE = re.compile(r"rate=(\d+)")
 
+# Native Gemini TTS (audio-out generate_content, not the classic text-only
+# API) reliably 500s on a long single-shot input — confirmed in production:
+# every podcast attempt (a whole-lesson script covering ALL vocab+grammar,
+# easily several thousand characters) failed with a generic
+# "500 INTERNAL" every single time, while every short caller (one
+# word/sentence — lecture-per-line, corpus-per-cue, vocab-per-word) always
+# succeeded. There's no documented hard limit, so this is a conservative
+# budget (~a minute of speech) chosen to stay well clear of it rather than
+# a number from Google's docs. Below this, text is sent as one chunk
+# exactly like before (so short callers are unaffected); above it, text is
+# split at sentence boundaries and synthesized as multiple chunks whose
+# raw PCM gets concatenated before a single transcode.
+_MAX_TTS_CHARS = 1600
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
 _client: genai.Client | None = None
 
 
@@ -49,6 +64,34 @@ def _get_client() -> genai.Client:
 
 def _resolve_voice(voice: str) -> str:
     return VOICE_MAP.get(voice) or (voice if voice in VOICE_MAP.values() else DEFAULT_GEMINI_VOICE)
+
+
+def _split_for_tts(text: str, max_chars: int) -> list[str]:
+    """Greedily pack sentence-like pieces into chunks no larger than
+    max_chars, splitting only at a sentence boundary (a punctuation mark
+    the podcast script already uses for pauses) so a chunk edge never
+    lands mid-clause. Falls back to a hard split for the rare single
+    "sentence" that alone exceeds max_chars (e.g. a long compound example
+    with no terminal punctuation)."""
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(sentence) <= max_chars:
+            current = sentence
+        else:
+            for start in range(0, len(sentence), max_chars):
+                chunks.append(sentence[start : start + max_chars])
+    if current:
+        chunks.append(current)
+    return chunks or [text.strip()]
 
 
 def _run_ffmpeg(pcm_bytes: bytes, sample_rate: int, *, codec_args: list[str]) -> bytes:
@@ -73,6 +116,44 @@ def transcode_pcm(pcm_bytes: bytes, sample_rate: int = 24000) -> tuple[bytes, by
     aac_bytes = _run_ffmpeg(pcm_bytes, sample_rate, codec_args=["-c:a", "aac", "-b:a", "96k", "-f", "adts"])
     duration_sec = round(len(pcm_bytes) / (sample_rate * 2))  # 16-bit mono PCM: 2 bytes/sample
     return opus_bytes, aac_bytes, duration_sec
+
+
+def _synthesize_chunk_pcm(client: genai.Client, text: str, config: dict, models_to_try: list[str]) -> tuple[bytes, int]:
+    """One chunk of text -> (pcm_bytes, sample_rate), trying each model in
+    order and falling through to the next only on a quota (429) error.
+    Raises RuntimeError with a clean, user-facing message otherwise."""
+    response = None
+    for i, model_name in enumerate(models_to_try):
+        try:
+            response = client.models.generate_content(model=model_name, contents=text, config=config)
+            break
+        except genai_errors.APIError as exc:
+            is_quota = exc.status == "RESOURCE_EXHAUSTED" or exc.code == 429
+            if is_quota and i < len(models_to_try) - 1:
+                continue
+            if is_quota:
+                # Surface a clean, actionable message instead of the raw SDK
+                # repr (a huge nested-dict string) — this is what ends up
+                # verbatim in job.error.message and is shown to the user.
+                raise RuntimeError(
+                    "Đã hết hạn mức Gemini TTS miễn phí trong hôm nay (đã thử cả model dự phòng). "
+                    "Thử lại vào ngày mai, hoặc bật billing (pay-as-you-go) cho API key trong "
+                    "Google AI Studio / Google Cloud Console để tăng hạn mức."
+                ) from exc
+            raise RuntimeError(
+                f"Gemini TTS tạm thời gặp lỗi ({exc.code} {exc.status or 'unknown'}), thử lại sau ít phút."
+            ) from exc
+    assert response is not None  # loop always either returns via break or raises
+
+    candidates = response.candidates or []
+    parts = candidates[0].content.parts if candidates and candidates[0].content else None
+    inline = parts[0].inline_data if parts else None
+    if inline is None or not inline.data:
+        raise RuntimeError("Gemini TTS returned no inline audio data")
+
+    match = _RATE_RE.search(inline.mime_type or "")
+    sample_rate = int(match.group(1)) if match else 24000
+    return inline.data, sample_rate
 
 
 def synthesize_korean_tts(text_ko: str, voice: str = "ko-female-1") -> tuple[bytes, bytes, int]:
@@ -126,35 +207,17 @@ def synthesize_korean_tts(text_ko: str, voice: str = "ko-female-1") -> tuple[byt
     if settings.GEMINI_MODEL_TTS_FALLBACK and settings.GEMINI_MODEL_TTS_FALLBACK not in models_to_try:
         models_to_try.append(settings.GEMINI_MODEL_TTS_FALLBACK)
 
-    response = None
-    for i, model_name in enumerate(models_to_try):
-        try:
-            response = client.models.generate_content(model=model_name, contents=text_ko, config=config)
-            break
-        except genai_errors.APIError as exc:
-            is_quota = exc.status == "RESOURCE_EXHAUSTED" or exc.code == 429
-            if is_quota and i < len(models_to_try) - 1:
-                continue
-            if is_quota:
-                # Surface a clean, actionable message instead of the raw SDK
-                # repr (a huge nested-dict string) — this is what ends up
-                # verbatim in job.error.message and is shown to the user.
-                raise RuntimeError(
-                    "Đã hết hạn mức Gemini TTS miễn phí trong hôm nay (đã thử cả model dự phòng). "
-                    "Thử lại vào ngày mai, hoặc bật billing (pay-as-you-go) cho API key trong "
-                    "Google AI Studio / Google Cloud Console để tăng hạn mức."
-                ) from exc
-            raise RuntimeError(
-                f"Gemini TTS tạm thời gặp lỗi ({exc.code} {exc.status or 'unknown'}), thử lại sau ít phút."
-            ) from exc
-    assert response is not None  # loop always either returns via break or raises
+    # A long single-shot input (the podcast script — a whole lesson's
+    # vocab+grammar, easily several thousand characters) reliably 500s the
+    # native TTS endpoint; short callers (one word/sentence) never do. Chunk
+    # at sentence boundaries and concatenate the raw PCM before transcoding
+    # once, so long scripts get the same reliability short callers already
+    # have without changing this function's signature or callers.
+    chunks = _split_for_tts(text_ko, _MAX_TTS_CHARS)
+    pcm_parts: list[bytes] = []
+    sample_rate = 24000
+    for chunk in chunks:
+        pcm, sample_rate = _synthesize_chunk_pcm(client, chunk, config, models_to_try)
+        pcm_parts.append(pcm)
 
-    candidates = response.candidates or []
-    parts = candidates[0].content.parts if candidates and candidates[0].content else None
-    inline = parts[0].inline_data if parts else None
-    if inline is None or not inline.data:
-        raise RuntimeError("Gemini TTS returned no inline audio data")
-
-    match = _RATE_RE.search(inline.mime_type or "")
-    sample_rate = int(match.group(1)) if match else 24000
-    return transcode_pcm(inline.data, sample_rate)
+    return transcode_pcm(b"".join(pcm_parts), sample_rate)
