@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import _problem, get_current_profile
+from app.api.deps import _problem, get_current_profile, get_current_profile_sse
 from app.core.redis_client import async_redis, job_channel
 from app.db import get_db
 from app.models import Job, Profile
@@ -46,7 +46,7 @@ async def stream_job_events(
     job_id: uuid.UUID,
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
-    profile: Annotated[Profile, Depends(get_current_profile)],
+    profile: Annotated[Profile, Depends(get_current_profile_sse)],
 ):
     """SSE stream. Sends the current state immediately (in case the job
     already finished before the client subscribed), then relays every

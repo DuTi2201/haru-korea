@@ -1,7 +1,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +34,30 @@ async def get_current_profile(
     claims: Annotated[dict, Depends(get_current_claims)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Profile:
+    profile = await db.get(Profile, uuid.UUID(claims["sub"]))
+    if profile is None:
+        raise _problem(status.HTTP_401_UNAUTHORIZED, "Profile not found", "unauthenticated")
+    return profile
+
+
+async def get_current_profile_sse(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
+    token: Annotated[str | None, Query()] = None,
+) -> Profile:
+    """Same as get_current_profile, but ALSO accepts the JWT as a `?token=`
+    query param. Only use this on the SSE events route: the browser's
+    native EventSource cannot set an Authorization header, so this is the
+    one endpoint where a token-in-URL is the pragmatic trade-off (short-
+    lived access token, HTTPS-only, not logged server-side by this app).
+    """
+    raw = creds.credentials if creds else token
+    if not raw:
+        raise _problem(status.HTTP_401_UNAUTHORIZED, "Missing bearer token", "unauthenticated")
+    try:
+        claims = decode_token(raw)
+    except ValueError as exc:
+        raise _problem(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token", "invalid_token") from exc
     profile = await db.get(Profile, uuid.UUID(claims["sub"]))
     if profile is None:
         raise _problem(status.HTTP_401_UNAUTHORIZED, "Profile not found", "unauthenticated")
