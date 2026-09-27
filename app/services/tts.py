@@ -216,7 +216,18 @@ def synthesize_korean_tts(text_ko: str, voice: str = "ko-female-1") -> tuple[byt
     chunks = _split_for_tts(text_ko, _MAX_TTS_CHARS)
     pcm_parts: list[bytes] = []
     sample_rate = 24000
-    for chunk in chunks:
+    # TEMPORARY diagnostic logging (Railway captures worker stdout): the
+    # 500 INTERNAL from Gemini is generic and gives no hint of *why*, so
+    # this pins down exactly what was sent on the chunk that fails —
+    # length, chunk count, and a text preview — without needing to guess
+    # again. Safe to remove once the actual cause is confirmed.
+    print(
+        f"[tts-debug] total_len={len(text_ko)} chunks={len(chunks)} "
+        f"chunk_lens={[len(c) for c in chunks]} voice={voice_name}",
+        flush=True,
+    )
+    for idx, chunk in enumerate(chunks):
+        print(f"[tts-debug] chunk {idx + 1}/{len(chunks)} len={len(chunk)} text={chunk!r}", flush=True)
         pcm, sample_rate = _synthesize_chunk_pcm(client, chunk, config, models_to_try)
         pcm_parts.append(pcm)
 
