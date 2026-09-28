@@ -265,6 +265,64 @@ def generate_content_podcast(
             raise
 
 
+@celery_app.task(name="app.workers.tasks.generate_article_audio", bind=True, max_retries=3)
+def generate_article_audio(self, job_id: str, body_ko: str, voice: str, prompt_version: str, cache_key: str):
+    """Reads an editorial article's OWN scraped body_ko text aloud
+    verbatim — deliberately independent of generate_content_podcast (which
+    has Gemini WRITE a teaching script about the article's vocab/grammar,
+    never the article's actual words). No script-writing step here at
+    all: body_ko goes straight into TTS, same as generate_lecture_audio,
+    just under this table's "article-audio:" cache_key prefix instead of
+    "podcast:" (see app/api/routers/editorial.py request_article_audio for
+    the cache key, which hashes body_ko so a later re-ingest/backfill of
+    the article's text naturally busts a stale recording).
+
+    body_ko for a real news article/column easily runs several thousand
+    characters — well past a single TTS request's reliable limit — but
+    tts.synthesize_korean_tts already chunks at sentence boundaries and
+    concatenates before one transcode (see app/services/tts.py), so this
+    task doesn't need its own chunking logic."""
+    jid = uuid.UUID(job_id)
+    with Session(_sync_engine) as db:
+        try:
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc với Gemini")
+            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(body_ko, voice)
+
+            publish_job_event(db, jid, progress=0.9, step="Đang lưu âm thanh")
+            row = LectureAudio(
+                cache_key=cache_key,
+                opus_path=f"/api/v1/lessons/audio/{cache_key}.opus",
+                aac_path=f"/api/v1/lessons/audio/{cache_key}.aac",
+                opus_data=opus_bytes,
+                aac_data=aac_bytes,
+                prompt_version=prompt_version,
+                voice=voice,
+                duration_sec=duration_sec,
+            )
+            db.add(row)
+            db.commit()
+
+            publish_job_event(
+                db,
+                jid,
+                status="succeeded",
+                progress=1.0,
+                step="Hoàn tất",
+                result={
+                    "cache_key": cache_key,
+                    "opus_path": row.opus_path,
+                    "aac_path": row.aac_path,
+                    "duration_sec": duration_sec,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            publish_job_event(
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
+            )
+            raise
+
+
 @celery_app.task(name="app.workers.tasks.grade_editorial_outline", bind=True, max_retries=3)
 def grade_editorial_outline(self, job_id: str, submission_id: str):
     """Real Gemini feedback on the learner's OWN "luyện dàn ý" attempt —

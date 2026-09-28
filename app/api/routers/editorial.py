@@ -14,6 +14,7 @@ viết câu 54). Two audiences share this file:
   through the exact same POST /imports?kind=editorial_article flow as a
   manually-typed URL (see app.api.routers.ingest.start_editorial_import).
 """
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated
@@ -33,10 +34,12 @@ from app.models import (
     EditorialSource,
     GrammarPoint,
     Job,
+    LectureAudio,
     Profile,
     VocabItem,
 )
 from app.schemas import (
+    ArticleAudioRequest,
     EditorialArticleOut,
     EditorialArticleSummaryOut,
     EditorialCandidateOut,
@@ -51,7 +54,7 @@ from app.schemas import (
     PodcastRequest,
     VocabItemOut,
 )
-from app.workers.tasks import discover_editorial_candidates, grade_editorial_outline
+from app.workers.tasks import discover_editorial_candidates, generate_article_audio, grade_editorial_outline
 
 router = APIRouter(tags=["editorial"])
 
@@ -132,6 +135,86 @@ async def request_editorial_podcast(
         raise _problem(status.HTTP_404_NOT_FOUND, "Editorial article not found", "not_found")
     return await _request_podcast(
         db, "article", str(article_id), body, request, article.vocab_ids, article.grammar_ids
+    )
+
+
+@router.post("/editorials/{article_id}/audio", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
+async def request_article_audio(
+    article_id: uuid.UUID,
+    body: ArticleAudioRequest,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Reads the article's OWN body_ko text aloud verbatim — completely
+    independent of POST .../podcast (that endpoint has Gemini WRITE a
+    teaching script about the article's vocab/grammar; this one just hands
+    the article's real scraped sentences straight to TTS, so a learner can
+    hear native-length pacing/pauses on the actual news text). No login
+    required — same rationale as GET /editorials/{id} itself.
+
+    cache_key is keyed off a hash of body_ko itself (not just article_id)
+    so a later re-ingest/backfill that changes the article's text (e.g. the
+    apply_editorial_batch fix that recovers a previously-empty body_ko)
+    naturally busts any stale cached recording instead of serving audio for
+    text that no longer matches what's on screen."""
+    article = await db.get(EditorialArticle, article_id)
+    if article is None or article.body_ko is None:
+        raise _problem(status.HTTP_404_NOT_FOUND, "Editorial article not found", "not_found")
+    if not article.body_ko.strip():
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "Article has no body text yet",
+            "no_body_text",
+            "This article hasn't been fully imported yet — its full text isn't available to read aloud.",
+        )
+
+    content_sig = hashlib.sha256(article.body_ko.encode("utf-8")).hexdigest()[:16]
+    cache_key = f"article-audio:{article_id}:{body.voice}:{body.prompt_version}:{content_sig}"
+
+    cached = await db.execute(select(LectureAudio).where(LectureAudio.cache_key == cache_key))
+    hit = cached.scalar_one_or_none()
+
+    idempotency_key = request.headers.get("Idempotency-Key", cache_key)
+    existing_job = await db.execute(
+        select(Job).where(Job.type == "generate_article_audio", Job.idempotency_key == idempotency_key)
+    )
+    job = existing_job.scalar_one_or_none()
+    if job is not None and job.status not in ("queued", "running", "succeeded"):
+        # Same reasoning as _request_podcast's identical guard: a stale
+        # "failed" row under this idempotency key would otherwise wedge
+        # every retry behind a unique-constraint 500 forever.
+        await db.delete(job)
+        await db.flush()
+        job = None
+
+    if job is None:
+        job = Job(
+            type="generate_article_audio",
+            owner_id=None,
+            idempotency_key=idempotency_key,
+            status="succeeded" if hit else "queued",
+            progress=1.0 if hit else 0.0,
+            result={
+                "cache_key": hit.cache_key,
+                "opus_path": hit.opus_path,
+                "aac_path": hit.aac_path,
+                "duration_sec": hit.duration_sec,
+            }
+            if hit
+            else None,
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+
+        if not hit:
+            generate_article_audio.delay(str(job.id), article.body_ko, body.voice, body.prompt_version, cache_key)
+
+    return JobAccepted(
+        job_id=job.id,
+        status=job.status,
+        poll_url=f"/api/v1/jobs/{job.id}",
+        events_url=f"/api/v1/jobs/{job.id}/events",
     )
 
 

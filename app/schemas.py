@@ -120,6 +120,19 @@ class PodcastRequest(BaseModel):
     prompt_version: str = "podcast-v1"
 
 
+class ArticleAudioRequest(BaseModel):
+    """POST /editorials/{id}/audio: reads the article's OWN body_ko text
+    aloud verbatim (native-length sentences, real pacing/pauses) — no
+    Gemini script-writing step at all, unlike PodcastRequest. Deliberately
+    separate from the podcast feature: a learner listening to the actual
+    news article and a learner listening to a teaching script ABOUT its
+    vocab/grammar are two different study modes, cached independently
+    (see app.workers.tasks.generate_article_audio)."""
+
+    voice: str = "ko-female-1"
+    prompt_version: str = "article-v1"
+
+
 # ----------------------------------------------------------------- writing --
 class WritingSubmissionOut(BaseModel):
     id: uuid.UUID
