@@ -1233,7 +1233,21 @@ def apply_editorial_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
     items = db.execute(select(ImportItem).where(ImportItem.import_batch_id == batch.id)).scalars().all()
     applied = 0
 
-    meta_item = next((i for i in items if i.kind == "editorial_meta" and i.status == "confirmed"), None)
+    # Unlike vocab_item/grammar_point (individually AI-guessed proposals
+    # that genuinely warrant a per-row accept/reject), editorial_meta's
+    # body_ko is the real, human-written scraped article text — not an AI
+    # invention — bundled with Gemini's classification of it (level/topics/
+    # outline) under one status. Gating this on status == "confirmed"
+    # meant a reviewer who confirmed the vocab/grammar rows and hit "Xác
+    # nhận lô" WITHOUT separately noticing and clicking "Xác nhận" on this
+    # one extra row got a batch marked confirmed (vocab/grammar did apply)
+    # with the article's own body_ko silently left empty forever — no
+    # warning anywhere. Confirmed in production: an article with real
+    # vocab+grammar and body_ko == "". Apply it unless a reviewer
+    # EXPLICITLY rejected it (they still can, e.g. a garbled scrape) —
+    # matches how a scraped article is actually reviewed in practice (read
+    # the whole thing once, act on the article, not tick every row).
+    meta_item = next((i for i in items if i.kind == "editorial_meta" and i.status != "rejected"), None)
     if meta_item is not None and article.import_item_id is None:
         payload = meta_item.payload
         article.body_ko = payload["body_ko"]
