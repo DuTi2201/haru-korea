@@ -51,7 +51,7 @@ from app.schemas import (
     PodcastRequest,
     VocabItemOut,
 )
-from app.workers.tasks import grade_editorial_outline
+from app.workers.tasks import discover_editorial_candidates, grade_editorial_outline
 
 router = APIRouter(tags=["editorial"])
 
@@ -312,6 +312,21 @@ async def list_editorial_candidates(
     if status_filter:
         query = query.where(EditorialCandidate.status == status_filter)
     return (await db.execute(query)).scalars().all()
+
+
+@router.post("/editorial-candidates/discover", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_editorial_discovery(profile: Annotated[Profile, Depends(_editor_or_admin)]):
+    """Manually kicks off the same RSS-discovery pass discover_editorial_
+    candidates (Celery beat) otherwise only runs every 6h — the "Làm mới"
+    button used to just re-fetch the candidate list (a no-op if the beat
+    scheduler hadn't ticked yet, which — until this deploy — it never had:
+    the worker process ran with no beat scheduler at all, so this task had
+    literally never executed once). Fire-and-forget, same as the beat
+    schedule: no Job row (per the task's own docstring, "không ai chờ kết
+    quả trực tiếp"), just enqueues and returns immediately; refresh the
+    candidate list a few seconds later to see what it found."""
+    discover_editorial_candidates.delay()
+    return {"status": "queued"}
 
 
 @router.post("/editorial-candidates/{candidate_id}/dismiss", response_model=EditorialCandidateOut)
