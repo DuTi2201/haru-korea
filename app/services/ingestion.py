@@ -1513,7 +1513,24 @@ def discover_editorial_candidates_for_source(db: Session, source: EditorialSourc
 def discover_editorial_candidates(db: Session) -> dict[str, Any]:
     """Runs discovery across every active registered source. One bad feed
     (network error, malformed XML) is recorded in `errors` and does not
-    sink the rest of the run."""
+    sink the rest of the run.
+
+    IMPORTANT: this is the one place in the whole ingestion module that
+    owns its own commit. The caller (app.workers.tasks.
+    discover_editorial_candidates) just does `with Session(_sync_engine)
+    as db: return discover_editorial_candidates(db)` — no db.commit()
+    anywhere in that path, unlike every other task in tasks.py, which all
+    commit explicitly before their `with` block exits. Session.__exit__
+    only closes the session; it does NOT commit a pending transaction, so
+    every row this used to insert (only ever flushed, never committed) was
+    silently rolled back the moment the task function returned. That
+    produced exactly the two symptoms this was written to fix: the
+    candidate queue stayed empty no matter how many times the scan ran
+    (nothing was ever actually persisted), AND re-running the scan kept
+    "inserting" the identical entries every time (ON CONFLICT DO NOTHING
+    on source_url never found a conflict, because the rows it should have
+    conflicted with had already been rolled back out of the database).
+    """
     sources = db.execute(select(EditorialSource).where(EditorialSource.active.is_(True))).scalars().all()
     per_source: dict[str, int] = {}
     errors: dict[str, str] = {}
@@ -1526,6 +1543,7 @@ def discover_editorial_candidates(db: Session) -> dict[str, Any]:
             continue
         per_source[source.name] = n
         total += n
+    db.commit()
     return {"total_inserted": total, "per_source": per_source, "errors": errors}
 
 
