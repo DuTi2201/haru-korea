@@ -218,6 +218,63 @@ def split_paragraphs(body: str) -> list[str]:
     return [p for p in (ln.strip() for ln in (body or "").splitlines()) if p]
 
 
+# ------------------------------------------------------------- image cleanup --
+_CAP_COPYRIGHT_TAIL_RE = re.compile(r"\s*[<\[(（]?\s*저작권자.*$|\s*[ⓒ©]\s*\d{0,4}.*$|\s*무단\s*(전재|복제).*$")
+_CAP_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
+_CAP_STAMP_RE = re.compile(r"/?\s*\d{4}[-./]\s?\d{1,2}[-./]\s?\d{1,2}(\s+\d{1,2}:\d{2}(:\d{2})?)?\s*/?")
+_CAP_END_RE = re.compile(r"[.!?…\"”’'」』。)]$")
+_CAPTION_MAX = 400
+
+
+def clean_image_caption(caption: str | None) -> str | None:
+    """A caption as the reader should see it: copyright tags, photographer
+    e-mails and upload timestamps ("…jieunlee@yna.co.kr/2026-09-17 19:48:00/
+    <저작권자 ⓒ …>") dropped, whitespace normalised, capped in length.
+    Pure and idempotent; None when nothing readable is left."""
+    if not caption:
+        return None
+    text = _norm_ws(caption)
+    text = _CAP_COPYRIGHT_TAIL_RE.sub("", text)
+    text = _CAP_EMAIL_RE.sub("", text)
+    text = _CAP_STAMP_RE.sub(" ", text)
+    text = _norm_ws(text).strip(" /|·-")
+    if len(text) > _CAPTION_MAX:
+        cut = text[:_CAPTION_MAX]
+        end = max(cut.rfind(". "), cut.rfind("다. "))
+        text = cut[: end + 1] if end >= _CAPTION_MAX // 2 else cut.rstrip() + "…"
+    return text or None
+
+
+def _is_author_portrait(caption: str | None) -> bool:
+    """Columnists' head-shots carry just "김준기 논설위원" as their caption —
+    that is a byline picture, not a picture of the story."""
+    if not caption:
+        return False
+    return (
+        len(caption) <= 24
+        and len(caption.split()) <= 4
+        and _BYLINE_RE.search(caption) is not None
+        and _CAP_END_RE.search(caption) is None
+    )
+
+
+def clean_images(images: list[dict] | None) -> list[dict]:
+    """Normalise stored/extracted image dicts: clean captions and drop
+    author portraits. Pure and idempotent, so it runs both when an article
+    is scraped and again at read time (legacy rows get the same treatment
+    with no migration)."""
+    out: list[dict] = []
+    for im in images or []:
+        url = im.get("url")
+        if not url:
+            continue
+        cap = clean_image_caption(im.get("caption"))
+        if _is_author_portrait(cap):
+            continue
+        out.append({"url": url, "caption": cap, "after_paragraph": int(im.get("after_paragraph") or 0)})
+    return out
+
+
 # ------------------------------------------------------------------- TTS text --
 _URL_RE = re.compile(r"https?://\S+|www\.\S+")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
@@ -642,4 +699,6 @@ def extract_article(html: str, url: str, site_name: str | None = None) -> Extrac
             if _img_key(u) not in seen_keys and not any(h in u.lower() for h in _IMG_BAD_HINTS):
                 out_images.append({"url": u, "caption": None, "after_paragraph": 0})
                 break
-    return ExtractedArticle(title=title, site_name=site, body=body, images=out_images[:MAX_IMAGES], strategy=strategy)
+    return ExtractedArticle(
+        title=title, site_name=site, body=body, images=clean_images(out_images)[:MAX_IMAGES], strategy=strategy
+    )

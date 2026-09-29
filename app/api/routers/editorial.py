@@ -55,7 +55,12 @@ from app.schemas import (
     PodcastRequest,
     VocabItemOut,
 )
-from app.services.article_extract import TEXT_CLEAN_VERSION, article_tts_text, clean_article_text
+from app.services.article_extract import (
+    TEXT_CLEAN_VERSION,
+    article_tts_text,
+    clean_article_text,
+    clean_images,
+)
 from app.workers.tasks import (
     discover_editorial_candidates,
     generate_article_audio,
@@ -68,6 +73,14 @@ router = APIRouter(tags=["editorial"])
 _editor_or_admin = require_role("editor", "admin")
 
 _STALE_JOB_AFTER = timedelta(minutes=8)
+
+
+def _cover_image_url(images: list[dict] | None) -> str | None:
+    """First usable photo (captions cleaned, author head-shots dropped) —
+    the same filtering the detail view applies, so the list thumbnail never
+    shows a picture the article page then hides."""
+    cleaned = clean_images(images)
+    return cleaned[0]["url"] if cleaned else None
 
 
 # ------------------------------------------------------------ learner-facing --
@@ -99,7 +112,7 @@ async def list_editorials(
             level_estimate=a.level_estimate,
             topic_tags=a.topic_tags,
             created_at=a.created_at,
-            cover_image_url=(a.images[0].get("url") if a.images else None),
+            cover_image_url=_cover_image_url(a.images),
         )
         for a in articles
     ]
@@ -155,7 +168,7 @@ async def get_editorial(article_id: uuid.UUID, db: Annotated[AsyncSession, Depen
         grammar=[GrammarPointOut.model_validate(g) for g in grammar],
         thinking_guide_text=article.thinking_guide_text,
         created_at=article.created_at,
-        images=[ArticleImageOut(**im) for im in (article.images or [])],
+        images=[ArticleImageOut(**im) for im in clean_images(article.images)],
         images_pending=images_pending,
     )
 

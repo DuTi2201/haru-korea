@@ -10,6 +10,8 @@ import unittest
 from app.services.article_extract import (
     article_tts_text,
     clean_article_text,
+    clean_image_caption,
+    clean_images,
     extract_article,
     select_body_lines,
 )
@@ -288,6 +290,58 @@ class ExtractHtmlTests(unittest.TestCase):
         self.assertEqual([i["url"] for i in art.images], ["https://example.com/real.jpg"])
         self.assertEqual(art.images[0]["caption"], "현장 사진 설명입니다")
         self.assertEqual(art.images[0]["after_paragraph"], 2)
+
+
+class ImageCleanupTests(unittest.TestCase):
+    # Real caption pulled from a 세계일보 article on production.
+    SEGYE_CAP = (
+        "'주민동의 없는 여명학교 건립 반대' (서울=연합뉴스) 이지은 기자 = 17일 서울 강서구 여명학교에서 열린 "
+        "주민설명회에서 주민들이 손팻말을 들고 있다. 2026.9.17 jieunlee@yna.co.kr/2026-09-17 19:48:00/ "
+        "<저작권자 ⓒ 1980-2026 ㈜연합뉴스. 무단 전재 재배포 금지, AI 학습 및 활용 금지>"
+    )
+
+    def test_caption_loses_copyright_email_and_timestamps(self):
+        cap = clean_image_caption(self.SEGYE_CAP)
+        self.assertTrue(cap.endswith("손팻말을 들고 있다."), cap)
+        for junk in ("jieunlee@", "저작권자", "19:48", "무단"):
+            self.assertNotIn(junk, cap)
+
+    def test_plain_caption_untouched_and_idempotent(self):
+        cap = "이헌석 정책위원이 지난 15일 인터뷰에서 문제점을 설명하고 있다. 강윤중 선임기자"
+        self.assertEqual(clean_image_caption(cap), cap)
+        once = clean_image_caption(self.SEGYE_CAP)
+        self.assertEqual(clean_image_caption(once), once)
+
+    def test_empty_or_only_junk_caption_is_none(self):
+        self.assertIsNone(clean_image_caption(None))
+        self.assertIsNone(clean_image_caption("  "))
+        self.assertIsNone(clean_image_caption("<저작권자 ⓒ 경향신문, 무단 전재 및 재배포 금지>"))
+
+    def test_long_caption_capped_at_a_sentence(self):
+        long_cap = "이것은 매우 긴 설명이다. " * 60
+        cap = clean_image_caption(long_cap)
+        self.assertLessEqual(len(cap), 401)
+        self.assertTrue(cap.endswith(".") or cap.endswith("…"))
+
+    def test_author_portrait_dropped_but_real_photos_kept(self):
+        imgs = [
+            {"url": "https://x/a.jpg", "caption": "이헌석 정책위원이 인터뷰에서 문제점을 설명하고 있다. 강윤중 선임기자", "after_paragraph": 0},
+            {"url": "https://x/b.jpg", "caption": "김준기 논설위원", "after_paragraph": 43},
+            {"url": "https://x/c.jpg", "caption": None, "after_paragraph": 5},
+            {"url": "", "caption": "빈 주소", "after_paragraph": 1},
+        ]
+        out = clean_images(imgs)
+        self.assertEqual([i["url"] for i in out], ["https://x/a.jpg", "https://x/c.jpg"])
+        self.assertEqual(clean_images(out), out)  # idempotent
+
+    def test_extract_applies_cleanup(self):
+        html = f"""<html><body><article>
+        <figure><img src="/p/1.jpg"><figcaption>{self.SEGYE_CAP}</figcaption></figure>
+        <p>{P1}</p><p>{P2}</p>
+        <figure><img src="/p/2.jpg"><figcaption>김준기 논설위원</figcaption></figure></article></body></html>"""
+        art = extract_article(html, "https://example.com/f")
+        self.assertEqual([i["url"] for i in art.images], ["https://example.com/p/1.jpg"])
+        self.assertNotIn("저작권자", art.images[0]["caption"])
 
 
 if __name__ == "__main__":
