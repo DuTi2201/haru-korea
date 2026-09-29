@@ -334,7 +334,8 @@ class EditorialSourceOut(BaseModel):
 class EditorialArticleSummaryOut(BaseModel):
     """GET /editorials list card — no body_ko (too big for a list) and no
     model_outline (that's revealed only after the learner submits their
-    own outline attempt — see EditorialOutlineOut)."""
+    own outline attempt — see EditorialOutlineOut). `cover_image_url` is the
+    article's first scraped photo, for the card thumbnail."""
 
     id: uuid.UUID
     source_name: str
@@ -342,8 +343,19 @@ class EditorialArticleSummaryOut(BaseModel):
     level_estimate: int | None
     topic_tags: list[str]
     created_at: datetime
+    cover_image_url: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+class ArticleImageOut(BaseModel):
+    """One photo from the source article. `after_paragraph` = how many body
+    paragraphs precede it (0 = above the first paragraph), so the reader
+    can put it back where it sat in the original."""
+
+    url: str
+    caption: str | None = None
+    after_paragraph: int = 0
 
 
 class EditorialArticleOut(BaseModel):
@@ -358,6 +370,11 @@ class EditorialArticleOut(BaseModel):
     grammar: list[GrammarPointOut]
     thinking_guide_text: str | None
     created_at: datetime
+    images: list[ArticleImageOut] = []
+    # True when this article's photos have never been fetched (imported
+    # before photos existed) and a background fetch was just queued — the
+    # client refetches once after a few seconds instead of showing none.
+    images_pending: bool = False
 
 
 class EditorialOutlineSubmitRequest(BaseModel):

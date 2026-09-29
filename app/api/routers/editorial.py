@@ -16,7 +16,7 @@ viết câu 54). Two audiences share this file:
 """
 import hashlib
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, status
@@ -40,6 +40,7 @@ from app.models import (
 )
 from app.schemas import (
     ArticleAudioRequest,
+    ArticleImageOut,
     EditorialArticleOut,
     EditorialArticleSummaryOut,
     EditorialCandidateOut,
@@ -54,11 +55,19 @@ from app.schemas import (
     PodcastRequest,
     VocabItemOut,
 )
-from app.workers.tasks import discover_editorial_candidates, generate_article_audio, grade_editorial_outline
+from app.services.article_extract import TEXT_CLEAN_VERSION, article_tts_text, clean_article_text
+from app.workers.tasks import (
+    discover_editorial_candidates,
+    generate_article_audio,
+    grade_editorial_outline,
+    refresh_editorial_images,
+)
 
 router = APIRouter(tags=["editorial"])
 
 _editor_or_admin = require_role("editor", "admin")
+
+_STALE_JOB_AFTER = timedelta(minutes=8)
 
 
 # ------------------------------------------------------------ learner-facing --
@@ -81,7 +90,19 @@ async def list_editorials(
         query = query.where(EditorialArticle.level_estimate == level)
     if topic:
         query = query.where(EditorialArticle.topic_tags.any(topic))
-    return (await db.execute(query)).scalars().all()
+    articles = (await db.execute(query)).scalars().all()
+    return [
+        EditorialArticleSummaryOut(
+            id=a.id,
+            source_name=a.source_name,
+            title_ko=a.title_ko,
+            level_estimate=a.level_estimate,
+            topic_tags=a.topic_tags,
+            created_at=a.created_at,
+            cover_image_url=(a.images[0].get("url") if a.images else None),
+        )
+        for a in articles
+    ]
 
 
 @router.get("/editorials/{article_id}", response_model=EditorialArticleOut)
@@ -104,6 +125,24 @@ async def get_editorial(article_id: uuid.UUID, db: Annotated[AsyncSession, Depen
         else []
     )
 
+    # Articles imported before the page-chrome filter existed still have the
+    # menu / AI-summary / "지금 많이 보는 기사" lines stored in body_ko —
+    # clean_article_text is idempotent, so applying it on every read fixes
+    # them retroactively (and is a no-op on already-clean text).
+    images_pending = False
+    if article.images_fetched_at is None:
+        # Imported before article photos existed: fetch them once in the
+        # background. Stamp the time NOW so concurrent views don't each queue
+        # a fetch; the task overwrites it when done.
+        try:
+            article.images_fetched_at = datetime.now(timezone.utc)
+            db.add(article)
+            await db.commit()
+            refresh_editorial_images.delay(str(article.id))
+            images_pending = True
+        except Exception:  # noqa: BLE001 — reading must never fail because a background fetch could not be queued
+            await db.rollback()
+
     return EditorialArticleOut(
         id=article.id,
         source_name=article.source_name,
@@ -111,11 +150,13 @@ async def get_editorial(article_id: uuid.UUID, db: Annotated[AsyncSession, Depen
         title_ko=article.title_ko,
         level_estimate=article.level_estimate,
         topic_tags=article.topic_tags,
-        body_ko=article.body_ko,
+        body_ko=clean_article_text(article.body_ko),
         vocab=[VocabItemOut.model_validate(v) for v in vocab],
         grammar=[GrammarPointOut.model_validate(g) for g in grammar],
         thinking_guide_text=article.thinking_guide_text,
         created_at=article.created_at,
+        images=[ArticleImageOut(**im) for im in (article.images or [])],
+        images_pending=images_pending,
     )
 
 
@@ -160,7 +201,15 @@ async def request_article_audio(
     article = await db.get(EditorialArticle, article_id)
     if article is None or article.body_ko is None:
         raise _problem(status.HTTP_404_NOT_FOUND, "Editorial article not found", "not_found")
-    if not article.body_ko.strip():
+
+    # Voice the CLEANED text (title + body, page chrome/captions/ranking
+    # widgets removed, URLs stripped) — the raw scrape used to be read aloud
+    # verbatim, menu items included. Same function the reader screen's
+    # body goes through, so what you hear is what you see.
+    cleaned_body = clean_article_text(article.body_ko)
+    if not cleaned_body.strip():
+        # (checked on the BODY, not the final text: a title alone must never
+        # be voiced as if it were the article)
         raise _problem(
             status.HTTP_409_CONFLICT,
             "Article has no body text yet",
@@ -168,7 +217,12 @@ async def request_article_audio(
             "This article hasn't been fully imported yet — its full text isn't available to read aloud.",
         )
 
-    content_sig = hashlib.sha256(article.body_ko.encode("utf-8")).hexdigest()[:16]
+    tts_text = article_tts_text(article.title_ko, cleaned_body)
+
+    # Keyed on the exact text voiced + the cleaning-rules version, so a
+    # body backfill OR a cleaning-rule change regenerates the recording
+    # instead of serving audio for text that no longer matches the screen.
+    content_sig = hashlib.sha256(f"{TEXT_CLEAN_VERSION}\n{tts_text}".encode("utf-8")).hexdigest()[:16]
     cache_key = f"article-audio:{article_id}:{body.voice}:{body.prompt_version}:{content_sig}"
 
     cached = await db.execute(select(LectureAudio).where(LectureAudio.cache_key == cache_key))
@@ -179,10 +233,18 @@ async def request_article_audio(
         select(Job).where(Job.type == "generate_article_audio", Job.idempotency_key == idempotency_key)
     )
     job = existing_job.scalar_one_or_none()
-    if job is not None and job.status not in ("queued", "running", "succeeded"):
+    if job is not None and (
+        job.status not in ("queued", "running", "succeeded")
+        or (job.status in ("queued", "running") and datetime.now(timezone.utc) - job.updated_at > _STALE_JOB_AFTER)
+    ):
         # Same reasoning as _request_podcast's identical guard: a stale
         # "failed" row under this idempotency key would otherwise wedge
-        # every retry behind a unique-constraint 500 forever.
+        # every retry behind a unique-constraint 500 forever. Also covers a
+        # job whose worker died mid-way (a Railway redeploy during a
+        # multi-minute generation): it would sit "running" for ever and
+        # every later play would poll it endlessly. The worker refreshes
+        # updated_at after every chunk, so no update for _STALE_JOB_AFTER
+        # means it is dead, not slow.
         await db.delete(job)
         await db.flush()
         job = None
@@ -208,7 +270,7 @@ async def request_article_audio(
         await db.refresh(job)
 
         if not hit:
-            generate_article_audio.delay(str(job.id), article.body_ko, body.voice, body.prompt_version, cache_key)
+            generate_article_audio.delay(str(job.id), tts_text, body.voice, body.prompt_version, cache_key)
 
     return JobAccepted(
         job_id=job.id,

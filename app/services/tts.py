@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
+from collections.abc import Callable
 
 from google import genai
 from google.genai import errors as genai_errors
@@ -36,6 +38,13 @@ VOICE_MAP: dict[str, str] = {
 DEFAULT_GEMINI_VOICE = "Kore"
 
 _RATE_RE = re.compile(r"rate=(\d+)")
+
+
+class TransientTTSError(RuntimeError):
+    """A failure that is worth retrying (Gemini 5xx / empty audio) — as
+    opposed to quota exhaustion or a content rejection, where a retry only
+    burns more quota. Still a RuntimeError, so every existing caller that
+    catches RuntimeError is unaffected."""
 
 # The actual cause of the podcast 500s turned out to be the (now-removed)
 # system_instruction field, not length — a ~1600-char chunk reproduced the
@@ -151,7 +160,7 @@ def _synthesize_chunk_pcm(client: genai.Client, text: str, config: dict, models_
                     "đọc (thường do câu mẹo TOPIK viết theo kiểu ra lệnh). Thử lại để kịch bản được "
                     "viết lại theo cách diễn đạt khác."
                 ) from exc
-            raise RuntimeError(
+            raise TransientTTSError(
                 f"Gemini TTS tạm thời gặp lỗi ({exc.code} {exc.status or 'unknown'}), thử lại sau ít phút."
             ) from exc
     assert response is not None  # loop always either returns via break or raises
@@ -160,18 +169,64 @@ def _synthesize_chunk_pcm(client: genai.Client, text: str, config: dict, models_
     parts = candidates[0].content.parts if candidates and candidates[0].content else None
     inline = parts[0].inline_data if parts else None
     if inline is None or not inline.data:
-        raise RuntimeError("Gemini TTS returned no inline audio data")
+        raise TransientTTSError("Gemini TTS returned no inline audio data")
 
     match = _RATE_RE.search(inline.mime_type or "")
     sample_rate = int(match.group(1)) if match else 24000
     return inline.data, sample_rate
 
 
+def _tts_config(voice: str) -> tuple[dict, str]:
+    """(request config, resolved Gemini voice name). Plain dict config (not
+    typed types.GenerateContentConfig(...)) to match this pinned SDK's
+    proven-working style in gemini_client.py — the SDK's dict->proto
+    conversion accepts snake_case keys here.
+
+    NOTE: no `system_instruction`. It was once added to stop a long
+    conversational script from being *answered* instead of voiced (400
+    "Model tried to generate text, but it should only be used for TTS") and
+    turned out to be the wrong fix: Gemini's native TTS documents only
+    response_modalities/speech_config, and every podcast call started
+    failing with a generic 500 the moment it was added. The 400 is
+    prevented at the source instead — script prompts forbid instruction-like
+    phrasing, and article audio voices real news prose."""
+    voice_name = _resolve_voice(voice)
+    config = {
+        "response_modalities": ["AUDIO"],
+        "speech_config": {
+            "voice_config": {"prebuilt_voice_config": {"voice_name": voice_name}},
+        },
+    }
+    return config, voice_name
+
+
+def _tts_models() -> list[str]:
+    """Gemini's free-tier TTS quota is a hard per-model daily cap (observed:
+    10 requests/day for gemini-2.5-flash-tts) shared by every TTS caller
+    (lecture/corpus/vocab/podcast/article audio). The quota is tracked per
+    model, so a same-shape fallback model is a genuinely separate bucket.
+    Only a RESOURCE_EXHAUSTED (429) falls through to the next model — any
+    other APIError is the same regardless of model, so it is raised
+    immediately instead of burning a second call."""
+    models = [settings.GEMINI_MODEL_TTS]
+    if settings.GEMINI_MODEL_TTS_FALLBACK and settings.GEMINI_MODEL_TTS_FALLBACK not in models:
+        models.append(settings.GEMINI_MODEL_TTS_FALLBACK)
+    return models
+
+
 def synthesize_korean_tts(text_ko: str, voice: str = "ko-female-1") -> tuple[bytes, bytes, int]:
     """Returns (opus_bytes, aac_bytes, duration_sec). Raises RuntimeError on
     any failure (missing key, empty/blocked response, ffmpeg error) — the
     caller (a Celery task) turns that into a job.failed row, same as every
-    other AI-backed task in this codebase."""
+    other AI-backed task in this codebase.
+
+    A long single-shot input (the podcast script — a whole lesson's
+    vocab+grammar, easily several thousand characters) reliably 500s the
+    native TTS endpoint; short callers (one word/sentence) never do. Text is
+    chunked at sentence boundaries and the raw PCM concatenated before ONE
+    transcode, so long scripts get the same reliability short callers have.
+    For real article text (paragraph pauses, retries, progress) use
+    synthesize_article_tts instead."""
     if not settings.GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
     text_ko = text_ko.strip()
@@ -179,66 +234,120 @@ def synthesize_korean_tts(text_ko: str, voice: str = "ko-female-1") -> tuple[byt
         raise RuntimeError("empty text_ko")
 
     client = _get_client()
-    voice_name = _resolve_voice(voice)
-    # Plain dict config (not typed types.GenerateContentConfig(...)) to
-    # match this pinned SDK's proven-working style in gemini_client.py —
-    # the SDK's dict->proto conversion accepts snake_case keys here.
-    #
-    # NOTE: this used to also send `system_instruction`, added to stop a
-    # long conversational script (the podcast feature) from reading enough
-    # like a request/task that the model tried to *answer* it instead of
-    # voicing it (400 "Model tried to generate text, but it should only be
-    # used for TTS"). That turned out to be the wrong fix: Gemini's native
-    # TTS docs (response_modalities=["AUDIO"]) document only
-    # response_modalities/speech_config for these models — no
-    # system_instruction — and every podcast call started failing with a
-    # generic 500 INTERNAL the moment system_instruction was added,
-    # reproducing on the very first ~1600-char chunk regardless of content.
-    # Removed; the actual fix for the 400 is at the source — the script
-    # PROMPT (build_podcast_prompt in ingestion.py) already forbids the
-    # model from writing instruction-like phrasing into the script itself,
-    # so the text handed to TTS is already plain narration.
-    config = {
-        "response_modalities": ["AUDIO"],
-        "speech_config": {
-            "voice_config": {"prebuilt_voice_config": {"voice_name": voice_name}},
-        },
-    }
-    # Gemini's free-tier TTS quota is a hard per-model daily cap (observed:
-    # 10 requests/day for gemini-2.5-flash-tts) — every TTS caller
-    # (lecture/corpus/vocab/podcast audio) shares this same call, so one
-    # busy test day exhausts it for all of them at once. The quota is
-    # tracked per model, so a same-shape fallback model is a genuinely
-    # separate bucket, not just a retry of the same failure. Only a
-    # RESOURCE_EXHAUSTED (429) falls through to the next model — any other
-    # APIError (bad request, transient 5xx, etc.) is the same regardless of
-    # model, so it's raised immediately instead of burning a second call.
-    models_to_try = [settings.GEMINI_MODEL_TTS]
-    if settings.GEMINI_MODEL_TTS_FALLBACK and settings.GEMINI_MODEL_TTS_FALLBACK not in models_to_try:
-        models_to_try.append(settings.GEMINI_MODEL_TTS_FALLBACK)
-
-    # A long single-shot input (the podcast script — a whole lesson's
-    # vocab+grammar, easily several thousand characters) reliably 500s the
-    # native TTS endpoint; short callers (one word/sentence) never do. Chunk
-    # at sentence boundaries and concatenate the raw PCM before transcoding
-    # once, so long scripts get the same reliability short callers already
-    # have without changing this function's signature or callers.
+    config, voice_name = _tts_config(voice)
+    models_to_try = _tts_models()
     chunks = _split_for_tts(text_ko, _MAX_TTS_CHARS)
     pcm_parts: list[bytes] = []
     sample_rate = 24000
-    # TEMPORARY diagnostic logging (Railway captures worker stdout): the
-    # 500 INTERNAL from Gemini is generic and gives no hint of *why*, so
-    # this pins down exactly what was sent on the chunk that fails —
-    # length, chunk count, and a text preview — without needing to guess
-    # again. Safe to remove once the actual cause is confirmed.
-    print(
-        f"[tts-debug] total_len={len(text_ko)} chunks={len(chunks)} "
-        f"chunk_lens={[len(c) for c in chunks]} voice={voice_name}",
-        flush=True,
-    )
-    for idx, chunk in enumerate(chunks):
-        print(f"[tts-debug] chunk {idx + 1}/{len(chunks)} len={len(chunk)} text={chunk!r}", flush=True)
+    print(f"[tts] chars={len(text_ko)} chunks={len(chunks)} voice={voice_name}", flush=True)
+    for chunk in chunks:
         pcm, sample_rate = _synthesize_chunk_pcm(client, chunk, config, models_to_try)
         pcm_parts.append(pcm)
+
+    return transcode_pcm(b"".join(pcm_parts), sample_rate)
+
+
+# ------------------------------------------------------ article read-aloud --
+# Paragraph-aligned chunks of ~1200 chars: small enough that one bad
+# request costs little and the voice does not drift over a very long input,
+# large enough to keep the request count (= quota) low.
+_ARTICLE_CHUNK_CHARS = 1200
+_ARTICLE_MAX_CHARS = 8000  # ~ a 20-minute read; beyond this the tail is not voiced
+_PAUSE_AFTER_PARAGRAPH_MS = 700
+_PAUSE_AFTER_SENTENCE_MS = 250
+_CHUNK_RETRY_DELAYS_SEC = (2.0, 6.0)
+
+
+def plan_article_chunks(text: str, max_chars: int = _ARTICLE_CHUNK_CHARS) -> list[tuple[str, int]]:
+    """text (one paragraph per line) -> [(chunk_text, pause_after_ms)].
+
+    Chunks end on a paragraph boundary whenever possible, so the silence
+    inserted between chunks is a real paragraph pause; paragraphs inside one
+    chunk are separated by a blank line (the model's own pacing). A single
+    paragraph longer than max_chars is split at sentence boundaries and
+    gets the shorter sentence pause between its pieces."""
+    paragraphs = [p.strip() for p in text.splitlines() if p.strip()]
+    chunks: list[tuple[str, int]] = []
+    current: list[str] = []
+    size = 0
+    total = 0
+
+    def flush(pause_ms: int) -> None:
+        nonlocal current, size
+        if current:
+            chunks.append(("\n\n".join(current), pause_ms))
+            current, size = [], 0
+
+    for para in paragraphs:
+        if total + len(para) > _ARTICLE_MAX_CHARS and chunks:
+            break
+        total += len(para)
+        if len(para) > max_chars:
+            flush(_PAUSE_AFTER_PARAGRAPH_MS)
+            pieces = _split_for_tts(para, max_chars)
+            for i, piece in enumerate(pieces):
+                last = i == len(pieces) - 1
+                chunks.append((piece, _PAUSE_AFTER_PARAGRAPH_MS if last else _PAUSE_AFTER_SENTENCE_MS))
+            continue
+        if current and size + len(para) + 2 > max_chars:
+            flush(_PAUSE_AFTER_PARAGRAPH_MS)
+        current.append(para)
+        size += len(para) + 2
+    flush(0)
+    if chunks:
+        chunks[-1] = (chunks[-1][0], 0)
+    return chunks
+
+
+def _silence_pcm(ms: int, sample_rate: int) -> bytes:
+    return b"\x00" * (int(sample_rate * ms / 1000) * 2)  # 16-bit mono
+
+
+def synthesize_article_tts(
+    text: str,
+    voice: str = "ko-female-1",
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[bytes, bytes, int]:
+    """Read a whole news article aloud. Differences from synthesize_korean_tts:
+    paragraph-aligned chunking, real silence between chunks (so paragraph
+    breaks are audible instead of being flattened into one run-on blob),
+    per-chunk retry on transient Gemini errors (a 5xx on chunk 4 used to
+    throw away chunks 1-3 and their quota), and an `on_progress(done,
+    total)` callback so the UI can show "2/4" instead of a bare spinner.
+    Returns (opus_bytes, aac_bytes, duration_sec)."""
+    if not settings.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    plan = plan_article_chunks(text)
+    if not plan:
+        raise RuntimeError("empty text_ko")
+
+    client = _get_client()
+    config, voice_name = _tts_config(voice)
+    models_to_try = _tts_models()
+    print(
+        f"[tts] article chars={len(text)} chunks={len(plan)} chunk_lens={[len(c) for c, _ in plan]} voice={voice_name}",
+        flush=True,
+    )
+    if on_progress:
+        on_progress(0, len(plan))
+
+    pcm_parts: list[bytes] = []
+    sample_rate = 24000
+    for idx, (chunk, pause_ms) in enumerate(plan):
+        attempt = 0
+        while True:
+            try:
+                pcm, sample_rate = _synthesize_chunk_pcm(client, chunk, config, models_to_try)
+                break
+            except TransientTTSError:
+                if attempt >= len(_CHUNK_RETRY_DELAYS_SEC):
+                    raise
+                time.sleep(_CHUNK_RETRY_DELAYS_SEC[attempt])
+                attempt += 1
+        pcm_parts.append(pcm)
+        if pause_ms:
+            pcm_parts.append(_silence_pcm(pause_ms, sample_rate))
+        if on_progress:
+            on_progress(idx + 1, len(plan))
 
     return transcode_pcm(b"".join(pcm_parts), sample_rate)

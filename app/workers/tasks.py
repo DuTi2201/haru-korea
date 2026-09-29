@@ -4,7 +4,7 @@ process uses the async session instead (see app/db.py AsyncSessionLocal).
 """
 import base64
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -266,29 +266,37 @@ def generate_content_podcast(
 
 
 @celery_app.task(name="app.workers.tasks.generate_article_audio", bind=True, max_retries=3)
-def generate_article_audio(self, job_id: str, body_ko: str, voice: str, prompt_version: str, cache_key: str):
-    """Reads an editorial article's OWN scraped body_ko text aloud
-    verbatim — deliberately independent of generate_content_podcast (which
-    has Gemini WRITE a teaching script about the article's vocab/grammar,
-    never the article's actual words). No script-writing step here at
-    all: body_ko goes straight into TTS, same as generate_lecture_audio,
-    just under this table's "article-audio:" cache_key prefix instead of
-    "podcast:" (see app/api/routers/editorial.py request_article_audio for
-    the cache key, which hashes body_ko so a later re-ingest/backfill of
-    the article's text naturally busts a stale recording).
+def generate_article_audio(self, job_id: str, tts_text: str, voice: str, prompt_version: str, cache_key: str):
+    """Reads an editorial article's OWN cleaned text aloud verbatim —
+    deliberately independent of generate_content_podcast (which has Gemini
+    WRITE a teaching script about the article's vocab/grammar, never the
+    article's actual words). `tts_text` is built by the API route
+    (article_extract.article_tts_text: cleaned title + body, one paragraph
+    per line) and is exactly what the cache key hashes.
 
-    body_ko for a real news article/column easily runs several thousand
-    characters — well past a single TTS request's reliable limit — but
-    tts.synthesize_korean_tts already chunks at sentence boundaries and
-    concatenates before one transcode (see app/services/tts.py), so this
-    task doesn't need its own chunking logic."""
+    Uses tts.synthesize_article_tts, not the generic synthesize_korean_tts:
+    paragraph-aligned chunks with real silence between them, per-chunk
+    retry on transient Gemini errors, and a progress callback so the client
+    can show "2/4" during the (long) first generation. Every later play of
+    the same text is a cache hit and never reaches this task."""
     jid = uuid.UUID(job_id)
     with Session(_sync_engine) as db:
         try:
-            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc với Gemini")
-            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(body_ko, voice)
+            publish_job_event(db, jid, status="running", progress=0.05, step="Đang chuẩn bị giọng đọc")
 
-            publish_job_event(db, jid, progress=0.9, step="Đang lưu âm thanh")
+            def on_progress(done: int, total: int) -> None:
+                if total <= 0:
+                    return
+                publish_job_event(
+                    db,
+                    jid,
+                    progress=round(0.05 + 0.85 * done / total, 3),
+                    step=f"Đang tạo giọng đọc ({done}/{total})" if done < total else "Đang ghép âm thanh",
+                )
+
+            opus_bytes, aac_bytes, duration_sec = tts.synthesize_article_tts(tts_text, voice, on_progress)
+
+            publish_job_event(db, jid, progress=0.95, step="Đang lưu âm thanh")
             row = LectureAudio(
                 cache_key=cache_key,
                 opus_path=f"/api/v1/lessons/audio/{cache_key}.opus",
@@ -574,7 +582,8 @@ def extract_editorial_import(
             return
         try:
             publish_job_event(db, jid, status="running", progress=0.1, step="Đang tải bài viết")
-            body_ko, parsed_title, suggested_source_name = ingestion.fetch_article_text(source_url)
+            fetched = ingestion.fetch_article(source_url)
+            body_ko, parsed_title, suggested_source_name = fetched.body, fetched.title, fetched.site_name
             resolved_title = title_ko or parsed_title
             published_date = datetime.fromisoformat(published_date_iso) if published_date_iso else None
 
@@ -592,7 +601,7 @@ def extract_editorial_import(
             publish_job_event(db, jid, progress=0.4, step="Đang phân tích với Gemini")
 
             staged, flagged = ingestion.run_editorial_extraction(
-                db, batch, body_ko, resolved_title, suggested_source_name
+                db, batch, body_ko, resolved_title, suggested_source_name, fetched.images
             )
 
             batch.status = "awaiting_review"
@@ -620,6 +629,32 @@ def extract_editorial_import(
                 db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
             )
             raise
+
+
+@celery_app.task(name="app.workers.tasks.refresh_editorial_images", bind=True, max_retries=1)
+def refresh_editorial_images(self, article_id: str):
+    """Re-fetches one already-published article's source page and stores ONLY
+    its photos (+captions). Never touches body_ko/vocab/grammar — those were
+    reviewed by an admin. Queued lazily by GET /editorials/{id} the first
+    time an article imported before the `images` column existed is read
+    (images_fetched_at IS NULL). images_fetched_at is stamped even when the
+    fetch fails or finds no photo, so a broken source page is tried once, not
+    on every page view; an admin can still force a full re-import."""
+    aid = uuid.UUID(article_id)
+    with Session(_sync_engine) as db:
+        article = db.get(EditorialArticle, aid)
+        if article is None:
+            return {"ok": False, "reason": "not_found"}
+        images: list[dict] = []
+        try:
+            images = ingestion.fetch_article(article.source_url).images
+        except Exception as exc:  # noqa: BLE001 — a dead source page must not retry-loop
+            print(f"[refresh-images] {article.source_url}: {exc}", flush=True)
+        article.images = images
+        article.images_fetched_at = datetime.now(timezone.utc)
+        db.add(article)
+        db.commit()
+        return {"ok": True, "images": len(images)}
 
 
 @celery_app.task(name="app.workers.tasks.apply_import_batch", bind=True, max_retries=2)

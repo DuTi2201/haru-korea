@@ -22,7 +22,6 @@ from typing import Any, Literal
 
 import feedparser
 import httpx
-from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -48,7 +47,7 @@ from app.models import (
     Topic,
     VocabItem,
 )
-from app.services import gemini_client
+from app.services import article_extract, gemini_client
 from app.services.subtitles import Cue, chunk_cues, parse_plain_lines, parse_subtitles
 
 # ============================================================ extraction ==
@@ -782,69 +781,20 @@ _ARTICLE_FETCH_TIMEOUT = 15.0
 _ARTICLE_MAX_BODY_CHARS = 20000
 _ARTICLE_USER_AGENT = "Mozilla/5.0 (compatible; HaruBot/1.0; +family-use-only, not for redistribution)"
 
-# Class/id substrings that mark a container as boilerplate on typical
-# Korean news CMSes (comments, share buttons, related-article lists,
-# byline/reporter cards, tag/hashtag rows, copyright footers) — none of
-# this is the article's own text, but it usually isn't inside <nav>/
-# <footer>/<aside> either, so the plain tag-name strip below misses it.
-# Matched case-insensitively against the element's own class+id string.
-_BOILERPLATE_CONTAINER_HINTS = (
-    "comment", "reply", "disqus",
-    "sns", "share", "sharing", "social",
-    "relate", "related", "recommend", "popular", "ranking",
-    "tag_area", "taglist", "tag-list", "hashtag",
-    "byline", "reporter", "journalist", "author-info",
-    "copyright", "ⓒ",
-    "ad_area", "ad-area", "adbanner", "banner_area", "promotion", "subscribe", "newsletter",
-    "print_area", "btn_area", "util_area",
-)
+def fetch_article(url: str) -> article_extract.ExtractedArticle:
+    """Fetches one editorial/column page and extracts ONLY the article: title,
+    clean paragraphs (one per line) and inline images with captions. The
+    real work — finding the article container, dropping page chrome/
+    captions/ranking widgets — lives in app.services.article_extract (see
+    its docstring for why the old "get_text() of the whole <body>" approach
+    leaked menus, AI-summary disclaimers and related-article lists into both
+    the reader and TTS).
 
-# Whole-line boilerplate that slips through even after container stripping
-# (inline share/comment/related-article widgets some CMSes render as plain
-# text nodes, not their own tagged container). Matched against a line's
-# full stripped text.
-_BOILERPLATE_LINE_RE = re.compile(
-    r"^#\S+"  # a lone hashtag line, e.g. "#고령화 #저출산"
-    r"|^(공유하기|공유|스크랩|인쇄하기|글자크기|가|기사원문|기사 원문)$"
-    r"|(페이스북|트위터|카카오\s?톡|카카오스토리|네이버\s?블로그|밴드|URL\s?복사|링크\s?복사)"
-    r"|^(관련\s?기사|관련기사|많이\s?본\s?기사|인기\s?기사|추천\s?기사|이전\s?기사|다음\s?기사)"
-    r"|^(댓글|댓글쓰기|댓글\s?\d+)$"
-    r"|^ⓒ.*무단.*전재",
-    re.IGNORECASE,
-)
-
-# og:site_name (or the plain <meta name="application-name">) is the outlet
-# self-reporting its own name — far more reliable than guessing from a
-# byline in the body text, which is the exact bug this fixes (a sample
-# article ended up with the author's name as source_name instead of the
-# outlet's).
-def _guess_site_name(soup: BeautifulSoup, url: str) -> str | None:
-    for attrs in ({"property": "og:site_name"}, {"name": "application-name"}):
-        tag = soup.find("meta", attrs=attrs)
-        if tag and tag.get("content"):
-            return tag["content"].strip()
-    host = httpx.URL(url).host or ""
-    host = host.removeprefix("www.")
-    return host or None
-
-
-def fetch_article_text(url: str) -> tuple[str, str | None, str | None]:
-    """Fetches one editorial/column page and strips it to plain text —
-    script/style/nav/footer/ad-ish TAGS removed first, then containers
-    whose class/id names a known boilerplate widget (comments, share
-    buttons, related-article lists, byline cards, hashtag rows — see
-    _BOILERPLATE_CONTAINER_HINTS), then any straggler lines matching
-    _BOILERPLATE_LINE_RE. Whitespace collapsed, truncated to
-    _ARTICLE_MAX_BODY_CHARS (a TOPIK 쓰기 54 사설 is a few hundred words;
-    this only guards against an unexpectedly huge page).
-
-    Returns (body_ko, parsed_title, suggested_source_name) — the last two
-    are fallbacks/suggestions only, never written straight onto
-    EditorialArticle: they become part of a staged `editorial_meta`
-    ImportItem instead, so an admin can review — and hand-fix a messy
-    scrape or a wrong outlet-name guess — before any of it ever reaches a
-    learner (same "staged, human confirms" principle as everything else
-    here)."""
+    Never written straight onto EditorialArticle: it becomes part of a
+    staged `editorial_meta` ImportItem instead, so an admin can review — and
+    hand-fix a messy scrape or a wrong outlet-name guess — before any of it
+    ever reaches a learner (same "staged, human confirms" principle as
+    everything else here)."""
     resp = httpx.get(
         url,
         timeout=_ARTICLE_FETCH_TIMEOUT,
@@ -852,40 +802,17 @@ def fetch_article_text(url: str) -> tuple[str, str | None, str | None]:
         headers={"User-Agent": _ARTICLE_USER_AGENT},
     )
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    art = article_extract.extract_article(resp.text, str(resp.url))
+    if not art.site_name:
+        art.site_name = (httpx.URL(url).host or "").removeprefix("www.") or None
+    art.body = art.body[:_ARTICLE_MAX_BODY_CHARS]
+    return art
 
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript"]):
-        tag.decompose()
 
-    title: str | None = None
-    if soup.title and soup.title.string:
-        title = soup.title.string.strip()
-    og_title = soup.find("meta", attrs={"property": "og:title"})
-    if og_title and og_title.get("content"):
-        title = og_title["content"].strip()
-
-    site_name = _guess_site_name(soup, url)
-
-    # get_text() on the whole document would also pick up <title>/<meta>
-    # text sitting in <head> — read from <body> alone so that never leaks
-    # into the article body.
-    root = soup.body or soup
-    for el in root.find_all(True):
-        # find_all(True) snapshots every tag up front. Decomposing a
-        # boilerplate CONTAINER also decomposes its descendants (bs4 clears
-        # their internal state), so a later iteration can land on a tag
-        # that's already dead — .get() on it then blows up with
-        # AttributeError: 'NoneType' object has no attribute 'get'. Skip
-        # anything no longer attached to the tree.
-        if getattr(el, "attrs", None) is None:
-            continue
-        ident = f"{' '.join(el.get('class', []) or [])} {el.get('id', '') or ''}".lower()
-        if any(hint in ident for hint in _BOILERPLATE_CONTAINER_HINTS):
-            el.decompose()
-
-    lines = [ln.strip() for ln in root.get_text("\n").splitlines()]
-    body = "\n".join(ln for ln in lines if ln and not _BOILERPLATE_LINE_RE.search(ln))
-    return body[:_ARTICLE_MAX_BODY_CHARS], title, site_name
+def fetch_article_text(url: str) -> tuple[str, str | None, str | None]:
+    """Back-compat wrapper: (body_ko, parsed_title, suggested_source_name)."""
+    art = fetch_article(url)
+    return art.body, art.title, art.site_name
 
 
 def build_editorial_prompt(body_ko: str) -> str:
@@ -936,6 +863,7 @@ def run_editorial_extraction(
     body_ko: str,
     title_ko: str | None,
     suggested_source_name: str | None = None,
+    images: list[dict] | None = None,
 ) -> tuple[int, int]:
     """Stages the fetched body + Gemini's classification as one
     kind="editorial_meta" ImportItem (body_ko included, so an admin can
@@ -966,6 +894,9 @@ def run_editorial_extraction(
                 "body_ko": body_ko,
                 "title_ko": title_ko,
                 "source_name": suggested_source_name,
+                # Inline photos scraped with the article (url/caption/
+                # after_paragraph) — see article_extract.extract_article.
+                "images": images or [],
                 "level_estimate": extraction.level_estimate,
                 "topic_tags": extraction.topic_tags,
                 "model_outline": extraction.model_outline.model_dump(),
@@ -1261,6 +1192,8 @@ def apply_editorial_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
         article.topic_tags = payload.get("topic_tags", [])
         article.model_outline = payload["model_outline"]
         article.thinking_guide_text = payload["thinking_guide_text"]
+        article.images = payload.get("images") or []
+        article.images_fetched_at = datetime.now(timezone.utc)
         article.import_item_id = meta_item.id
         db.add(article)
         applied += 1
@@ -1376,6 +1309,8 @@ async def rollback_import_batch(db: AsyncSession, batch: ImportBatch) -> dict[st
                 article.grammar_ids = []
                 article.model_outline = None
                 article.thinking_guide_text = None
+                article.images = []
+                article.images_fetched_at = None
                 article.import_item_id = None
                 db.add(article)
 

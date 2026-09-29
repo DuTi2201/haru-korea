@@ -643,6 +643,13 @@ class EditorialArticle(Base):
     grammar_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
     model_outline: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     thinking_guide_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Inline photos scraped with the article: [{url, caption, after_paragraph}]
+    # (hotlinked, not copied — same internal/family-use scope as body_ko).
+    # `images_fetched_at` NULL = never attempted: GET /editorials/{id} then
+    # queues a one-off refresh_editorial_images so articles imported before
+    # this column existed get their photos without any admin action.
+    images: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
+    images_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     import_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
