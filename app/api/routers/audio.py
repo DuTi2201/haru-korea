@@ -19,6 +19,7 @@ routes below — the frontend just points an <audio> tag at `opus_path`/
 `aac_path`, no separate fetch-then-blob dance needed.
 """
 import hashlib
+import re
 import uuid
 from typing import Annotated
 
@@ -42,6 +43,33 @@ corpus_router = APIRouter(prefix="/corpus", tags=["audio"])
 vocab_router = APIRouter(prefix="/vocab-items", tags=["audio"])
 
 _CACHE_CONTROL = "public, max-age=31536000, immutable"  # cache_key is content-addressed — never changes once written
+
+
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+def _audio_response(request: Request, data: bytes, media_type: str) -> Response:
+    """200 with the whole body, or 206 for a `Range: bytes=a-b` request.
+    Browsers (iOS/macOS Safari above all) only report a duration, allow
+    seeking, and in the worst case only PLAY media from a server that
+    answers byte-range requests — without Accept-Ranges a minutes-long
+    article recording could not be scrubbed on the iPhone."""
+    total = len(data)
+    headers = {"Cache-Control": _CACHE_CONTROL, "Accept-Ranges": "bytes"}
+    match = _RANGE_RE.fullmatch((request.headers.get("range") or "").strip())
+    if match and (match.group(1) or match.group(2)):
+        if match.group(1):
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else total - 1
+        else:  # "bytes=-N": the last N bytes
+            start = max(total - int(match.group(2)), 0)
+            end = total - 1
+        end = min(end, total - 1)
+        if start >= total or start > end:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{total}", "Accept-Ranges": "bytes"})
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return Response(content=data[start : end + 1], status_code=206, media_type=media_type, headers=headers)
+    return Response(content=data, media_type=media_type, headers=headers)
 
 
 async def _podcast_cache_key(
@@ -213,7 +241,7 @@ async def request_lesson_podcast(
 
 
 @router.get("/audio/{filename}")
-async def stream_lecture_audio(filename: str, db: Annotated[AsyncSession, Depends(get_db)]):
+async def stream_lecture_audio(filename: str, request: Request, db: Annotated[AsyncSession, Depends(get_db)]):
     """Serves the bytes behind `LectureAudio.opus_path`/`aac_path` — those
     columns are set to exactly this route at write time (see
     app/workers/tasks.py generate_lecture_audio), so the frontend just
@@ -228,7 +256,7 @@ async def stream_lecture_audio(filename: str, db: Annotated[AsyncSession, Depend
     data = row.opus_data if media_type.startswith("audio/ogg") else row.aac_data
     if not data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not yet generated")
-    return Response(content=data, media_type=media_type, headers={"Cache-Control": _CACHE_CONTROL})
+    return _audio_response(request, data, media_type)
 
 
 @corpus_router.post("/{corpus_item_id}/audio", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
@@ -295,7 +323,7 @@ async def request_corpus_audio(
 
 
 @corpus_router.get("/audio/{filename}")
-async def stream_corpus_audio(filename: str, db: Annotated[AsyncSession, Depends(get_db)]):
+async def stream_corpus_audio(filename: str, request: Request, db: Annotated[AsyncSession, Depends(get_db)]):
     """Serves audio.corpus_item_audio bytes — same shape as
     stream_lecture_audio, keyed by the corpus item's own cache_key."""
     cache_key, media_type = _split_cache_filename(filename)
@@ -307,7 +335,7 @@ async def stream_corpus_audio(filename: str, db: Annotated[AsyncSession, Depends
     data = row.opus_data if media_type.startswith("audio/ogg") else row.aac_data
     if not data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not yet generated")
-    return Response(content=data, media_type=media_type, headers={"Cache-Control": _CACHE_CONTROL})
+    return _audio_response(request, data, media_type)
 
 
 @vocab_router.post("/{vocab_item_id}/audio", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
@@ -375,7 +403,7 @@ async def request_vocab_audio(
 
 
 @vocab_router.get("/audio/{filename}")
-async def stream_vocab_audio(filename: str, db: Annotated[AsyncSession, Depends(get_db)]):
+async def stream_vocab_audio(filename: str, request: Request, db: Annotated[AsyncSession, Depends(get_db)]):
     """Serves audio.vocab_item_audio bytes — same shape as
     stream_corpus_audio, keyed by the vocab item's own cache_key."""
     cache_key, media_type = _split_cache_filename(filename)
@@ -387,4 +415,4 @@ async def stream_vocab_audio(filename: str, db: Annotated[AsyncSession, Depends(
     data = row.opus_data if media_type.startswith("audio/ogg") else row.aac_data
     if not data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Audio not yet generated")
-    return Response(content=data, media_type=media_type, headers={"Cache-Control": _CACHE_CONTROL})
+    return _audio_response(request, data, media_type)
