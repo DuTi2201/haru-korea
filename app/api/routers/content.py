@@ -4,6 +4,7 @@ corpus (listening sentences), progress (item-state check-ins), curriculum
 for the scaffold; split into content.py/curriculum.py/practice.py once
 each grows past a handful of routes.
 """
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
@@ -38,6 +39,7 @@ from app.schemas import (
     TopicOut,
     VocabItemOut,
 )
+from app.services.progress import ItemKey, pick_next_lesson
 
 router = APIRouter(tags=["content"])
 
@@ -51,10 +53,11 @@ async def list_topics(db: Annotated[AsyncSession, Depends(get_db)]):
 
 @router.get("/lessons/{lesson_id}", response_model=LessonOut)
 async def get_lesson(lesson_id: str, db: Annotated[AsyncSession, Depends(get_db)]):
-    """`lesson_id="today"` is a placeholder "next lesson" heuristic (picks
-    the earliest confirmed lesson) — real adaptive next-lesson selection
-    is SRS scheduling logic, still stubbed elsewhere in this scaffold; a
-    numeric id fetches that exact lesson."""
+    """`lesson_id="today"` is the anonymous fallback (the earliest lesson) —
+    this route is public, so it cannot know who is asking. The learner-aware
+    "next lesson" is chosen by /me/plan (see app.services.progress), which
+    hands the frontend a concrete numeric `lesson_id`; a numeric id fetches
+    that exact lesson."""
     if lesson_id == "today":
         lesson = (await db.execute(select(Lesson).order_by(Lesson.id).limit(1))).scalars().first()
     else:
@@ -150,7 +153,14 @@ async def record_item_review(
 ):
     """A learner's quick in-app check nudges ItemState.strength — SRS §5
     ITEM_STATE's decay-style nudge, not a full SM-2 scheduler (see
-    ItemState's docstring in app/models.py)."""
+    ItemState's docstring in app/models.py). The item must exist: item_id
+    has no FK (content lives in another schema), so without this check a
+    typo'd or made-up id would quietly become a phantom ItemState row that
+    skews the learner's streak and readiness."""
+    content_model = VocabItem if body.item_type == "vocab_item" else GrammarPoint
+    if (await db.execute(select(content_model.id).where(content_model.id == body.item_id))).first() is None:
+        raise _problem(status.HTTP_404_NOT_FOUND, "Item not found", "not_found")
+
     existing = await db.execute(
         select(ItemState).where(
             ItemState.learner_id == profile.id,
@@ -206,45 +216,45 @@ async def get_my_plan(
 
     tasks: list[TodayPlanTask] = []
 
-    # -- vocab/grammar review: reuse get_lesson("today")'s own "earliest
-    # confirmed lesson" heuristic so this never drifts from what /lesson/
-    # today itself resolves to.
-    lesson = (await db.execute(select(Lesson).order_by(Lesson.id).limit(1))).scalars().first()
-    if lesson is not None:
-        vocab_ids = [
-            v_id
-            for (v_id,) in (
-                await db.execute(select(VocabItem.id).where(VocabItem.lesson_id == lesson.id))
-            ).all()
-        ]
-        grammar_ids = [
-            g_id
-            for (g_id,) in (
-                await db.execute(select(GrammarPoint.id).where(GrammarPoint.lesson_id == lesson.id))
-            ).all()
-        ]
-        total = len(vocab_ids) + len(grammar_ids)
-        if total > 0:
-            reviewed_today = sum(
-                1
-                for s in states
-                if s.last_seen.astimezone(timezone.utc).date() == today
-                and (
-                    (s.item_type == "vocab_item" and s.item_id in vocab_ids)
-                    or (s.item_type == "grammar_point" and s.item_id in grammar_ids)
-                )
+    # -- vocab/grammar review: the first lesson this learner has not yet
+    # mastered (see app.services.progress.pick_next_lesson), so finishing
+    # lesson 1 moves them on to lesson 2 instead of showing lesson 1 forever.
+    # Two narrow bulk queries (ids only) — vocab/grammar that belong to no
+    # lesson (editorial-article imports) are left out, they are not lesson
+    # content.
+    lesson_items: dict[int, list[ItemKey]] = defaultdict(list)
+    for lesson_id_, v_id in (await db.execute(select(VocabItem.lesson_id, VocabItem.id))).all():
+        if lesson_id_ is not None:
+            lesson_items[lesson_id_].append(("vocab_item", v_id))
+    for lesson_id_, g_id in (await db.execute(select(GrammarPoint.lesson_id, GrammarPoint.id))).all():
+        if lesson_id_ is not None:
+            lesson_items[lesson_id_].append(("grammar_point", g_id))
+
+    picked = pick_next_lesson(lesson_items, {(s.item_type, s.item_id): (s.strength, s.last_seen) for s in states})
+    lesson = await db.get(Lesson, picked.lesson_id) if picked is not None else None
+    if picked is not None and lesson is not None:
+        total = picked.total
+        lesson_keys = set(lesson_items[picked.lesson_id])
+        reviewed_today = sum(
+            1
+            for s in states
+            if s.last_seen.astimezone(timezone.utc).date() == today and (s.item_type, s.item_id) in lesson_keys
+        )
+        status_ = "done" if reviewed_today >= total else ("in_progress" if reviewed_today > 0 else "todo")
+        subtitle = f"{total} từ/ngữ pháp"
+        if picked.mastered:
+            subtitle += f" · đã thuộc {picked.mastered}/{total}"
+        if reviewed_today:
+            subtitle += f" · đã ôn {reviewed_today}/{total} hôm nay"
+        tasks.append(
+            TodayPlanTask(
+                kind="vocab_review",
+                title=lesson.title,
+                subtitle=subtitle,
+                status=status_,
+                lesson_id=lesson.id,
             )
-            status_ = "done" if reviewed_today >= total else ("in_progress" if reviewed_today > 0 else "todo")
-            tasks.append(
-                TodayPlanTask(
-                    kind="vocab_review",
-                    title=lesson.title,
-                    subtitle=f"{total} từ/ngữ pháp"
-                    + (f" · đã ôn {reviewed_today}/{total} hôm nay" if reviewed_today else ""),
-                    status=status_,
-                    lesson_id=lesson.id,
-                )
-            )
+        )
 
     # -- listening: no per-item completion is tracked yet for corpus
     # items (only lesson vocab/grammar go through /progress/reviews), so
