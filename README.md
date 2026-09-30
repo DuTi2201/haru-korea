@@ -53,6 +53,10 @@ the environment level):
 | `GEMINI_API_KEY` | server-side only, never exposed to the client |
 | `GEMINI_MODEL_LESSON_INGEST` | optional, defaults to `gemini-3.5-flash-lite` |
 | `GEMINI_MODEL_CORPUS_INGEST` | optional, defaults to `gemini-3.5-flash-lite` |
+| `GEMINI_MODEL_STUDY` | optional, model for the beginner study pack (translation / simple Korean); defaults to `gemini-3.5-flash-lite` |
+| `TTS_GG_Chirp` | Google Cloud Text-to-Speech API key (Chirp 3 HD, the primary Korean voice). Set ONLY as a Railway variable on the api AND worker services, never in code; empty = Gemini TTS only |
+| `TTS_CHIRP_VOICE` | optional, defaults to `ko-KR-Chirp3-HD-Iapetus`; changing it regenerates article audio |
+| `TTS_CHIRP_SPEAKING_RATE` | optional, defaults to `0.85` (API range 0.25–2.0); changing it regenerates article audio |
 | `GEMINI_EMBEDDING_MODEL` | optional, defaults to `gemini-embedding-2` |
 | `MAX_INGEST_FILE_MB` | optional, defaults to `20` — caps a single Studio upload |
 | `CORPUS_CHUNK_SIZE` | optional, defaults to `40` — subtitle cues per Gemini call |

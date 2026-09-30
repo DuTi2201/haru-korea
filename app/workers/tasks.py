@@ -43,8 +43,8 @@ def generate_lecture_audio(self, job_id: str, lesson_id: str, text_ko: str, voic
     cache_key = f"{lesson_id}:{voice}:{prompt_version}"
     with Session(_sync_engine) as db:
         try:
-            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc với Gemini")
-            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(text_ko, voice)
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc")
+            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts_chirp_first(text_ko, voice)
 
             publish_job_event(db, jid, progress=0.8, step="Đang lưu âm thanh")
             row = LectureAudio(
@@ -85,8 +85,8 @@ def generate_corpus_audio(self, job_id: str, corpus_item_id: str, text_ko: str, 
     cache_key = f"{corpus_item_id}:{voice}:{prompt_version}"
     with Session(_sync_engine) as db:
         try:
-            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc với Gemini")
-            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(text_ko, voice)
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc")
+            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts_chirp_first(text_ko, voice)
 
             publish_job_event(db, jid, progress=0.8, step="Đang lưu âm thanh")
             row = CorpusItemAudio(
@@ -133,8 +133,8 @@ def generate_vocab_audio(self, job_id: str, vocab_item_id: str, text_ko: str, vo
     cache_key = f"{vocab_item_id}:{voice}:{prompt_version}"
     with Session(_sync_engine) as db:
         try:
-            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc với Gemini")
-            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(text_ko, voice)
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tạo giọng đọc")
+            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts_chirp_first(text_ko, voice)
 
             publish_job_event(db, jid, progress=0.8, step="Đang lưu âm thanh")
             row = VocabItemAudio(
@@ -226,6 +226,8 @@ def generate_content_podcast(
             publish_job_event(db, jid, progress=0.3, step="Đang viết kịch bản với Gemini")
             script = ingestion.generate_podcast_script(title, vocab, grammar)
 
+            # The script alternates Vietnamese explanation with Korean examples, so it
+            # stays on Gemini (a ko-KR Chirp voice cannot read Vietnamese).
             publish_job_event(db, jid, progress=0.6, step="Đang tạo giọng đọc với Gemini")
             opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(script, voice)
 
@@ -266,8 +268,58 @@ def generate_content_podcast(
             raise
 
 
+def _voice_article(
+    db: Session,
+    tts_text: str,
+    voice: str,
+    cache_key: str,
+    fallback_cache_key: str | None,
+    on_progress,
+):
+    """Voice an article. Returns (reuse_row, opus, aac, duration_sec, stored_key).
+
+    `fallback_cache_key` is None when the API did not have Google Chirp on:
+    plain Gemini, stored under `cache_key`, exactly as before.
+
+    Otherwise Chirp 3 HD is tried first and its recording is stored under
+    `cache_key` (which embeds the voice+pace spec). If Chirp fails, the
+    WHOLE article is redone with Gemini (never two voices in one recording)
+    and stored under `fallback_cache_key`, so a later play retries Chirp
+    instead of being stuck with the fallback voice forever. A fallback
+    recording that already exists is reused rather than spending Gemini's
+    small daily quota again while Chirp is still down."""
+    if fallback_cache_key is None:
+        opus, aac, dur = tts.synthesize_article_tts(tts_text, voice, on_progress)
+        return None, opus, aac, dur, cache_key
+
+    try:
+        if not tts.chirp_enabled():
+            raise RuntimeError("TTS_GG_Chirp is not set on the worker service")
+        opus, aac, dur = tts.synthesize_article_chirp(tts_text, on_progress)
+        return None, opus, aac, dur, cache_key
+    except Exception as chirp_exc:  # noqa: BLE001 - ANY Chirp failure (incl. an unexpected client error) must fall back, not lose the audio
+        chirp_exc = RuntimeError(tts.describe_error(chirp_exc))
+        print(f"[tts] article: Google Chirp failed ({chirp_exc}); using Gemini fallback", flush=True)
+        existing = db.execute(select(LectureAudio).where(LectureAudio.cache_key == fallback_cache_key)).scalar_one_or_none()
+        if existing is not None:
+            return existing, b"", b"", existing.duration_sec, fallback_cache_key
+        try:
+            opus, aac, dur = tts.synthesize_article_tts(tts_text, voice, on_progress)
+        except RuntimeError as gemini_exc:
+            raise RuntimeError(f"Google Chirp lỗi ({chirp_exc}); Gemini dự phòng cũng lỗi: {gemini_exc}") from gemini_exc
+        return None, opus, aac, dur, fallback_cache_key
+
+
 @celery_app.task(name="app.workers.tasks.generate_article_audio", bind=True, max_retries=3)
-def generate_article_audio(self, job_id: str, tts_text: str, voice: str, prompt_version: str, cache_key: str):
+def generate_article_audio(
+    self,
+    job_id: str,
+    tts_text: str,
+    voice: str,
+    prompt_version: str,
+    cache_key: str,
+    fallback_cache_key: str | None = None,
+):
     """Reads an editorial article's OWN cleaned text aloud verbatim —
     deliberately independent of generate_content_podcast (which has Gemini
     WRITE a teaching script about the article's vocab/grammar, never the
@@ -275,9 +327,9 @@ def generate_article_audio(self, job_id: str, tts_text: str, voice: str, prompt_
     (article_extract.article_tts_text: cleaned title + body, one paragraph
     per line) and is exactly what the cache key hashes.
 
-    Uses tts.synthesize_article_tts, not the generic synthesize_korean_tts:
-    paragraph-aligned chunks with real silence between them, per-chunk
-    retry on transient Gemini errors, and a progress callback so the client
+    Voice: Google Chirp 3 HD first, Gemini as the fallback (see _voice_article).
+    Both paths use paragraph-aligned chunks with real silence between them,
+    per-chunk retry on transient errors, and a progress callback so the client
     can show "2/4" during the (long) first generation. Every later play of
     the same text is a cache hit and never reaches this task."""
     jid = uuid.UUID(job_id)
@@ -295,21 +347,26 @@ def generate_article_audio(self, job_id: str, tts_text: str, voice: str, prompt_
                     step=f"Đang tạo giọng đọc ({done}/{total})" if done < total else "Đang ghép âm thanh",
                 )
 
-            opus_bytes, aac_bytes, duration_sec = tts.synthesize_article_tts(tts_text, voice, on_progress)
-
-            publish_job_event(db, jid, progress=0.95, step="Đang lưu âm thanh")
-            row = LectureAudio(
-                cache_key=cache_key,
-                opus_path=f"/api/v1/lessons/audio/{cache_key}.opus",
-                aac_path=f"/api/v1/lessons/audio/{cache_key}.aac",
-                opus_data=opus_bytes,
-                aac_data=aac_bytes,
-                prompt_version=prompt_version,
-                voice=voice,
-                duration_sec=duration_sec,
+            reuse, opus_bytes, aac_bytes, duration_sec, stored_key = _voice_article(
+                db, tts_text, voice, cache_key, fallback_cache_key, on_progress
             )
-            db.add(row)
-            db.commit()
+
+            if reuse is not None:
+                row = reuse
+            else:
+                publish_job_event(db, jid, progress=0.95, step="Đang lưu âm thanh")
+                row = LectureAudio(
+                    cache_key=stored_key,
+                    opus_path=f"/api/v1/lessons/audio/{stored_key}.opus",
+                    aac_path=f"/api/v1/lessons/audio/{stored_key}.aac",
+                    opus_data=opus_bytes,
+                    aac_data=aac_bytes,
+                    prompt_version=prompt_version,
+                    voice=voice,
+                    duration_sec=duration_sec,
+                )
+                db.add(row)
+                db.commit()
 
             publish_job_event(
                 db,
@@ -318,7 +375,7 @@ def generate_article_audio(self, job_id: str, tts_text: str, voice: str, prompt_
                 progress=1.0,
                 step="Hoàn tất",
                 result={
-                    "cache_key": cache_key,
+                    "cache_key": stored_key,
                     "opus_path": row.opus_path,
                     "aac_path": row.aac_path,
                     "duration_sec": duration_sec,

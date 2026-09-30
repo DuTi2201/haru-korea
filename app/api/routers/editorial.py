@@ -56,6 +56,7 @@ from app.schemas import (
     StudyPackOut,
     VocabItemOut,
 )
+from app.services import tts
 from app.services.article_extract import (
     TEXT_CLEAN_VERSION,
     article_tts_text,
@@ -307,9 +308,21 @@ async def request_article_audio(
     # body backfill OR a cleaning-rule change regenerates the recording
     # instead of serving audio for text that no longer matches the screen.
     content_sig = hashlib.sha256(f"{TEXT_CLEAN_VERSION}\n{tts_text}".encode("utf-8")).hexdigest()[:16]
-    cache_key = f"article-audio:{article_id}:{body.voice}:{body.prompt_version}:{content_sig}"
+    base_key = f"article-audio:{article_id}:{body.voice}:{body.prompt_version}:{content_sig}"
     if body.variant == "easy":
-        cache_key += ":easy"
+        base_key += ":easy"
+    # With Google Chirp 3 HD on, the key also carries the voice+pace spec
+    # (google_tts.spec), so (a) recordings made earlier with the Gemini voice
+    # do not match and are regenerated in the new voice, and (b) changing the
+    # voice/rate on Railway regenerates them again. The plain key is where the
+    # worker files a Gemini FALLBACK recording (Chirp failed), so that a later
+    # play retries Chirp instead of being stuck with the fallback voice.
+    if tts.chirp_enabled():
+        cache_key = f"{base_key}:{tts.chirp_spec()}"
+        fallback_cache_key: str | None = base_key
+    else:
+        cache_key = base_key
+        fallback_cache_key = None
 
     cached = await db.execute(select(LectureAudio).where(LectureAudio.cache_key == cache_key))
     hit = cached.scalar_one_or_none()
@@ -322,6 +335,11 @@ async def request_article_audio(
     if job is not None and (
         job.status not in ("queued", "running", "succeeded")
         or (job.status in ("queued", "running") and datetime.now(timezone.utc) - job.updated_at > _STALE_JOB_AFTER)
+        # A "succeeded" job whose recording is not in the cache under the key
+        # we want NOW: the fallback voice was used (Chirp failed), or the
+        # voice/rate changed. Re-run so Chirp gets another chance (the worker
+        # reuses an existing fallback recording if it is still down).
+        or (job.status == "succeeded" and hit is None)
     ):
         # Same reasoning as _request_podcast's identical guard: a stale
         # "failed" row under this idempotency key would otherwise wedge
@@ -356,7 +374,9 @@ async def request_article_audio(
         await db.refresh(job)
 
         if not hit:
-            generate_article_audio.delay(str(job.id), tts_text, body.voice, body.prompt_version, cache_key)
+            generate_article_audio.delay(
+                str(job.id), tts_text, body.voice, body.prompt_version, cache_key, fallback_cache_key
+            )
 
     return JobAccepted(
         job_id=job.id,

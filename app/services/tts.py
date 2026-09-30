@@ -1,7 +1,13 @@
-"""Gemini text-to-speech + ffmpeg transcode — the real implementation
-behind both `audio.lecture_audio` (whole-lesson narration) and
-`audio.corpus_item_audio` (single-sentence listening clips). One call
-here == one Gemini TTS request, so every caller MUST go through the
+"""Text-to-speech + ffmpeg transcode — the real implementation behind
+`audio.lecture_audio` (whole-lesson narration), `audio.corpus_item_audio`
+(single-sentence listening clips) and the article read-aloud.
+
+Voices: Google Chirp 3 HD (app/services/google_tts.py) is the PRIMARY voice
+for Korean-only text whenever the `TTS_GG_Chirp` credential is configured
+(`synthesize_article_chirp`, `synthesize_korean_tts_chirp_first`); Gemini TTS
+below is the fallback, and the only voice for the podcast script, which mixes
+Vietnamese with Korean (a ko-KR voice cannot read Vietnamese). One call
+here == one TTS request, so every caller MUST go through the
 content-addressed cache (cache_key = f"{content_id}:{voice}:{prompt_version}",
 already the pattern audio.py's lecture-audio route uses) rather than
 calling this on every playback — that's what keeps repeat listens free.
@@ -24,6 +30,7 @@ from google import genai
 from google.genai import errors as genai_errors
 
 from app.core.config import settings
+from app.services import google_tts
 
 # Friendly ids (already the shape of LectureAudioRequest.voice's default,
 # "ko-female-1") mapped to one of Gemini's prebuilt voice names. Kept as a
@@ -258,14 +265,17 @@ _PAUSE_AFTER_SENTENCE_MS = 250
 _CHUNK_RETRY_DELAYS_SEC = (2.0, 6.0)
 
 
-def plan_article_chunks(text: str, max_chars: int = _ARTICLE_CHUNK_CHARS) -> list[tuple[str, int]]:
+def plan_article_chunks(
+    text: str, max_chars: int = _ARTICLE_CHUNK_CHARS, max_total: int = _ARTICLE_MAX_CHARS
+) -> list[tuple[str, int]]:
     """text (one paragraph per line) -> [(chunk_text, pause_after_ms)].
 
     Chunks end on a paragraph boundary whenever possible, so the silence
     inserted between chunks is a real paragraph pause; paragraphs inside one
     chunk are separated by a blank line (the model's own pacing). A single
     paragraph longer than max_chars is split at sentence boundaries and
-    gets the shorter sentence pause between its pieces."""
+    gets the shorter sentence pause between its pieces. `max_total` caps the
+    characters voiced (the tail of a very long text is dropped)."""
     paragraphs = [p.strip() for p in text.splitlines() if p.strip()]
     chunks: list[tuple[str, int]] = []
     current: list[str] = []
@@ -279,7 +289,7 @@ def plan_article_chunks(text: str, max_chars: int = _ARTICLE_CHUNK_CHARS) -> lis
             current, size = [], 0
 
     for para in paragraphs:
-        if total + len(para) > _ARTICLE_MAX_CHARS and chunks:
+        if total + len(para) > max_total and chunks:
             break
         total += len(para)
         if len(para) > max_chars:
@@ -351,3 +361,128 @@ def synthesize_article_tts(
             on_progress(idx + 1, len(plan))
 
     return transcode_pcm(b"".join(pcm_parts), sample_rate)
+
+
+# ------------------------------------------------- Google Chirp 3 HD (primary)
+# Chirp is cheap per character and its request limit (5,000 bytes) is enforced
+# by google_tts.CHUNK_CHARS, so a longer read-aloud cap than Gemini's is fine.
+_CHIRP_ARTICLE_MAX_CHARS = 12000
+
+
+def chirp_enabled() -> bool:
+    """True when the TTS_GG_Chirp credential is present in the environment."""
+    return google_tts.is_configured()
+
+
+def chirp_spec() -> str:
+    """Voice + pace id (e.g. "gc3-iapetus-r85") for cache keys."""
+    return google_tts.spec()
+
+
+def describe_error(exc: BaseException) -> str:
+    """One-line, log-safe description of a failure. Never includes the
+    credential: it travels in a request header, not in any exception text."""
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}"[:400] if text else type(exc).__name__
+
+
+def _chirp_chunk_pcm(text: str) -> tuple[bytes, int]:
+    """One Chirp request; a retryable failure is mapped onto TransientTTSError
+    so the same retry loop as the Gemini path applies. A non-retryable
+    GoogleTTSError is already a RuntimeError and simply propagates."""
+    try:
+        return google_tts.synthesize_pcm(text)
+    except google_tts.GoogleTTSTransient as exc:
+        raise TransientTTSError(str(exc)) from exc
+
+
+def _retry_transient(fn: Callable[[str], tuple[bytes, int]], text: str) -> tuple[bytes, int]:
+    attempt = 0
+    while True:
+        try:
+            return fn(text)
+        except TransientTTSError:
+            if attempt >= len(_CHUNK_RETRY_DELAYS_SEC):
+                raise
+            time.sleep(_CHUNK_RETRY_DELAYS_SEC[attempt])
+            attempt += 1
+
+
+def _join_pcm(parts: list[tuple[bytes, int, int]]) -> tuple[bytes, int]:
+    """[(pcm, sample_rate, pause_after_ms)] -> one PCM stream with the pauses
+    inserted as silence. All chunks come from one voice, so one sample rate;
+    a mismatch would garble the join, so it is an error, not a shrug."""
+    rates = {rate for _, rate, _ in parts}
+    if len(rates) != 1:
+        raise RuntimeError(f"Google TTS returned mixed sample rates {sorted(rates)}")
+    rate = rates.pop()
+    out: list[bytes] = []
+    for pcm, _rate, pause_ms in parts:
+        out.append(pcm)
+        if pause_ms:
+            out.append(_silence_pcm(pause_ms, rate))
+    return b"".join(out), rate
+
+
+def synthesize_article_chirp(
+    text: str, on_progress: Callable[[int, int], None] | None = None
+) -> tuple[bytes, bytes, int]:
+    """Read a whole article aloud with Google Chirp 3 HD: same paragraph-aligned
+    plan, real silence between chunks, per-chunk retry of transient errors and
+    progress callback as the Gemini path, but ~900-character chunks (the
+    request limit is in bytes). Raises RuntimeError on any failure — the
+    caller (the Celery task) decides whether to fall back to Gemini; this never
+    mixes two voices inside one recording."""
+    if not google_tts.is_configured():
+        raise RuntimeError("TTS_GG_Chirp is not set")
+    plan = plan_article_chunks(text, google_tts.CHUNK_CHARS, _CHIRP_ARTICLE_MAX_CHARS)
+    if not plan:
+        raise RuntimeError("empty text_ko")
+    print(
+        f"[tts] article provider=google-chirp spec={google_tts.spec()} chars={len(text)} chunks={len(plan)}",
+        flush=True,
+    )
+    if on_progress:
+        on_progress(0, len(plan))
+
+    parts: list[tuple[bytes, int, int]] = []
+    for idx, (chunk, pause_ms) in enumerate(plan):
+        pcm, rate = _retry_transient(_chirp_chunk_pcm, chunk)
+        parts.append((pcm, rate, pause_ms))
+        if on_progress:
+            on_progress(idx + 1, len(plan))
+
+    pcm_all, rate = _join_pcm(parts)
+    return transcode_pcm(pcm_all, rate)
+
+
+def _synthesize_korean_chirp(text: str) -> tuple[bytes, bytes, int]:
+    chunks = _split_for_tts(text, google_tts.CHUNK_CHARS)
+    parts = []
+    for chunk in chunks:
+        pcm, rate = _retry_transient(_chirp_chunk_pcm, chunk)
+        parts.append((pcm, rate, 0))
+    print(f"[tts] chars={len(text)} chunks={len(chunks)} provider=google-chirp spec={google_tts.spec()}", flush=True)
+    pcm_all, rate = _join_pcm(parts)
+    return transcode_pcm(pcm_all, rate)
+
+
+def synthesize_korean_tts_chirp_first(text_ko: str, voice: str = "ko-female-1") -> tuple[bytes, bytes, int]:
+    """Korean-ONLY text (a lesson passage, one listening sentence, one word):
+    Google Chirp 3 HD when configured, Gemini when it is not or when Chirp
+    fails. Not for the podcast script — that mixes in Vietnamese, which a
+    ko-KR voice cannot read; it stays on synthesize_korean_tts."""
+    text = text_ko.strip()
+    if not text:
+        raise RuntimeError("empty text_ko")
+    if not google_tts.is_configured():
+        return synthesize_korean_tts(text, voice)
+    try:
+        return _synthesize_korean_chirp(text)
+    except Exception as exc:  # noqa: BLE001 - any Chirp failure falls back rather than losing the audio
+        reason = describe_error(exc)
+        print(f"[tts] google-chirp failed ({reason}); falling back to Gemini", flush=True)
+        try:
+            return synthesize_korean_tts(text, voice)
+        except RuntimeError as gem_exc:
+            raise RuntimeError(f"Google Chirp lỗi ({reason}); Gemini dự phòng cũng lỗi: {gem_exc}") from gem_exc

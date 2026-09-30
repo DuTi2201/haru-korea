@@ -65,6 +65,19 @@ class Settings(BaseSettings):
     # same generate_content/response_modalities/speech_config call shape.
     GEMINI_MODEL_TTS_FALLBACK: str = "gemini-2.5-pro-preview-tts"
 
+    # Google Cloud Text-to-Speech, Chirp 3 HD — the PRIMARY voice for Korean
+    # article / passage read-aloud (app/services/google_tts.py); Gemini above
+    # stays as the fallback. The credential is ONLY ever read from the
+    # environment (Railway variable `TTS_GG_Chirp`; env names are matched
+    # case-insensitively) and must never be written into code, docs or
+    # tests. Empty => Chirp is off and everything behaves exactly as before.
+    TTS_GG_CHIRP: str = ""
+    # Non-secret tuning: change on Railway to swap the voice or pace without a
+    # deploy of code. Changing either also changes the article-audio cache key
+    # (see google_tts.spec), so recordings regenerate with the new voice.
+    TTS_CHIRP_VOICE: str = "ko-KR-Chirp3-HD-Iapetus"
+    TTS_CHIRP_SPEAKING_RATE: float = 0.85
+
     # Content-ingestion tuning (Studio uploads — admin.py/ingest.py)
     MAX_INGEST_FILE_MB: int = 20
     # Cues per Gemini call when classifying a subtitle file — the knob
