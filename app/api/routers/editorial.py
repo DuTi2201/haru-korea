@@ -56,15 +56,14 @@ from app.schemas import (
     StudyPackOut,
     VocabItemOut,
 )
-from app.services import tts
+from app.services import read_along, tts
 from app.services.article_extract import (
     TEXT_CLEAN_VERSION,
-    article_tts_text,
     clean_article_text,
     clean_images,
     split_paragraphs,
 )
-from app.services.study_pack import STUDY_VERSION, easy_tts_text, study_text_sig
+from app.services.study_pack import STUDY_VERSION, study_text_sig
 from app.workers.tasks import (
     discover_editorial_candidates,
     generate_article_audio,
@@ -251,6 +250,26 @@ async def request_editorial_podcast(
     )
 
 
+async def _timings_of_recording(db: AsyncSession, cache_key: str) -> dict | None:
+    """The read-along timeline of a cached recording. It lives in the result of
+    the job that generated it (the audio row has no column for it), so a cache
+    hit that has to build a fresh job result looks it up there."""
+    result = (
+        await db.execute(
+            select(Job.result)
+            .where(
+                Job.type == "generate_article_audio",
+                Job.status == "succeeded",
+                Job.result["cache_key"].astext == cache_key,
+            )
+            .order_by(Job.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    timings = (result or {}).get("timings")
+    return timings if isinstance(timings, dict) else None
+
+
 @router.post("/editorials/{article_id}/audio", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def request_article_audio(
     article_id: uuid.UUID,
@@ -292,22 +311,28 @@ async def request_article_audio(
     if body.variant == "easy":
         # The simplified-Korean rewrite from the study pack — for beginners.
         pack = _valid_pack(article, cleaned_body)
-        easy_text = easy_tts_text(article.title_ko, pack) if pack else ""
-        if not easy_text.strip():
+        units = read_along.easy_units(article.title_ko, pack) if pack else []
+        if not any(u.p != read_along.TITLE_PARAGRAPH for u in units):
             raise _problem(
                 status.HTTP_409_CONFLICT,
                 "Easy version not ready",
                 "study_not_ready",
                 "The simplified version of this article is still being prepared — try again in a minute.",
             )
-        tts_text = easy_text
     else:
-        tts_text = article_tts_text(article.title_ko, cleaned_body)
+        # One unit per sentence, numbered like the study pack's sentences, so
+        # the reader can follow the audio sentence by sentence.
+        units = read_along.original_units(article.title_ko, cleaned_body)
+    tts_text = read_along.units_to_text(units)
 
     # Keyed on the exact text voiced + the cleaning-rules version, so a
     # body backfill OR a cleaning-rule change regenerates the recording
     # instead of serving audio for text that no longer matches the screen.
-    content_sig = hashlib.sha256(f"{TEXT_CLEAN_VERSION}\n{tts_text}".encode("utf-8")).hexdigest()[:16]
+    # READ_ALONG_VERSION: recordings made before the read-along timeline existed
+    # have nothing to follow, so they are voiced again (once) on the next play.
+    content_sig = hashlib.sha256(
+        f"{TEXT_CLEAN_VERSION}\n{read_along.READ_ALONG_VERSION}\n{tts_text}".encode("utf-8")
+    ).hexdigest()[:16]
     base_key = f"article-audio:{article_id}:{body.voice}:{body.prompt_version}:{content_sig}"
     if body.variant == "easy":
         base_key += ":easy"
@@ -326,6 +351,11 @@ async def request_article_audio(
 
     cached = await db.execute(select(LectureAudio).where(LectureAudio.cache_key == cache_key))
     hit = cached.scalar_one_or_none()
+    print(
+        f"[tts] audio request article={article_id} variant={body.variant} "
+        f"chirp={'on' if fallback_cache_key is not None else 'off'} units={len(units)} cache={'hit' if hit else 'miss'}",
+        flush=True,
+    )
 
     idempotency_key = request.headers.get("Idempotency-Key", cache_key)
     existing_job = await db.execute(
@@ -365,6 +395,7 @@ async def request_article_audio(
                 "opus_path": hit.opus_path,
                 "aac_path": hit.aac_path,
                 "duration_sec": hit.duration_sec,
+                "timings": await _timings_of_recording(db, hit.cache_key),
             }
             if hit
             else None,
@@ -375,7 +406,13 @@ async def request_article_audio(
 
         if not hit:
             generate_article_audio.delay(
-                str(job.id), tts_text, body.voice, body.prompt_version, cache_key, fallback_cache_key
+                str(job.id),
+                tts_text,
+                body.voice,
+                body.prompt_version,
+                cache_key,
+                fallback_cache_key,
+                units=[list(u) for u in units],
             )
 
     return JobAccepted(

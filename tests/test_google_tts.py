@@ -305,9 +305,16 @@ class KoreanChirpFirstTests(ChirpOn):
 class WorkerBookkeepingTests(ChirpOn):
     """tasks._voice_article: which recording is stored under which key."""
 
-    def db_with(self, fallback_row=None):
+    def db_with(self, fallback_row=None, job_result=None):
         db = mock.MagicMock()
-        db.execute.return_value.scalar_one_or_none.return_value = fallback_row
+
+        def execute(stmt):
+            res = mock.MagicMock()
+            is_job_lookup = "SELECT jobs.result" in str(stmt)
+            res.scalar_one_or_none.return_value = job_result if is_job_lookup else fallback_row
+            return res
+
+        db.execute.side_effect = execute
         return db
 
     def test_legacy_gemini_only_when_api_had_chirp_off(self):
@@ -315,7 +322,7 @@ class WorkerBookkeepingTests(ChirpOn):
             tts, "synthesize_article_chirp"
         ) as chirp:
             out = tasks._voice_article(self.db_with(), "t", "v", "KEY", None, None)
-        self.assertEqual(out, (None, "o", "a", 5, "KEY"))
+        self.assertEqual(out, (None, "o", "a", 5, "KEY", None))
         chirp.assert_not_called()
         gem.assert_called_once()
 
@@ -324,7 +331,7 @@ class WorkerBookkeepingTests(ChirpOn):
             tts, "synthesize_article_tts"
         ) as gem:
             out = tasks._voice_article(self.db_with(), "t", "v", "KEY:gc3", "KEY", None)
-        self.assertEqual(out, (None, "o", "a", 5, "KEY:gc3"))
+        self.assertEqual(out, (None, "o", "a", 5, "KEY:gc3", None))
         gem.assert_not_called()
 
     def test_chirp_failure_redoes_whole_article_with_gemini_under_fallback_key(self):
@@ -332,7 +339,7 @@ class WorkerBookkeepingTests(ChirpOn):
             tts, "synthesize_article_tts", return_value=("go", "ga", 7)
         ) as gem:
             out = tasks._voice_article(self.db_with(), "t", "v", "KEY:gc3", "KEY", None)
-        self.assertEqual(out, (None, "go", "ga", 7, "KEY"))  # NOT the chirp key
+        self.assertEqual(out, (None, "go", "ga", 7, "KEY", None))  # NOT the chirp key
         gem.assert_called_once()
 
     def test_existing_fallback_recording_reused_without_spending_gemini(self):
@@ -340,10 +347,32 @@ class WorkerBookkeepingTests(ChirpOn):
         with mock.patch.object(tts, "synthesize_article_chirp", side_effect=google_tts.GoogleTTSError("403")), mock.patch.object(
             tts, "synthesize_article_tts"
         ) as gem:
-            reuse, _o, _a, dur, key = tasks._voice_article(self.db_with(row), "t", "v", "KEY:gc3", "KEY", None)
+            reuse, _o, _a, dur, key, _t = tasks._voice_article(self.db_with(row), "t", "v", "KEY:gc3", "KEY", None)
         self.assertIs(reuse, row)
         self.assertEqual((dur, key), (99, "KEY"))
         gem.assert_not_called()
+
+    def test_reused_fallback_recording_keeps_its_read_along_timeline(self):
+        row = SimpleNamespace(duration_sec=99)
+        timeline = {"v": 1, "items": [[0, 0, 0], [0, 1, 4200]]}
+        db = self.db_with(row, job_result={"cache_key": "KEY", "timings": timeline})
+        with mock.patch.object(tts, "synthesize_article_chirp", side_effect=google_tts.GoogleTTSError("403")), mock.patch.object(
+            tts, "synthesize_article_tts"
+        ) as gem:
+            out = tasks._voice_article(db, "t", "v", "KEY:gc3", "KEY", None)
+        self.assertEqual(out[5], timeline)
+        gem.assert_not_called()
+
+    def test_units_switch_to_the_timed_voices(self):
+        units = [[0, 0, "안녕하세요."], [0, 1, "반갑습니다."]]
+        timeline = {"v": 1, "items": [[0, 0, 0], [0, 1, 1500]]}
+        with mock.patch.object(
+            tts, "synthesize_article_chirp_timed", return_value=("o", "a", 5, timeline)
+        ) as chirp, mock.patch.object(tts, "synthesize_article_chirp") as plain:
+            out = tasks._voice_article(self.db_with(), "t", "v", "KEY:gc3", "KEY", None, units)
+        self.assertEqual(out, (None, "o", "a", 5, "KEY:gc3", timeline))
+        self.assertEqual([tuple(u) for u in chirp.call_args.args[0]], [(0, 0, "안녕하세요."), (0, 1, "반갑습니다.")])
+        plain.assert_not_called()
 
     def test_worker_without_the_variable_falls_back_and_says_why(self):
         with mock.patch.object(settings, "TTS_GG_CHIRP", ""), mock.patch.object(
@@ -351,7 +380,7 @@ class WorkerBookkeepingTests(ChirpOn):
         ) as chirp, mock.patch.object(tts, "synthesize_article_tts", return_value=("go", "ga", 7)):
             out = tasks._voice_article(self.db_with(), "t", "v", "KEY:gc3", "KEY", None)
         chirp.assert_not_called()
-        self.assertEqual(out[-1], "KEY")
+        self.assertEqual(out[4], "KEY")
 
     def test_both_fail_message_names_both(self):
         with mock.patch.object(tts, "synthesize_article_chirp", side_effect=google_tts.GoogleTTSError("HTTP 403")), mock.patch.object(
@@ -428,9 +457,9 @@ class RouteKeyTests(unittest.IsolatedAsyncioTestCase):
         pack = SimpleNamespace()
         with mock.patch.object(settings, "TTS_GG_CHIRP", SECRET), mock.patch.object(
             editorial, "_valid_pack", return_value=pack
-        ), mock.patch.object(editorial, "easy_tts_text", return_value="쉬운 글이다."), mock.patch.object(
-            editorial.generate_article_audio, "delay"
-        ) as delay:
+        ), mock.patch.object(
+            editorial.read_along, "easy_units", return_value=[editorial.read_along.Unit(0, 0, "쉬운 글이다.")]
+        ), mock.patch.object(editorial.generate_article_audio, "delay") as delay:
             await editorial.request_article_audio(
                 art.id, ArticleAudioRequest(variant="easy"), self.request(), fake_db(art)
             )

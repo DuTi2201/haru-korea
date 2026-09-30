@@ -281,18 +281,35 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
 _TITLE_TAG_RE = re.compile(r"^\s*[\[［【〈<(（][^\]］】〉>)）]{1,12}[\]］】〉>)）]\s*")
 
 
+def speakable(text: str) -> str:
+    """`text` as a TTS voice should get it: URLs and e-mail addresses removed
+    (a voice reads them character by character)."""
+    return _EMAIL_RE.sub("", _URL_RE.sub("", text)).strip()
+
+
+def tts_title(title: str | None) -> str | None:
+    """The article title as voiced: leading "[사설]"-style tag dropped and a
+    full stop added so the voice ends it like a sentence. None when there is
+    nothing to say."""
+    if not title or not title.strip():
+        return None
+    t = _TITLE_TAG_RE.sub("", title.strip()).strip()
+    if not t:
+        return None
+    return t if _ends_sentence(t) else t + "."
+
+
 def article_tts_text(title: str | None, body: str) -> str:
     """Exactly what "Nghe toàn văn" voices: the cleaned title (leading
     "[사설]"-style tag dropped) as its own paragraph, then the cleaned body,
     one paragraph per line. URLs/emails are removed — a TTS voice reads
     them character by character."""
     paras: list[str] = []
-    if title and title.strip():
-        t = _TITLE_TAG_RE.sub("", title.strip()).strip()
-        if t:
-            paras.append(t if _ends_sentence(t) else t + ".")
+    t = tts_title(title)
+    if t:
+        paras.append(t)
     for p in split_paragraphs(clean_article_text(body)):
-        p = _EMAIL_RE.sub("", _URL_RE.sub("", p)).strip()
+        p = speakable(p)
         if p:
             paras.append(p)
     return "\n".join(paras)

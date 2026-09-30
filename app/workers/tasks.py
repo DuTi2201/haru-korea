@@ -19,12 +19,13 @@ from app.models import (
     EditorialOutlineSubmission,
     GrammarPoint,
     ImportBatch,
+    Job,
     LectureAudio,
     Lesson,
     VocabItem,
     VocabItemAudio,
 )
-from app.services import article_extract, ingestion, study_pack, tts
+from app.services import article_extract, ingestion, read_along, study_pack, tts
 from app.services import gemini_client
 from app.services.job_events import publish_job_event
 
@@ -268,6 +269,25 @@ def generate_content_podcast(
             raise
 
 
+def _timings_for_key(db: Session, cache_key: str) -> dict | None:
+    """The read-along timeline of an earlier recording, taken from the result of
+    the job that made it (the timeline is stored with the job result — there is
+    no column for it on the audio row). None when that job is gone or predates
+    read-along."""
+    result = db.execute(
+        select(Job.result)
+        .where(
+            Job.type == "generate_article_audio",
+            Job.status == "succeeded",
+            Job.result["cache_key"].astext == cache_key,
+        )
+        .order_by(Job.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    timings = (result or {}).get("timings")
+    return timings if isinstance(timings, dict) else None
+
+
 def _voice_article(
     db: Session,
     tts_text: str,
@@ -275,8 +295,14 @@ def _voice_article(
     cache_key: str,
     fallback_cache_key: str | None,
     on_progress,
+    units: list | None = None,
 ):
-    """Voice an article. Returns (reuse_row, opus, aac, duration_sec, stored_key).
+    """Voice an article. Returns (reuse_row, opus, aac, duration_sec,
+    stored_key, timings).
+
+    `units` (read_along.Unit tuples) turns on read-along: the article is voiced
+    sentence by sentence and `timings` says when each one starts. Without it
+    (an old queued task) the article is voiced as before and `timings` is None.
 
     `fallback_cache_key` is None when the API did not have Google Chirp on:
     plain Gemini, stored under `cache_key`, exactly as before.
@@ -288,26 +314,40 @@ def _voice_article(
     instead of being stuck with the fallback voice forever. A fallback
     recording that already exists is reused rather than spending Gemini's
     small daily quota again while Chirp is still down."""
-    if fallback_cache_key is None:
+    timed = [read_along.Unit(*u) for u in units] if units else None
+
+    def gemini():
+        if timed:
+            return tts.synthesize_article_tts_timed(timed, voice, on_progress)
         opus, aac, dur = tts.synthesize_article_tts(tts_text, voice, on_progress)
-        return None, opus, aac, dur, cache_key
+        return opus, aac, dur, None
+
+    def chirp():
+        if timed:
+            return tts.synthesize_article_chirp_timed(timed, on_progress)
+        opus, aac, dur = tts.synthesize_article_chirp(tts_text, on_progress)
+        return opus, aac, dur, None
+
+    if fallback_cache_key is None:
+        opus, aac, dur, timings = gemini()
+        return None, opus, aac, dur, cache_key, timings
 
     try:
         if not tts.chirp_enabled():
             raise RuntimeError("TTS_GG_Chirp is not set on the worker service")
-        opus, aac, dur = tts.synthesize_article_chirp(tts_text, on_progress)
-        return None, opus, aac, dur, cache_key
+        opus, aac, dur, timings = chirp()
+        return None, opus, aac, dur, cache_key, timings
     except Exception as chirp_exc:  # noqa: BLE001 - ANY Chirp failure (incl. an unexpected client error) must fall back, not lose the audio
         chirp_exc = RuntimeError(tts.describe_error(chirp_exc))
         print(f"[tts] article: Google Chirp failed ({chirp_exc}); using Gemini fallback", flush=True)
         existing = db.execute(select(LectureAudio).where(LectureAudio.cache_key == fallback_cache_key)).scalar_one_or_none()
         if existing is not None:
-            return existing, b"", b"", existing.duration_sec, fallback_cache_key
+            return existing, b"", b"", existing.duration_sec, fallback_cache_key, _timings_for_key(db, fallback_cache_key)
         try:
-            opus, aac, dur = tts.synthesize_article_tts(tts_text, voice, on_progress)
+            opus, aac, dur, timings = gemini()
         except RuntimeError as gemini_exc:
             raise RuntimeError(f"Google Chirp lỗi ({chirp_exc}); Gemini dự phòng cũng lỗi: {gemini_exc}") from gemini_exc
-        return None, opus, aac, dur, fallback_cache_key
+        return None, opus, aac, dur, fallback_cache_key, timings
 
 
 @celery_app.task(name="app.workers.tasks.generate_article_audio", bind=True, max_retries=3)
@@ -319,6 +359,7 @@ def generate_article_audio(
     prompt_version: str,
     cache_key: str,
     fallback_cache_key: str | None = None,
+    units: list | None = None,
 ):
     """Reads an editorial article's OWN cleaned text aloud verbatim —
     deliberately independent of generate_content_podcast (which has Gemini
@@ -347,8 +388,8 @@ def generate_article_audio(
                     step=f"Đang tạo giọng đọc ({done}/{total})" if done < total else "Đang ghép âm thanh",
                 )
 
-            reuse, opus_bytes, aac_bytes, duration_sec, stored_key = _voice_article(
-                db, tts_text, voice, cache_key, fallback_cache_key, on_progress
+            reuse, opus_bytes, aac_bytes, duration_sec, stored_key, timings = _voice_article(
+                db, tts_text, voice, cache_key, fallback_cache_key, on_progress, units
             )
 
             if reuse is not None:
@@ -379,6 +420,9 @@ def generate_article_audio(
                     "opus_path": row.opus_path,
                     "aac_path": row.aac_path,
                     "duration_sec": duration_sec,
+                    # read-along: when each sentence starts (None for a
+                    # recording made without it)
+                    "timings": timings,
                 },
             )
         except Exception as exc:  # noqa: BLE001

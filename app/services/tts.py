@@ -30,7 +30,7 @@ from google import genai
 from google.genai import errors as genai_errors
 
 from app.core.config import settings
-from app.services import google_tts
+from app.services import google_tts, read_along
 
 # Friendly ids (already the shape of LectureAudioRequest.voice's default,
 # "ko-female-1") mapped to one of Gemini's prebuilt voice names. Kept as a
@@ -454,6 +454,122 @@ def synthesize_article_chirp(
 
     pcm_all, rate = _join_pcm(parts)
     return transcode_pcm(pcm_all, rate)
+
+
+# ------------------------------------------- read-along (timed) article audio --
+# The same two voices, but planned sentence by sentence so the reader can
+# highlight what is being said (see app/services/read_along.py). The clip
+# length of every request is known exactly, which is where the timeline gets
+# its accuracy. Nothing here changes how a single request is made or retried.
+_CHIRP_PACK_CHARS = 240  # ~2-3 news sentences per Chirp request
+_CHIRP_SENTENCE_GAP_MS = 150  # extra silence between requests inside a paragraph
+
+
+def _synthesize_timed(
+    chunks: list[read_along.Chunk],
+    synth_one: Callable[[str], tuple[bytes, int]],
+    on_progress: Callable[[int, int], None] | None,
+) -> tuple[bytes, int, list[float], list[float]]:
+    """Run the planned chunks one after the other. Returns (pcm of the whole
+    article with the planned silences in it, sample rate, start time of every
+    chunk in ms, length of every chunk's speech in ms) — the last two measured
+    from the samples, so they are exact."""
+    if on_progress:
+        on_progress(0, len(chunks))
+    parts: list[bytes] = []
+    starts: list[float] = []
+    speech: list[float] = []
+    rate = 0
+    samples = 0
+    for idx, chunk in enumerate(chunks):
+        pcm, chunk_rate = synth_one(chunk.text)
+        if not rate:
+            rate = chunk_rate
+        elif chunk_rate != rate:
+            raise RuntimeError(f"TTS returned mixed sample rates {sorted({rate, chunk_rate})}")
+        n = len(pcm) // 2  # 16-bit mono
+        starts.append(samples * 1000.0 / rate)
+        speech.append(n * 1000.0 / rate)
+        parts.append(pcm[: n * 2])
+        samples += n
+        if chunk.pause_after_ms:
+            silence = int(rate * chunk.pause_after_ms / 1000)
+            parts.append(b"\x00" * (silence * 2))
+            samples += silence
+        if on_progress:
+            on_progress(idx + 1, len(chunks))
+    return b"".join(parts), rate, starts, speech
+
+
+def synthesize_article_chirp_timed(
+    units: list[read_along.Unit], on_progress: Callable[[int, int], None] | None = None
+) -> tuple[bytes, bytes, int, dict]:
+    """synthesize_article_chirp, planned per sentence. Returns (opus, aac,
+    duration_sec, timings). Raises RuntimeError on any failure; the caller
+    decides whether to fall back (never mixes two voices in one recording)."""
+    if not google_tts.is_configured():
+        raise RuntimeError("TTS_GG_Chirp is not set")
+    chunks = read_along.plan_chunks(
+        units,
+        pack_to=_CHIRP_PACK_CHARS,
+        split_over=google_tts.CHUNK_CHARS,
+        max_total=_CHIRP_ARTICLE_MAX_CHARS,
+        sentence_gap_ms=_CHIRP_SENTENCE_GAP_MS,
+        paragraph_gap_ms=_PAUSE_AFTER_PARAGRAPH_MS,
+        cross_paragraph=False,
+    )
+    if not chunks:
+        raise RuntimeError("empty text_ko")
+    print(
+        f"[tts] article provider=google-chirp spec={google_tts.spec()} units={len(units)} chunks={len(chunks)} timed=1",
+        flush=True,
+    )
+    pcm, rate, starts, speech = _synthesize_timed(
+        chunks, lambda text: _retry_transient(_chirp_chunk_pcm, text), on_progress
+    )
+    timings = read_along.build_timeline(units, chunks, starts, speech)
+    opus, aac, dur = transcode_pcm(pcm, rate)
+    return opus, aac, dur, timings
+
+
+def synthesize_article_tts_timed(
+    units: list[read_along.Unit],
+    voice: str = "ko-female-1",
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[bytes, bytes, int, dict]:
+    """synthesize_article_tts (Gemini), planned per sentence but packed into
+    the same large paragraph-aligned chunks as before — Gemini's daily quota is
+    small, so its request count must not grow. Timing is therefore coarser
+    here (anchored every ~1,200 characters) than with Chirp."""
+    if not settings.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    chunks = read_along.plan_chunks(
+        units,
+        pack_to=_ARTICLE_CHUNK_CHARS,
+        split_over=_ARTICLE_CHUNK_CHARS,
+        max_total=_ARTICLE_MAX_CHARS,
+        sentence_gap_ms=_PAUSE_AFTER_SENTENCE_MS,
+        paragraph_gap_ms=_PAUSE_AFTER_PARAGRAPH_MS,
+        cross_paragraph=True,
+    )
+    if not chunks:
+        raise RuntimeError("empty text_ko")
+    client = _get_client()
+    config, voice_name = _tts_config(voice)
+    models_to_try = _tts_models()
+    print(
+        f"[tts] article chars={sum(len(c.text) for c in chunks)} chunks={len(chunks)} "
+        f"chunk_lens={[len(c.text) for c in chunks]} voice={voice_name} timed=1",
+        flush=True,
+    )
+    pcm, rate, starts, speech = _synthesize_timed(
+        chunks,
+        lambda text: _retry_transient(lambda t: _synthesize_chunk_pcm(client, t, config, models_to_try), text),
+        on_progress,
+    )
+    timings = read_along.build_timeline(units, chunks, starts, speech)
+    opus, aac, dur = transcode_pcm(pcm, rate)
+    return opus, aac, dur, timings
 
 
 def _synthesize_korean_chirp(text: str) -> tuple[bytes, bytes, int]:
