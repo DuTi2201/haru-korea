@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL_LESSON_INGEST: str = "gemini-3.5-flash-lite"
     GEMINI_MODEL_CORPUS_INGEST: str = "gemini-3.5-flash-lite"
+    # Text model for the beginner study pack (translation / simplified Korean /
+    # word breakdown) — see app/services/study_pack.py. Override via env to use
+    # a stronger model without a code change.
+    GEMINI_MODEL_STUDY: str = "gemini-3.5-flash-lite"
     GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-2"
     # TTS: a real Gemini call (app/services/tts.py), not a stub — always
     # cache the result (audio.lecture_audio / audio.corpus_item_audio) and

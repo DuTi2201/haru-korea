@@ -650,6 +650,14 @@ class EditorialArticle(Base):
     # this column existed get their photos without any admin action.
     images: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
     images_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Beginner "reading ladder" generated once per article (see
+    # app.services.study_pack): Vietnamese summary, per-sentence translation /
+    # word breakdown / grammar notes, simplified-Korean paragraphs. `study_status`
+    # is none | pending | ready | failed; `study_updated_at` doubles as the
+    # worker's heartbeat so a dead task is noticed and re-queued.
+    study_pack: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    study_status: Mapped[str] = mapped_column(String(16), default="none", server_default="none")
+    study_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     import_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

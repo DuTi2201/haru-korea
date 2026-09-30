@@ -24,7 +24,8 @@ from app.models import (
     VocabItem,
     VocabItemAudio,
 )
-from app.services import ingestion, tts
+from app.services import article_extract, ingestion, study_pack, tts
+from app.services import gemini_client
 from app.services.job_events import publish_job_event
 
 # Separate sync engine for worker-side DB access.
@@ -657,6 +658,62 @@ def refresh_editorial_images(self, article_id: str):
         return {"ok": True, "images": len(images)}
 
 
+@celery_app.task(name="app.workers.tasks.generate_study_pack", bind=True, max_retries=0)
+def generate_study_pack(self, article_id: str):
+    """Builds the beginner study pack (summary, per-sentence translation +
+    word breakdown, simplified-Korean paragraphs) for one article and stores
+    it on the row. Queued lazily by GET /editorials/{id} (and after an
+    import is applied); runs ONCE per (article text, prompt version) —
+    every reader afterwards just reads the stored JSON, so Gemini is never
+    called per view. `study_updated_at` is touched after every Gemini batch:
+    the API treats a 'pending' pack with no heartbeat for a while as dead
+    (worker killed by a redeploy) and re-queues it."""
+    aid = uuid.UUID(article_id)
+    with Session(_sync_engine) as db:
+        article = db.get(EditorialArticle, aid)
+        if article is None or not (article.body_ko or "").strip():
+            return {"ok": False, "reason": "not_found"}
+
+        cleaned = article_extract.clean_article_text(article.body_ko)
+        paragraphs = article_extract.split_paragraphs(cleaned)
+        if not paragraphs:
+            article.study_status = "failed"
+            article.study_updated_at = datetime.now(timezone.utc)
+            db.add(article)
+            db.commit()
+            return {"ok": False, "reason": "no_body"}
+
+        article.study_status = "pending"
+        article.study_updated_at = datetime.now(timezone.utc)
+        db.add(article)
+        db.commit()
+
+        def heartbeat(done: int, total: int) -> None:
+            article.study_updated_at = datetime.now(timezone.utc)
+            db.add(article)
+            db.commit()
+
+        try:
+            pack = study_pack.build_study_pack(
+                article.title_ko,
+                paragraphs,
+                study_pack.make_gemini_generate(settings.GEMINI_MODEL_STUDY, gemini_client.generate_structured),
+                text_sig=study_pack.study_text_sig(cleaned),
+                on_progress=heartbeat,
+            )
+            article.study_pack = pack
+            article.study_status = "ready"
+        except Exception as exc:  # noqa: BLE001 — recorded, retried later by the API
+            print(f"[study-pack] {article.source_url}: {exc}", flush=True)
+            db.rollback()
+            article = db.get(EditorialArticle, aid)
+            article.study_status = "failed"
+        article.study_updated_at = datetime.now(timezone.utc)
+        db.add(article)
+        db.commit()
+        return {"ok": article.study_status == "ready", "status": article.study_status}
+
+
 @celery_app.task(name="app.workers.tasks.apply_import_batch", bind=True, max_retries=2)
 def apply_import_batch_task(self, job_id: str, batch_id: str):
     """Ghi các import_item đã confirmed vào bảng chính (content.lesson/
@@ -676,6 +733,13 @@ def apply_import_batch_task(self, job_id: str, batch_id: str):
             publish_job_event(
                 db, jid, status="succeeded", progress=1.0, step="Hoàn tất xác nhận", result=outcome
             )
+            # Prepare the beginner study pack right away, so the first learner
+            # to open a freshly published article doesn't wait for it.
+            if batch.kind == "editorial_article" and batch.editorial_article_id is not None:
+                try:
+                    generate_study_pack.delay(str(batch.editorial_article_id))
+                except Exception as exc:  # noqa: BLE001 — the API also queues it lazily on first read
+                    print(f"[study-pack] could not queue after import: {exc}", flush=True)
         except Exception as exc:  # noqa: BLE001
             db.rollback()
             publish_job_event(

@@ -131,6 +131,10 @@ class ArticleAudioRequest(BaseModel):
 
     voice: str = "ko-female-1"
     prompt_version: str = "article-v1"
+    # "original" = the article's own text; "easy" = the simplified-Korean
+    # (TOPIK 1-2) rewrite from the study pack, for beginners who can't follow
+    # the original at native speed yet. Cached independently per text.
+    variant: Literal["original", "easy"] = "original"
 
 
 # ----------------------------------------------------------------- writing --
@@ -358,6 +362,43 @@ class ArticleImageOut(BaseModel):
     after_paragraph: int = 0
 
 
+class StudyWordOut(BaseModel):
+    surface: str
+    base: str | None = None
+    pos: str | None = None
+    meaning_vi: str
+
+
+class StudySentenceOut(BaseModel):
+    ko: str
+    vi: str | None = None
+    words: list[StudyWordOut] = []
+    grammar_notes_vi: list[str] = []
+
+
+class StudyParagraphOut(BaseModel):
+    """One body paragraph, aligned by index with the paragraphs of `body_ko`
+    (split on newlines): its sentences with translations + word breakdowns,
+    and the paragraph rewritten in simple Korean."""
+
+    easy_ko: str | None = None
+    sentences: list[StudySentenceOut] = []
+
+
+class StudyKeyTermOut(BaseModel):
+    ko: str
+    vi: str
+
+
+class StudyPackOut(BaseModel):
+    """Beginner "reading ladder" — see app.services.study_pack."""
+
+    summary_vi: str = ""
+    key_points_vi: list[str] = []
+    key_terms: list[StudyKeyTermOut] = []
+    paragraphs: list[StudyParagraphOut] = []
+
+
 class EditorialArticleOut(BaseModel):
     id: uuid.UUID
     source_name: str
@@ -375,6 +416,10 @@ class EditorialArticleOut(BaseModel):
     # before photos existed) and a background fetch was just queued — the
     # client refetches once after a few seconds instead of showing none.
     images_pending: bool = False
+    # none = not requested yet, pending = being generated (client polls),
+    # ready = `study` is present, failed = generation failed (retried later).
+    study_status: Literal["none", "pending", "ready", "failed"] = "none"
+    study: StudyPackOut | None = None
 
 
 class EditorialOutlineSubmitRequest(BaseModel):

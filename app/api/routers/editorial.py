@@ -53,6 +53,7 @@ from app.schemas import (
     ImportBatchAccepted,
     JobAccepted,
     PodcastRequest,
+    StudyPackOut,
     VocabItemOut,
 )
 from app.services.article_extract import (
@@ -60,10 +61,13 @@ from app.services.article_extract import (
     article_tts_text,
     clean_article_text,
     clean_images,
+    split_paragraphs,
 )
+from app.services.study_pack import STUDY_VERSION, easy_tts_text, study_text_sig
 from app.workers.tasks import (
     discover_editorial_candidates,
     generate_article_audio,
+    generate_study_pack,
     grade_editorial_outline,
     refresh_editorial_images,
 )
@@ -73,6 +77,12 @@ router = APIRouter(tags=["editorial"])
 _editor_or_admin = require_role("editor", "admin")
 
 _STALE_JOB_AFTER = timedelta(minutes=8)
+# A study pack still "pending" with no worker heartbeat for this long is
+# dead (worker killed mid-way) and is re-queued; a "failed" one is retried
+# after the (longer) cool-down so a persistently failing article doesn't
+# hit Gemini on every page view.
+_STUDY_STALE_AFTER = timedelta(minutes=10)
+_STUDY_RETRY_AFTER = timedelta(minutes=20)
 
 
 def _cover_image_url(images: list[dict] | None) -> str | None:
@@ -81,6 +91,36 @@ def _cover_image_url(images: list[dict] | None) -> str | None:
     shows a picture the article page then hides."""
     cleaned = clean_images(images)
     return cleaned[0]["url"] if cleaned else None
+
+
+def _valid_pack(article: EditorialArticle, cleaned_body: str) -> dict | None:
+    """The stored study pack, only if it was written for exactly this text and
+    prompt version — otherwise it is treated as absent (never shown against
+    paragraphs it doesn't belong to)."""
+    pack = article.study_pack
+    if not pack or pack.get("version") != STUDY_VERSION:
+        return None
+    if pack.get("text_sig") != study_text_sig(cleaned_body):
+        return None
+    if len(pack.get("paragraphs", [])) != len(split_paragraphs(cleaned_body)):
+        return None
+    return pack
+
+
+def _study_state(article: EditorialArticle, cleaned_body: str, now: datetime) -> tuple[str, dict | None, bool]:
+    """(status to report, valid pack or None, whether to queue generation)."""
+    pack = _valid_pack(article, cleaned_body)
+    if pack is not None:
+        return "ready", pack, False
+    if not split_paragraphs(cleaned_body):
+        return "none", None, False
+    status_now = article.study_status or "none"
+    beat = article.study_updated_at
+    if status_now == "pending" and beat is not None and now - beat < _STUDY_STALE_AFTER:
+        return "pending", None, False
+    if status_now == "failed" and beat is not None and now - beat < _STUDY_RETRY_AFTER:
+        return "failed", None, False
+    return "pending", None, True
 
 
 # ------------------------------------------------------------ learner-facing --
@@ -156,6 +196,22 @@ async def get_editorial(article_id: uuid.UUID, db: Annotated[AsyncSession, Depen
         except Exception:  # noqa: BLE001 — reading must never fail because a background fetch could not be queued
             await db.rollback()
 
+    cleaned_body = clean_article_text(article.body_ko)
+    now = datetime.now(timezone.utc)
+    study_status, study_pack, queue_study = _study_state(article, cleaned_body, now)
+    if queue_study:
+        # First read of an article without a (current) study pack: generate
+        # it once in the background; the client polls while it is pending.
+        try:
+            article.study_status = "pending"
+            article.study_updated_at = now
+            db.add(article)
+            await db.commit()
+            generate_study_pack.delay(str(article.id))
+        except Exception:  # noqa: BLE001 — reading must never fail because a background job could not be queued
+            await db.rollback()
+            study_status = "none"
+
     return EditorialArticleOut(
         id=article.id,
         source_name=article.source_name,
@@ -163,13 +219,15 @@ async def get_editorial(article_id: uuid.UUID, db: Annotated[AsyncSession, Depen
         title_ko=article.title_ko,
         level_estimate=article.level_estimate,
         topic_tags=article.topic_tags,
-        body_ko=clean_article_text(article.body_ko),
+        body_ko=cleaned_body,
         vocab=[VocabItemOut.model_validate(v) for v in vocab],
         grammar=[GrammarPointOut.model_validate(g) for g in grammar],
         thinking_guide_text=article.thinking_guide_text,
         created_at=article.created_at,
         images=[ArticleImageOut(**im) for im in clean_images(article.images)],
         images_pending=images_pending,
+        study_status=study_status,
+        study=StudyPackOut.model_validate(study_pack) if study_pack else None,
     )
 
 
@@ -230,13 +288,28 @@ async def request_article_audio(
             "This article hasn't been fully imported yet — its full text isn't available to read aloud.",
         )
 
-    tts_text = article_tts_text(article.title_ko, cleaned_body)
+    if body.variant == "easy":
+        # The simplified-Korean rewrite from the study pack — for beginners.
+        pack = _valid_pack(article, cleaned_body)
+        easy_text = easy_tts_text(article.title_ko, pack) if pack else ""
+        if not easy_text.strip():
+            raise _problem(
+                status.HTTP_409_CONFLICT,
+                "Easy version not ready",
+                "study_not_ready",
+                "The simplified version of this article is still being prepared — try again in a minute.",
+            )
+        tts_text = easy_text
+    else:
+        tts_text = article_tts_text(article.title_ko, cleaned_body)
 
     # Keyed on the exact text voiced + the cleaning-rules version, so a
     # body backfill OR a cleaning-rule change regenerates the recording
     # instead of serving audio for text that no longer matches the screen.
     content_sig = hashlib.sha256(f"{TEXT_CLEAN_VERSION}\n{tts_text}".encode("utf-8")).hexdigest()[:16]
     cache_key = f"article-audio:{article_id}:{body.voice}:{body.prompt_version}:{content_sig}"
+    if body.variant == "easy":
+        cache_key += ":easy"
 
     cached = await db.execute(select(LectureAudio).where(LectureAudio.cache_key == cache_key))
     hit = cached.scalar_one_or_none()
