@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import _problem, get_current_profile
+from app.api.deps import _problem, get_current_profile, get_optional_profile
 from app.db import get_db
 from app.models import (
     CorpusItem,
@@ -33,13 +33,14 @@ from app.schemas import (
     ItemStateOut,
     ItemStateReviewRequest,
     LessonOut,
+    LessonSummaryOut,
     ProfileOut,
     TodayPlanOut,
     TodayPlanTask,
     TopicOut,
     VocabItemOut,
 )
-from app.services.progress import ItemKey, pick_next_lesson
+from app.services.progress import ItemKey, count_mastered, pick_next_lesson
 
 router = APIRouter(tags=["content"])
 
@@ -49,6 +50,72 @@ async def list_topics(db: Annotated[AsyncSession, Depends(get_db)]):
     result = await db.execute(select(Topic).order_by(Topic.name))
     topics = result.scalars().all()
     return [{"id": t.id, "name": t.name, "quizlet_url": t.quizlet_url} for t in topics]
+
+
+async def _lesson_item_keys(db: AsyncSession) -> dict[int, list[ItemKey]]:
+    """lesson id -> the (type, id) of every vocab/grammar item in it. Two
+    narrow bulk queries (ids only); items that belong to no lesson
+    (editorial-article imports) are left out — they are not lesson content."""
+    lesson_items: dict[int, list[ItemKey]] = defaultdict(list)
+    for lesson_id, item_id in (await db.execute(select(VocabItem.lesson_id, VocabItem.id))).all():
+        if lesson_id is not None:
+            lesson_items[lesson_id].append(("vocab_item", item_id))
+    for lesson_id, item_id in (await db.execute(select(GrammarPoint.lesson_id, GrammarPoint.id))).all():
+        if lesson_id is not None:
+            lesson_items[lesson_id].append(("grammar_point", item_id))
+    return lesson_items
+
+
+@router.get("/lessons", response_model=list[LessonSummaryOut])
+async def list_lessons(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile | None, Depends(get_optional_profile)],
+):
+    """The lesson picker: every lesson that has something to study, by level
+    then id. Public; when the caller is signed in each row also carries how
+    many of its items they have mastered, and `is_next` marks the lesson
+    /me/plan would hand them (same rule — app.services.progress)."""
+    lessons = (await db.execute(select(Lesson.id, Lesson.title, Lesson.level).order_by(Lesson.level, Lesson.id))).all()
+    lesson_items = await _lesson_item_keys(db)
+
+    topics: dict[int, list[str]] = defaultdict(list)
+    topic_rows = (
+        await db.execute(
+            select(LessonTopic.lesson_id, Topic.name)
+            .join(Topic, Topic.id == LessonTopic.topic_id)
+            .order_by(Topic.name)
+        )
+    ).all()
+    for lesson_id, name in topic_rows:
+        topics[lesson_id].append(name)
+
+    states: dict[ItemKey, tuple[float, datetime]] | None = None
+    next_id: int | None = None
+    if profile is not None:
+        rows = (await db.execute(select(ItemState).where(ItemState.learner_id == profile.id))).scalars().all()
+        states = {(s.item_type, s.item_id): (s.strength, s.last_seen) for s in rows}
+        picked = pick_next_lesson(lesson_items, states)
+        next_id = picked.lesson_id if picked is not None else None
+
+    out: list[LessonSummaryOut] = []
+    for lesson_id, title, level in lessons:
+        keys = lesson_items.get(lesson_id, [])
+        if not keys:  # nothing to study yet: not a choice worth offering
+            continue
+        vocab_count = sum(1 for kind, _ in keys if kind == "vocab_item")
+        out.append(
+            LessonSummaryOut(
+                id=lesson_id,
+                title=title,
+                level=level,
+                topics=topics.get(lesson_id, []),
+                vocab_count=vocab_count,
+                grammar_count=len(keys) - vocab_count,
+                mastered=count_mastered(keys, states) if states is not None else None,
+                is_next=lesson_id == next_id,
+            )
+        )
+    return out
 
 
 @router.get("/lessons/{lesson_id}", response_model=LessonOut)
@@ -222,13 +289,7 @@ async def get_my_plan(
     # Two narrow bulk queries (ids only) — vocab/grammar that belong to no
     # lesson (editorial-article imports) are left out, they are not lesson
     # content.
-    lesson_items: dict[int, list[ItemKey]] = defaultdict(list)
-    for lesson_id_, v_id in (await db.execute(select(VocabItem.lesson_id, VocabItem.id))).all():
-        if lesson_id_ is not None:
-            lesson_items[lesson_id_].append(("vocab_item", v_id))
-    for lesson_id_, g_id in (await db.execute(select(GrammarPoint.lesson_id, GrammarPoint.id))).all():
-        if lesson_id_ is not None:
-            lesson_items[lesson_id_].append(("grammar_point", g_id))
+    lesson_items = await _lesson_item_keys(db)
 
     picked = pick_next_lesson(lesson_items, {(s.item_type, s.item_id): (s.strength, s.last_seen) for s in states})
     lesson = await db.get(Lesson, picked.lesson_id) if picked is not None else None

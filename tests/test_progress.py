@@ -1,6 +1,7 @@
 """Progress logic: which lesson a learner sees next (pure function), and the
-two routes that use it — /progress/reviews rejects unknown items, /me/plan
-follows the learner's own progress. DB session is faked (no Postgres)."""
+routes that use it — /progress/reviews rejects unknown items, /me/plan and the
+lesson picker (/lessons) follow the learner's own progress. DB session is
+faked (no Postgres)."""
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -9,9 +10,10 @@ from unittest import mock
 
 from fastapi import HTTPException
 
+from app.api import deps
 from app.api.routers import content
 from app.schemas import ItemStateReviewRequest
-from app.services.progress import MASTERY_THRESHOLD, is_mastered, pick_next_lesson
+from app.services.progress import MASTERY_THRESHOLD, count_mastered, is_mastered, pick_next_lesson
 
 NOW = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
 
@@ -190,6 +192,94 @@ class PlanTests(unittest.IsolatedAsyncioTestCase):
         (task,) = plan.tasks
         self.assertEqual((task.lesson_id, task.status), (1, "in_progress"))
         self.assertEqual(task.subtitle, "3 từ/ngữ pháp · đã thuộc 1/3 · đã ôn 2/3 hôm nay")
+
+
+class CountMasteredTests(unittest.TestCase):
+    def test_counts_only_mastered_items_of_the_given_lesson(self):
+        states = {
+            ("vocab_item", 1): (1.0, NOW),
+            ("vocab_item", 2): (0.4, NOW),
+            ("vocab_item", 99): (1.0, NOW),  # not in this lesson
+        }
+        items = [("vocab_item", 1), ("vocab_item", 2), ("grammar_point", 1)]
+        self.assertEqual(count_mastered(items, states), 1)
+        self.assertEqual(count_mastered(items, {}), 0)
+
+
+class LessonListTests(unittest.IsolatedAsyncioTestCase):
+    LESSONS = [(1, "Gia đình", 1), (2, "Công việc", 1), (3, "Bài trống", 2), (4, "Du lịch", 3)]
+    VOCAB = [(1, 1), (1, 2), (2, 3), (4, 4), (None, 50)]  # 50: article vocab, no lesson
+    GRAMMAR = [(1, 1), (4, 2)]
+    TOPICS = [(1, "Gia đình"), (1, "Xã hội"), (4, "Du lịch")]
+
+    def _db(self, states):
+        db = mock.MagicMock()
+
+        async def execute(stmt):
+            text = str(stmt)
+            res = mock.MagicMock()
+            if "lesson_topic" in text:
+                res.all.return_value = self.TOPICS
+            elif "FROM content.vocab_item" in text:
+                res.all.return_value = self.VOCAB
+            elif "FROM content.grammar_point" in text:
+                res.all.return_value = self.GRAMMAR
+            elif "FROM item_state" in text:
+                res.scalars.return_value.all.return_value = states
+            else:  # the lessons themselves
+                res.all.return_value = self.LESSONS
+            return res
+
+        db.execute = execute
+        return db
+
+    def _state(self, item_type, item_id, strength):
+        return SimpleNamespace(item_type=item_type, item_id=item_id, strength=strength, last_seen=NOW)
+
+    async def test_anonymous_gets_the_list_without_personal_fields(self):
+        rows = await content.list_lessons(self._db([]), None)
+        self.assertEqual([r.id for r in rows], [1, 2, 4])  # lesson 3 has nothing to study
+        first = rows[0]
+        self.assertEqual((first.title, first.vocab_count, first.grammar_count), ("Gia đình", 2, 1))
+        self.assertEqual(first.topics, ["Gia đình", "Xã hội"])
+        self.assertEqual(rows[1].topics, [])
+        self.assertTrue(all(r.mastered is None and r.is_next is False for r in rows))
+
+    async def test_new_learner_is_pointed_at_the_first_lesson(self):
+        rows = await content.list_lessons(self._db([]), SimpleNamespace(id=uuid.uuid4()))
+        self.assertEqual([(r.id, r.mastered, r.is_next) for r in rows], [(1, 0, True), (2, 0, False), (4, 0, False)])
+
+    async def test_finished_lesson_moves_the_marker_on_and_counts_mastered(self):
+        states = [
+            self._state("vocab_item", 1, 0.8),
+            self._state("vocab_item", 2, 1.0),
+            self._state("grammar_point", 1, 0.8),
+            self._state("vocab_item", 3, 0.2),  # lesson 2: started, not mastered
+        ]
+        rows = await content.list_lessons(self._db(states), SimpleNamespace(id=uuid.uuid4()))
+        by_id = {r.id: r for r in rows}
+        self.assertEqual(by_id[1].mastered, 3)
+        self.assertEqual(by_id[2].mastered, 0)
+        self.assertEqual([r.id for r in rows if r.is_next], [2])
+
+
+class OptionalProfileTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_token_is_anonymous(self):
+        self.assertIsNone(await deps.get_optional_profile(None, mock.MagicMock()))
+
+    async def test_bad_token_is_anonymous_not_a_401(self):
+        creds = SimpleNamespace(credentials="junk")
+        with mock.patch.object(deps, "decode_token", side_effect=ValueError("bad")):
+            self.assertIsNone(await deps.get_optional_profile(creds, mock.MagicMock()))
+
+    async def test_valid_token_loads_the_profile(self):
+        pid = uuid.uuid4()
+        profile = SimpleNamespace(id=pid)
+        db = mock.MagicMock()
+        db.get = mock.AsyncMock(return_value=profile)
+        with mock.patch.object(deps, "decode_token", return_value={"sub": str(pid)}):
+            got = await deps.get_optional_profile(SimpleNamespace(credentials="ok"), db)
+        self.assertIs(got, profile)
 
 
 if __name__ == "__main__":

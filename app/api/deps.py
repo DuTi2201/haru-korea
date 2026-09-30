@@ -40,6 +40,23 @@ async def get_current_profile(
     return profile
 
 
+async def get_optional_profile(
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Profile | None:
+    """Like get_current_profile, but a caller with no (or an expired) token is
+    simply anonymous — None, never a 401. For public routes that only
+    personalise the answer when they know who is asking."""
+    if creds is None:
+        return None
+    try:
+        claims = decode_token(creds.credentials)
+        profile_id = uuid.UUID(claims["sub"])
+    except (ValueError, KeyError):
+        return None
+    return await db.get(Profile, profile_id)
+
+
 async def get_current_profile_sse(
     db: Annotated[AsyncSession, Depends(get_db)],
     creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,

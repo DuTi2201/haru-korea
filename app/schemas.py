@@ -210,6 +210,23 @@ class LessonOut(BaseModel):
     grammar: list[GrammarPointOut]
 
 
+class LessonSummaryOut(BaseModel):
+    """One row of the lesson picker (GET /lessons): enough to choose a lesson
+    without fetching its whole content."""
+
+    id: int
+    title: str
+    level: int
+    topics: list[str]
+    vocab_count: int
+    grammar_count: int
+    # Items of this lesson the signed-in learner has mastered; None when the
+    # caller is anonymous (nothing to report — not "0").
+    mastered: int | None = None
+    # True for the lesson /me/plan would hand this learner next (never for anonymous callers).
+    is_next: bool = False
+
+
 class CorpusItemOut(BaseModel):
     id: uuid.UUID
     film_id: int

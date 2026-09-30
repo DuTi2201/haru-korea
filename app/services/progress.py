@@ -35,6 +35,11 @@ class LessonProgress:
         return self.total > 0 and self.mastered >= self.total
 
 
+def count_mastered(items: Sequence[ItemKey], states: Mapping[ItemKey, tuple[float, datetime]]) -> int:
+    """How many of `items` the learner has mastered (items never reviewed count as not)."""
+    return sum(1 for key in items if (state := states.get(key)) is not None and is_mastered(state[0]))
+
+
 def pick_next_lesson(
     lessons: Mapping[int, Sequence[ItemKey]],
     states: Mapping[ItemKey, tuple[float, datetime]],
