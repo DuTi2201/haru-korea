@@ -189,5 +189,114 @@ class QueueTests(unittest.TestCase):
         self.assertEqual((q.due, q.new, q.due_total), ([], [], 0))
 
 
+class LeechTests(unittest.TestCase):
+    def test_forgotten_twice_and_not_yet_back_on_its_feet_is_a_leech(self):
+        self.assertTrue(srs.is_leech(Schedule(lapses=2, reps=0)))
+        self.assertTrue(srs.is_leech(Schedule(lapses=3, reps=2)))
+
+    def test_forgotten_once_is_shaky_but_not_a_leech(self):
+        s = Schedule(lapses=1, reps=0)
+        self.assertFalse(srs.is_leech(s))
+        self.assertTrue(srs.is_shaky(s))
+
+    def test_three_right_answers_in_a_row_make_it_well_again(self):
+        s = Schedule(lapses=4, reps=3)
+        self.assertFalse(srs.is_leech(s))
+        self.assertFalse(srs.is_shaky(s))
+
+    def test_a_card_never_forgotten_is_neither(self):
+        self.assertFalse(srs.is_leech(Schedule()))
+        self.assertFalse(srs.is_shaky(Schedule()))
+
+    def test_a_leech_goes_before_a_card_that_is_more_overdue(self):
+        lessons = {1: vocab(1, 2, 3)}
+        s = {
+            ("vocab_item", 1): Schedule(reps=1, due_at=NOW - 5 * DAY),
+            ("vocab_item", 2): Schedule(reps=0, lapses=2, due_at=NOW - timedelta(minutes=10)),
+            ("vocab_item", 3): Schedule(reps=1, due_at=NOW - 2 * DAY),
+        }
+        self.assertEqual(build_queue(s, lessons, NOW).due, vocab(2, 1, 3))
+
+    def test_a_leech_is_not_cut_by_the_limit_while_other_cards_are(self):
+        lessons = {1: vocab(*range(1, 8))}
+        s = {("vocab_item", i): Schedule(reps=1, due_at=NOW - i * DAY) for i in range(1, 7)}
+        s[("vocab_item", 7)] = Schedule(reps=0, lapses=2, due_at=NOW - timedelta(minutes=1))
+        q = build_queue(s, lessons, NOW, limit=3)
+        self.assertEqual(q.due[0], ("vocab_item", 7))
+        self.assertEqual(q.due_total, 7)
+
+    def test_weak_keys_lists_the_most_forgotten_first_due_or_not(self):
+        s = {
+            ("vocab_item", 1): Schedule(lapses=1, reps=0, strength=0.0, due_at=NOW + 3 * DAY),
+            ("vocab_item", 2): Schedule(lapses=3, reps=1, strength=0.2, due_at=NOW + DAY),
+            ("grammar_point", 1): Schedule(lapses=3, reps=0, strength=0.0, due_at=NOW - DAY),
+            ("vocab_item", 3): Schedule(lapses=0, reps=5, strength=1.0),
+            ("vocab_item", 4): Schedule(lapses=5, reps=4, strength=1.0),  # well again
+            ("vocab_item", 99): Schedule(lapses=9, reps=0),  # no longer exists
+        }
+        existing = {k for k in s if k != ("vocab_item", 99)}
+        self.assertEqual(
+            srs.weak_keys(s, existing), [("grammar_point", 1), ("vocab_item", 2), ("vocab_item", 1)]
+        )
+        self.assertEqual(srs.weak_keys(s, existing, limit=1), [("grammar_point", 1)])
+
+
+class ArticleWordTests(unittest.TestCase):
+    LESSONS = {1: vocab(1, 2, 3, 4, 5, 6, 7, 8, 9) + grammar(1, 2)}
+    ARTICLES = {"a-new": vocab(101, 102, 103), "a-old": vocab(201, 202)}
+
+    def test_about_one_new_card_in_four_is_an_article_word(self):
+        q = build_queue({}, self.LESSONS, NOW, articles=self.ARTICLES)
+        words = [k for k in q.new if k[1] > 100]
+        self.assertEqual(len(q.new), 8)
+        self.assertEqual(words, vocab(101, 102))  # budget 8 // 4
+        self.assertEqual(len([k for k in q.new if k[0] == "grammar_point"]), 2)
+        self.assertEqual(len([k for k in q.new if k[0] == "vocab_item" and k[1] < 100]), 4)
+
+    def test_the_words_of_one_article_come_before_the_next_articles(self):
+        q = build_queue({}, {}, NOW, articles=self.ARTICLES, new_limit=8)
+        self.assertEqual(q.new, vocab(101, 102, 103, 201, 202))
+
+    def test_article_words_fill_the_day_when_the_lessons_run_out(self):
+        q = build_queue({}, {1: vocab(1, 2) + grammar(1)}, NOW, articles=self.ARTICLES, new_limit=8)
+        self.assertEqual(len(q.new), 8)  # the 3 lesson cards plus all 5 article words
+        self.assertEqual(sorted(k[1] for k in q.new if k[1] > 100), [101, 102, 103, 201, 202])
+
+    def test_a_small_cap_has_no_article_word_until_the_lessons_are_done(self):
+        q = build_queue({}, self.LESSONS, NOW, articles=self.ARTICLES, new_limit=3)
+        self.assertEqual(q.new, vocab(1, 2, 3))
+
+    def test_a_word_already_started_is_not_offered_again_but_is_scheduled(self):
+        started = {("vocab_item", 101): Schedule(reps=1, introduced_at=NOW - 3 * DAY, due_at=NOW - DAY)}
+        q = build_queue(started, self.LESSONS, NOW, articles=self.ARTICLES)
+        self.assertEqual(q.due, vocab(101))
+        self.assertNotIn(("vocab_item", 101), q.new)
+        self.assertEqual(q.article_waiting, 4)
+
+    def test_a_word_of_an_article_that_is_gone_is_not_due(self):
+        s = {("vocab_item", 555): Schedule(reps=1, due_at=NOW - DAY)}
+        self.assertEqual(build_queue(s, self.LESSONS, NOW, articles=self.ARTICLES).due, [])
+
+    def test_without_articles_nothing_changes(self):
+        self.assertEqual(
+            build_queue({}, self.LESSONS, NOW).new, build_queue({}, self.LESSONS, NOW, articles={}).new
+        )
+
+    def test_words_held_back_for_level_are_not_started_but_a_started_one_stays_scheduled(self):
+        hold = {("vocab_item", 102), ("vocab_item", 201)}
+        started = {("vocab_item", 102): Schedule(reps=1, introduced_at=NOW - 3 * DAY, due_at=NOW - DAY)}
+        q = build_queue(started, {}, NOW, articles=self.ARTICLES, hold=hold, new_limit=8)
+        self.assertEqual(q.due, vocab(102))
+        self.assertEqual(q.new, vocab(101, 103, 202))
+        self.assertEqual(q.article_waiting, 3)
+
+    def test_the_level_cap_follows_the_goal(self):
+        self.assertEqual(srs.article_level_cap("topik1"), 2)
+        self.assertEqual(srs.article_level_cap("topik4"), 4)
+        self.assertEqual(srs.article_level_cap("topik6"), 6)
+        self.assertEqual(srs.article_level_cap(None), srs.DEFAULT_ARTICLE_LEVEL_CAP)
+        self.assertEqual(srs.article_level_cap("something else"), srs.DEFAULT_ARTICLE_LEVEL_CAP)
+
+
 if __name__ == "__main__":
     unittest.main()

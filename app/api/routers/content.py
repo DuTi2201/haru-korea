@@ -7,6 +7,7 @@ each grows past a handful of routes.
 import time
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 
@@ -20,6 +21,7 @@ from app.models import (
     CorpusItem,
     EditorialArticle,
     EditorialOutlineSubmission,
+    ErrorLog,
     Film,
     GrammarPoint,
     ItemState,
@@ -53,7 +55,7 @@ from app.schemas import (
     TopicOut,
     VocabItemOut,
 )
-from app.services import corpus_browse, srs
+from app.services import corpus_browse, srs, weakness
 from app.services.corpus_browse import Sentence
 from app.services.exercises import build_cloze
 from app.services.progress import ItemKey, count_mastered, pick_next_lesson
@@ -80,6 +82,55 @@ async def _lesson_item_keys(db: AsyncSession) -> dict[int, list[ItemKey]]:
         if lesson_id is not None:
             lesson_items[lesson_id].append(("grammar_point", item_id))
     return lesson_items
+
+
+@dataclass
+class ArticleWords:
+    """The vocabulary of the confirmed news articles, newest article first.
+    `keys` is every word that exists; `hold` the ones above the learner's level
+    (not started as new cards), `title_of` / `article_of` say where a word came from."""
+
+    keys: dict[str, list[ItemKey]] = field(default_factory=dict)
+    hold: set[ItemKey] = field(default_factory=set)
+    title_of: dict[str, str] = field(default_factory=dict)
+    article_of: dict[int, str] = field(default_factory=dict)
+
+
+async def _article_words(db: AsyncSession, level_cap: int) -> ArticleWords:
+    """Words of the articles a human has confirmed. A word that was rolled back is
+    left out (it no longer exists); a word shared by two articles belongs to the
+    newer one. Words above `level_cap` stay in `keys` but are listed in `hold`."""
+    out = ArticleWords()
+    rows = (
+        await db.execute(
+            select(
+                EditorialArticle.id,
+                EditorialArticle.title_ko,
+                EditorialArticle.source_name,
+                EditorialArticle.vocab_ids,
+            )
+            .where(EditorialArticle.body_ko.isnot(None), func.cardinality(EditorialArticle.vocab_ids) > 0)
+            .order_by(EditorialArticle.created_at.desc())
+        )
+    ).all()
+    if not rows:
+        return out
+    wanted = {vid for _, _, _, vocab_ids in rows for vid in vocab_ids}
+    level_of = dict(
+        (await db.execute(select(VocabItem.id, VocabItem.level).where(VocabItem.id.in_(wanted)))).all()
+    )
+    for article_id, title, source_name, vocab_ids in rows:
+        key = str(article_id)
+        words = [vid for vid in vocab_ids if vid in level_of and vid not in out.article_of]
+        if not words:
+            continue
+        out.keys[key] = [("vocab_item", vid) for vid in words]
+        out.title_of[key] = title or source_name
+        for vid in words:
+            out.article_of[vid] = key
+            if level_of[vid] > level_cap:
+                out.hold.add(("vocab_item", vid))
+    return out
 
 
 @router.get("/lessons", response_model=list[LessonSummaryOut])
@@ -432,12 +483,14 @@ async def record_item_review(
     """A learner's quick in-app check. It nudges ItemState.strength (SRS §5
     ITEM_STATE's decay-style nudge, the readiness signal) and moves the item's
     review schedule (app.services.srs: when it is due again, how often it was
-    forgotten). The item must exist: item_id has no FK (content lives in
-    another schema), so without this check a typo'd or made-up id would
-    quietly become a phantom ItemState row that skews the learner's streak
-    and readiness."""
+    forgotten). A wrong answer is also written to the error log, so the same
+    mistake can be found again (app.services.weakness). The item must exist:
+    item_id has no FK (content lives in another schema), so without this check a
+    typo'd or made-up id would quietly become a phantom ItemState row that skews
+    the learner's streak and readiness."""
     content_model = VocabItem if body.item_type == "vocab_item" else GrammarPoint
-    if (await db.execute(select(content_model.id).where(content_model.id == body.item_id))).first() is None:
+    row = (await db.execute(select(content_model).where(content_model.id == body.item_id))).scalar_one_or_none()
+    if row is None:
         raise _problem(status.HTTP_404_NOT_FOUND, "Item not found", "not_found")
 
     existing = await db.execute(
@@ -461,9 +514,33 @@ async def record_item_review(
     state.due_at = after.due_at
     state.introduced_at = after.introduced_at
     state.last_seen = now
+    if not body.correct:
+        db.add(_error_for(profile.id, body, row))
     await db.commit()
     await db.refresh(state)
     return state
+
+
+def _error_for(learner_id: uuid.UUID, body: ItemStateReviewRequest, row: VocabItem | GrammarPoint) -> ErrorLog:
+    """The error-log row for a wrong review answer."""
+    mode = body.mode or "recognize"
+    is_vocab = isinstance(row, VocabItem)
+    detail: dict[str, str] = {}
+    if body.chosen:
+        detail["chosen"] = body.chosen
+    family = getattr(row, "family", None)
+    if family:
+        detail["family"] = family
+    return ErrorLog(
+        learner_id=learner_id,
+        skill="vocab" if is_vocab else "grammar",
+        error_type=weakness.error_type_for_review(body.item_type, mode, bool(getattr(row, "node_word", None))),
+        example_ko=row.hangul if is_vocab else row.pattern,
+        item_type=body.item_type,
+        item_id=body.item_id,
+        mode=mode,
+        detail=detail or None,
+    )
 
 
 def _schedule_of(state: ItemState) -> srs.Schedule:
@@ -484,20 +561,34 @@ async def get_review_queue(
     profile: Annotated[Profile, Depends(get_current_profile)],
     limit: Annotated[int, Query(ge=1, le=60)] = srs.DEFAULT_REVIEW_LIMIT,
     new: Annotated[int, Query(ge=0, le=30)] = srs.DEFAULT_NEW_PER_DAY,
+    focus: Annotated[Literal["due", "weak"], Query()] = "due",
 ):
-    """Today's sitting: the cards that are due (most overdue first), then new
-    ones from the earliest lessons that still have unseen cards, at most `new`
-    per rolling 24 hours (about one grammar point in four). A due vocabulary
-    card that has been answered right before is asked as a fill-in-the-blank
-    when one can be built from it (app.services.exercises); a new, forgotten or
-    grammar card is shown for the ordinary flip-and-judge review. Lesson content
-    only — words that belong to no lesson (editorial articles) are reviewed in
-    their own page."""
+    """Today's sitting: the cards that are due (cards the learner keeps forgetting
+    first, then the most overdue), then new ones — from the earliest lessons that
+    still have unseen cards, plus words from the confirmed news articles that fit
+    the learner's goal level — at most `new` per rolling 24 hours (about one
+    grammar point and one article word in four). A due vocabulary card that has
+    been answered right before is asked as a fill-in-the-blank when one can be
+    built from it (app.services.exercises); a new, forgotten or grammar card is
+    shown for the ordinary flip-and-judge review.
+
+    `focus=weak` is practice on demand instead: the cards the learner keeps
+    forgetting, due or not (an answer before the due time still counts for
+    strength and the error log, but does not push the schedule out)."""
     now = datetime.now(timezone.utc)
     states = (await db.execute(select(ItemState).where(ItemState.learner_id == profile.id))).scalars().all()
     lesson_items = await _lesson_item_keys(db)
+    articles = await _article_words(db, srs.article_level_cap(profile.goal))
     schedules = {(s.item_type, s.item_id): _schedule_of(s) for s in states}
-    queue = srs.build_queue(schedules, lesson_items, now, limit=limit, new_limit=new)
+    if focus == "weak":
+        existing = {key for keys in lesson_items.values() for key in keys}
+        existing |= {key for keys in articles.keys.values() for key in keys}
+        weak = srs.weak_keys(schedules, existing, limit=limit)
+        queue = srs.Queue(due=weak, due_total=len(srs.weak_keys(schedules, existing, limit=10_000)))
+    else:
+        queue = srs.build_queue(
+            schedules, lesson_items, now, limit=limit, new_limit=new, articles=articles.keys, hold=articles.hold
+        )
 
     keys = [*queue.due, *queue.new]
     vocab_ids = [i for t, i in keys if t == "vocab_item"]
@@ -517,6 +608,13 @@ async def get_review_queue(
         titles = dict((await db.execute(select(Lesson.id, Lesson.title).where(Lesson.id.in_(lesson_ids)))).all())
         for v in (await db.execute(select(VocabItem).where(VocabItem.lesson_id.in_(lesson_ids)))).scalars().all():
             mates[v.lesson_id].append(v)
+    # an article word's mates, for the fill-in-the-blank, are the other words of its article
+    article_mates: dict[str, list[VocabItem]] = defaultdict(list)
+    article_ids = {articles.article_of[v.id] for v in vocab.values() if v.id in articles.article_of}
+    if article_ids:
+        wanted = [vid for aid in article_ids for _, vid in articles.keys.get(aid, [])]
+        for v in (await db.execute(select(VocabItem).where(VocabItem.id.in_(wanted)))).scalars().all():
+            article_mates[articles.article_of[v.id]].append(v)
 
     items: list[ReviewQueueItem] = []
     due_keys = set(queue.due)
@@ -526,9 +624,11 @@ async def get_review_queue(
             continue
         schedule = schedules.get((item_type, item_id))
         is_new = (item_type, item_id) not in due_keys
+        article_id = articles.article_of.get(item_id) if item_type == "vocab_item" and row.lesson_id is None else None
         cloze = None
         if item_type == "vocab_item" and not is_new and schedule is not None and schedule.reps >= 1:
-            built = build_cloze(row, mates.get(row.lesson_id, []), seed=f"{profile.id}:{item_id}:{schedule.reps}")
+            pool = article_mates.get(article_id, []) if article_id else mates.get(row.lesson_id, [])
+            built = build_cloze(row, pool, seed=f"{profile.id}:{item_id}:{schedule.reps}")
             if built is not None:
                 cloze = ClozeOut(prompt_ko=built.prompt_ko, answer=built.answer, choices=list(built.choices))
         items.append(
@@ -539,8 +639,11 @@ async def get_review_queue(
                 mode="cloze" if cloze is not None else "recognize",
                 reps=schedule.reps if schedule else 0,
                 lapses=schedule.lapses if schedule else 0,
+                leech=bool(schedule and srs.is_leech(schedule)),
                 due_at=schedule.due_at if schedule else None,
                 lesson_title=titles.get(row.lesson_id) if row.lesson_id else None,
+                article_id=uuid.UUID(article_id) if article_id else None,
+                article_title=articles.title_of.get(article_id) if article_id else None,
                 vocab=VocabItemOut.model_validate(row) if item_type == "vocab_item" else None,
                 grammar=GrammarPointOut.model_validate(row) if item_type == "grammar_point" else None,
                 cloze=cloze,
@@ -551,6 +654,11 @@ async def get_review_queue(
         new_available=queue.new_budget,
         new_today=queue.new_today,
         items=items,
+        focus=focus,
+        article_waiting=queue.article_waiting,
+        article_above_level=sum(
+            1 for key in articles.hold if key not in schedules
+        ),
     )
 
 
@@ -596,8 +704,16 @@ async def get_my_plan(
     # -- today's review sitting (the /review screen): cards that are due plus the
     # day's new ones, counted by the same rule that builds the queue itself.
     now = datetime.now(timezone.utc)
-    queue = srs.build_queue({(s.item_type, s.item_id): _schedule_of(s) for s in states}, lesson_items, now)
+    articles = await _article_words(db, srs.article_level_cap(profile.goal))
+    queue = srs.build_queue(
+        {(s.item_type, s.item_id): _schedule_of(s) for s in states},
+        lesson_items,
+        now,
+        articles=articles.keys,
+        hold=articles.hold,
+    )
     lesson_keys_all = {key for keys in lesson_items.values() for key in keys}
+    lesson_keys_all |= {key for keys in articles.keys.values() for key in keys}
     studied_today = sum(
         1
         for s in states

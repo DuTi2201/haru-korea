@@ -354,6 +354,10 @@ class ItemStateReviewRequest(BaseModel):
     item_type: Literal["vocab_item", "grammar_point"]
     item_id: int
     correct: bool
+    # How the card was asked and, for a wrong fill-in-the-blank, what was picked.
+    # Optional (older clients send neither); they only enrich the error log.
+    mode: Literal["recognize", "cloze"] | None = None
+    chosen: str | None = Field(default=None, max_length=120)
 
 
 class ItemStateOut(BaseModel):
@@ -387,8 +391,12 @@ class ReviewQueueItem(BaseModel):
     mode: Literal["recognize", "cloze"]
     reps: int
     lapses: int
+    leech: bool = False  # forgotten again and again: shown first, flagged "hay sai"
     due_at: datetime | None = None
     lesson_title: str | None = None
+    # A word that comes from a news article rather than a lesson.
+    article_id: uuid.UUID | None = None
+    article_title: str | None = None
     vocab: VocabItemOut | None = None
     grammar: GrammarPointOut | None = None
     cloze: ClozeOut | None = None
@@ -401,6 +409,154 @@ class ReviewQueueOut(BaseModel):
     new_available: int  # new cards today's cap still allows
     new_today: int  # new cards started in the last 24 hours
     items: list[ReviewQueueItem]
+    focus: Literal["due", "weak"] = "due"  # "weak": the cards the learner keeps forgetting, due or not
+    article_waiting: int = 0  # article words not started yet that fit the learner's level
+    article_above_level: int = 0  # article words held back because they are above the goal level
+
+
+# ------------------------------------------------------- practice: weak spots --
+class WeakTypeOut(BaseModel):
+    error_type: str
+    label: str
+    skill: str
+    count: int
+
+
+class WeakItemOut(BaseModel):
+    item_type: Literal["vocab_item", "grammar_point"]
+    item_id: int
+    title: str  # the chunk or the grammar pattern
+    meaning_vi: str
+    family: str | None = None
+    errors: int
+
+
+class WeakFamilyOut(BaseModel):
+    family: str
+    errors: int
+
+
+class ExamAccuracyOut(BaseModel):
+    qtype_code: str
+    name: str
+    attempts: int
+    correct: int
+    accuracy_pct: int
+
+
+class WeaknessesOut(BaseModel):
+    """Where the learner keeps going wrong in the last `days` days — counts of what
+    happened, never a prediction of an exam score."""
+
+    days: int
+    total_errors: int
+    by_type: list[WeakTypeOut]
+    top_items: list[WeakItemOut]  # cards that went wrong more than once
+    families: list[WeakFamilyOut]  # sets ("họ từ") the mistakes gather in
+    exam: list[ExamAccuracyOut]  # per question type, weakest first
+    weak_cards: int  # cards forgotten and not yet back on their feet ("Ôn thẻ hay sai")
+    leeches: int  # of those, forgotten twice or more
+    exam_ready: int  # confirmed reading questions available for the mini-drill
+
+
+# ------------------------------------------------------ practice: exam drill --
+class ExamDrillQuestion(BaseModel):
+    id: uuid.UUID
+    number: int
+    qtype_code: str
+    qtype_name_vi: str
+    stem_ko: str
+    options: list[str]
+    passage_ko: str | None = None
+    paper_label: str
+
+
+class ExamDrillOut(BaseModel):
+    items: list[ExamDrillQuestion]
+    available: int  # usable questions in the bank, whether or not they are offered now
+
+
+class ExamAnswerRequest(BaseModel):
+    item_id: uuid.UUID
+    chosen: int = Field(ge=1, le=5)  # 1-based, like the key
+
+
+class ExamAnswerOut(BaseModel):
+    item_id: uuid.UUID
+    chosen: int
+    answer: int
+    correct: bool
+
+
+# ---------------------------------------------------- practice: writing drill --
+class WritingBlankView(BaseModel):
+    label: str
+    intent_vi: str
+    uses: list[str] = Field(default_factory=list)
+
+
+class WritingTargetOut(BaseModel):
+    item_id: int
+    hangul: str
+    meaning_vi: str
+
+
+class WritingPromptOut(BaseModel):
+    """The exercise as the learner sees it. The model answers are not here — they
+    come with the result."""
+
+    text_type: str | None = None
+    title_ko: str | None = None
+    body_ko: str
+    register: str | None = None
+    blanks: list[WritingBlankView]
+    targets: list[WritingTargetOut] = Field(default_factory=list)
+
+
+class WritingFixOut(BaseModel):
+    original: str
+    corrected: str = ""
+    category: str
+    reason_vi: str
+    source: Literal["ai", "auto"]
+
+
+class WritingBlankResultOut(BaseModel):
+    label: str
+    answer: str
+    verdict: Literal["good", "minor", "off", "unchecked"]
+    comment_vi: str = ""
+    fixes: list[WritingFixOut] = Field(default_factory=list)
+    model_answer: str
+    alt_answers: list[str] = Field(default_factory=list)
+    intent_vi: str
+
+
+class WritingResultOut(BaseModel):
+    blanks: list[WritingBlankResultOut]
+    ai_checked: bool
+    note: str
+
+
+class WritingDrillOut(BaseModel):
+    id: uuid.UUID
+    status: Literal["pending", "ready", "failed"]  # the exercise being made
+    grade_status: Literal["none", "pending", "ready", "failed"]  # the answers being checked
+    job_id: uuid.UUID | None = None
+    prompt: WritingPromptOut | None = None
+    answers: dict[str, str] | None = None
+    result: WritingResultOut | None = None
+    created_at: datetime
+
+
+class WritingDrillStartOut(BaseModel):
+    drill_id: uuid.UUID
+    status: Literal["pending", "ready", "failed"]
+    job_id: uuid.UUID | None = None  # follow it with the jobs API while status is "pending"
+
+
+class WritingAnswersRequest(BaseModel):
+    answers: dict[Literal["㉠", "㉡"], str]  # one sentence per blank; each at most 200 characters
 
 
 class TodayPlanTask(BaseModel):

@@ -496,14 +496,69 @@ class ItemState(Base):
 
 
 class ErrorLog(Base):
+    """One wrong answer, kept so the same mistake can be found again: a review
+    card answered wrong (`item_type`/`item_id` say which card, `mode` how it was
+    asked), an exam question answered wrong (`error_type` is its question type)
+    or a writing slip (`error_type` is the kind of slip). `app.services.weakness`
+    turns these rows into the "điểm yếu" report and the weak-card queue."""
+
     __tablename__ = "error_log"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     learner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id"))
-    skill: Mapped[str] = mapped_column(String(32))
+    skill: Mapped[str] = mapped_column(String(32))  # vocab | grammar | đọc | nghe | viết
     error_type: Mapped[str] = mapped_column(String(64))
     example_ko: Mapped[str] = mapped_column(Text)
+    item_type: Mapped[str | None] = mapped_column(String(16), nullable=True)  # vocab_item | grammar_point
+    item_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mode: Mapped[str | None] = mapped_column(String(16), nullable=True)  # recognize | cloze | exam | writing
+    detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # what was chosen, the right answer…
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ExamAttempt(Base):
+    """A learner's answer to one real exam question (the mini-drill). Kept for
+    right answers too, so a question type's accuracy can be shown and a question
+    answered right recently is not asked again straight away."""
+
+    __tablename__ = "exam_attempt"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    learner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), index=True
+    )
+    exam_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("content.exam_item.id", ondelete="CASCADE")
+    )
+    chosen: Mapped[int] = mapped_column(SmallInteger)  # 1-based, like ExamItem.answer
+    correct: Mapped[bool] = mapped_column(Boolean)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class WritingDrill(Base):
+    """One "viết câu 51–52" exercise built from the learner's own cards: a short
+    practical text with two blanks (㉠ ㉡), what the learner wrote for them, and
+    the check of that. `status` is the generation of the text (pending → ready |
+    failed), `grade_status` the check of the answers (none → pending → ready |
+    failed). The JSON columns are shaped by app.services.writing_drill."""
+
+    __tablename__ = "writing_drill"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    learner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), index=True
+    )
+    source_items: Mapped[list] = mapped_column(JSONB, default=list)  # [{"item_type", "item_id"}]
+    job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # the running generate/grade job
+    prompt: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    answers: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", server_default="pending")
+    grade_status: Mapped[str] = mapped_column(String(16), default="none", server_default="none")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 # ------------------------------------------------------------------ writing --

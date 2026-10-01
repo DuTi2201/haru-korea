@@ -12,6 +12,7 @@ from fastapi import HTTPException
 
 from app.api import deps
 from app.api.routers import content
+from app.models import ErrorLog, GrammarPoint, ItemState, VocabItem
 from app.schemas import ItemStateReviewRequest
 from app.services.progress import MASTERY_THRESHOLD, count_mastered, is_mastered, pick_next_lesson
 
@@ -88,7 +89,8 @@ def _rows(rows):
 
 
 class RecordReviewTests(unittest.IsolatedAsyncioTestCase):
-    def _db(self, *, item_exists):
+    def _db(self, *, item_exists, row=None):
+        row = row or SimpleNamespace(id=1)
         db = mock.MagicMock()
         db.add = mock.MagicMock()
         db.commit = mock.AsyncMock()
@@ -99,8 +101,8 @@ class RecordReviewTests(unittest.IsolatedAsyncioTestCase):
             res = mock.MagicMock()
             if "item_state" in text:
                 res.scalar_one_or_none.return_value = None
-            else:  # existence probe on the vocab/grammar table
-                res.first.return_value = (1,) if item_exists else None
+            else:  # the vocab/grammar row itself
+                res.scalar_one_or_none.return_value = row if item_exists else None
             return res
 
         db.execute = execute
@@ -124,6 +126,53 @@ class RecordReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(created.strength, 0.2)
         db.commit.assert_awaited_once()
 
+    def _added(self, db):
+        return [c.args[0] for c in db.add.call_args_list]
+
+    async def test_a_right_answer_writes_no_error(self):
+        db = self._db(item_exists=True, row=VocabItem(id=1, hangul="비가 오다", meaning_vi="m", level=1))
+        body = ItemStateReviewRequest(item_type="vocab_item", item_id=1, correct=True, mode="cloze")
+        await content.record_item_review(body, db, SimpleNamespace(id=uuid.uuid4()))
+        self.assertEqual([type(x) for x in self._added(db)], [ItemState])
+
+    async def test_a_wrong_blank_on_a_chunk_is_logged_as_a_collocation_mistake(self):
+        row = VocabItem(id=1, hangul="비가 오다", meaning_vi="m", level=1, node_word="오다", family="Động từ đi với thời tiết")
+        db = self._db(item_exists=True, row=row)
+        learner = uuid.uuid4()
+        body = ItemStateReviewRequest(item_type="vocab_item", item_id=1, correct=False, mode="cloze", chosen="불다")
+        await content.record_item_review(body, db, SimpleNamespace(id=learner))
+        state, error = self._added(db)
+        self.assertIsInstance(state, ItemState)
+        self.assertIsInstance(error, ErrorLog)
+        self.assertEqual(
+            (error.learner_id, error.skill, error.error_type, error.example_ko, error.item_type, error.item_id, error.mode),
+            (learner, "vocab", "collocation", "비가 오다", "vocab_item", 1, "cloze"),
+        )
+        self.assertEqual(error.detail, {"chosen": "불다", "family": "Động từ đi với thời tiết"})
+
+    async def test_a_forgotten_card_is_a_recall_failure_and_an_old_client_without_a_mode_still_logs(self):
+        row = VocabItem(id=2, hangul="날씨", meaning_vi="m", level=1)
+        db = self._db(item_exists=True, row=row)
+        body = ItemStateReviewRequest(item_type="vocab_item", item_id=2, correct=False)
+        await content.record_item_review(body, db, SimpleNamespace(id=uuid.uuid4()))
+        error = self._added(db)[1]
+        self.assertEqual((error.error_type, error.mode, error.detail), ("vocab_recall", "recognize", None))
+
+    async def test_a_forgotten_grammar_point_is_logged_under_grammar(self):
+        row = GrammarPoint(id=3, pattern="V + -(으)ㄹ 것 같다", meaning_vi="m", level=2)
+        db = self._db(item_exists=True, row=row)
+        body = ItemStateReviewRequest(item_type="grammar_point", item_id=3, correct=False, mode="recognize")
+        await content.record_item_review(body, db, SimpleNamespace(id=uuid.uuid4()))
+        error = self._added(db)[1]
+        self.assertEqual((error.skill, error.error_type, error.example_ko), ("grammar", "grammar_recall", "V + -(으)ㄹ 것 같다"))
+
+    async def test_a_wrong_answer_to_an_unknown_item_writes_no_error(self):
+        db = self._db(item_exists=False)
+        body = ItemStateReviewRequest(item_type="vocab_item", item_id=999, correct=False)
+        with self.assertRaises(HTTPException):
+            await content.record_item_review(body, db, SimpleNamespace(id=uuid.uuid4()))
+        db.add.assert_not_called()
+
 
 class PlanTests(unittest.IsolatedAsyncioTestCase):
     def _db(self, states, *, vocab, grammar, lessons_by_id):
@@ -143,6 +192,8 @@ class PlanTests(unittest.IsolatedAsyncioTestCase):
                 res.all.return_value = vocab
             elif "FROM content.grammar_point" in text:
                 res.all.return_value = grammar
+            elif "cardinality(" in text:
+                res.all.return_value = []  # no article has words
             elif "count(" in text:
                 res.scalar_one.return_value = 0
             else:  # editorial article / submission: none

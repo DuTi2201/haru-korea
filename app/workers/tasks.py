@@ -24,10 +24,13 @@ from app.models import (
     Job,
     LectureAudio,
     Lesson,
+    Profile,
     VocabItem,
     VocabItemAudio,
+    WritingDrill,
 )
-from app.services import article_extract, corpus_enrich, ingestion, read_along, study_pack, tts
+from app.models import ErrorLog
+from app.services import article_extract, corpus_enrich, ingestion, read_along, srs, study_pack, tts, writing_drill
 from app.services import gemini_client
 from app.services.job_events import publish_job_event
 
@@ -563,6 +566,123 @@ def grade_editorial_outline(self, job_id: str, submission_id: str):
                 db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
             )
             raise
+
+
+@celery_app.task(name="app.workers.tasks.generate_writing_drill", bind=True, max_retries=0)
+def generate_writing_drill(self, job_id: str, drill_id: str):
+    """Builds one "viết câu 51–52" exercise from the learner's own cards:
+    generate, check with code, check with a second model call (see
+    app/services/writing_drill.py). No retry on purpose — a failed exercise
+    costs the learner one tap to ask for another, while a retry would double
+    the spend on a model that just refused to give a reliable one."""
+    jid, did = uuid.UUID(job_id), uuid.UUID(drill_id)
+    with Session(_sync_engine) as db:
+        drill = db.get(WritingDrill, did)
+        if drill is None:
+            publish_job_event(db, jid, status="failed", error={"code": "not_found", "message": "drill not found"})
+            return
+        try:
+            publish_job_event(db, jid, status="running", progress=0.2, step="Đang soạn đề từ các cụm bạn đang học")
+            ids = [s["item_id"] for s in drill.source_items]
+            rows = {v.id: v for v in db.execute(select(VocabItem).where(VocabItem.id.in_(ids))).scalars().all()}
+            targets = [
+                writing_drill.SourceCard(
+                    item_id=v.id,
+                    hangul=v.hangul,
+                    meaning_vi=v.meaning_vi,
+                    node_word=v.node_word,
+                    family=v.family,
+                    register=v.register,
+                    example_ko=v.example_ko,
+                )
+                for i in ids
+                if (v := rows.get(i)) is not None
+            ]
+            if not targets:
+                raise ValueError("Các thẻ nguồn của đề không còn nữa. Hãy tạo đề mới.")
+            profile = db.get(Profile, drill.learner_id)
+            level = srs.article_level_cap(profile.goal if profile else None)
+            exercise = writing_drill.build_exercise(
+                targets, level, gemini_client.generate_structured, settings.GEMINI_MODEL_STUDY
+            )
+            drill.prompt = exercise
+            drill.status = "ready"
+            db.add(drill)
+            db.commit()
+            publish_job_event(
+                db, jid, status="succeeded", progress=1.0, step="Đề đã sẵn sàng", result={"drill_id": drill_id}
+            )
+        except Exception as exc:  # noqa: BLE001 — recorded on the drill and the job
+            db.rollback()
+            drill = db.get(WritingDrill, did)
+            drill.status = "failed"
+            db.add(drill)
+            db.commit()
+            friendly = isinstance(exc, ValueError)
+            print(f"[writing-drill] generate {did}: {exc!r}", flush=True)
+            publish_job_event(
+                db,
+                jid,
+                status="failed",
+                error={
+                    "code": "drill_failed",
+                    "message": str(exc) if friendly else "Không tạo được đề lúc này. Hãy thử lại sau.",
+                    "retryable": True,
+                },
+            )
+
+
+@celery_app.task(name="app.workers.tasks.grade_writing_drill", bind=True, max_retries=0)
+def grade_writing_drill(self, job_id: str, drill_id: str):
+    """Checks the learner's two sentences (code first, then the model) and writes
+    each slip to the error log so it shows up in "điểm yếu". If the model cannot
+    be reached the check fails and the answers are kept, so the learner can send
+    them again (an exercise is graded once)."""
+    jid, did = uuid.UUID(job_id), uuid.UUID(drill_id)
+    with Session(_sync_engine) as db:
+        drill = db.get(WritingDrill, did)
+        if drill is None or drill.prompt is None or drill.answers is None:
+            publish_job_event(db, jid, status="failed", error={"code": "not_found", "message": "drill not ready"})
+            return
+        try:
+            publish_job_event(db, jid, status="running", progress=0.3, step="Đang chấm bài viết")
+            result = writing_drill.grade_answers(
+                drill.prompt, drill.answers, gemini_client.generate_structured, settings.GEMINI_MODEL_STUDY
+            )
+            drill.result = result
+            drill.grade_status = "ready"
+            single = drill.source_items[0] if len(drill.source_items) == 1 else None
+            for row in writing_drill.error_rows(result):
+                db.add(
+                    ErrorLog(
+                        learner_id=drill.learner_id,
+                        skill="viết",
+                        error_type=row["error_type"],
+                        example_ko=row["example_ko"],
+                        item_type=single["item_type"] if single else None,
+                        item_id=single["item_id"] if single else None,
+                        mode="writing",
+                        detail={**row["detail"], "drill_id": drill_id},
+                    )
+                )
+            db.add(drill)
+            db.commit()
+            publish_job_event(
+                db, jid, status="succeeded", progress=1.0, step="Đã chấm xong", result={"drill_id": drill_id}
+            )
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            drill = db.get(WritingDrill, did)
+            drill.grade_status = "failed"
+            db.add(drill)
+            db.commit()
+            print(f"[writing-drill] grade {did}: {exc!r}", flush=True)
+            publish_job_event(
+                db,
+                jid,
+                status="failed",
+                error={"code": "grade_failed", "message": "Chưa chấm được lúc này. Bài của bạn vẫn được giữ, hãy thử gửi lại.", "retryable": True},
+            )
 
 
 @celery_app.task(name="app.workers.tasks.grade_writing_submission")
