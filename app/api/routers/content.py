@@ -4,9 +4,11 @@ corpus (listening sentences), progress (item-state check-ins), curriculum
 for the scaffold; split into content.py/curriculum.py/practice.py once
 each grows past a handful of routes.
 """
+import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import func, select
@@ -28,7 +30,15 @@ from app.models import (
     VocabItem,
 )
 from app.schemas import (
+    CorpusFacetsOut,
+    CorpusFilmCount,
+    CorpusGrammarCount,
     CorpusItemOut,
+    CorpusLevelCount,
+    CorpusPageOut,
+    CorpusRegisterCount,
+    CorpusSimilarOut,
+    CorpusTopicCount,
     GrammarPointOut,
     ItemStateOut,
     ItemStateReviewRequest,
@@ -40,6 +50,8 @@ from app.schemas import (
     TopicOut,
     VocabItemOut,
 )
+from app.services import corpus_browse
+from app.services.corpus_browse import Sentence
 from app.services.progress import ItemKey, count_mastered, pick_next_lesson
 
 router = APIRouter(tags=["content"])
@@ -212,6 +224,187 @@ async def list_corpus_items(
     ]
 
 
+# --------------------------------------------------------- corpus browsing --
+# A light copy of corpus.corpus_item (no embedding, de-duplicated, register
+# corrected — see app/services/corpus_browse.py). Three endpoints and every
+# page of a listening session read from it, so it is kept for a short while
+# per process instead of being rebuilt on each request; a freshly confirmed
+# import shows up within _SNAPSHOT_TTL_SECONDS.
+_SNAPSHOT_TTL_SECONDS = 30.0
+_snapshot: tuple[float, list[Sentence]] | None = None
+
+
+def reset_corpus_snapshot() -> None:
+    global _snapshot
+    _snapshot = None
+
+
+async def _corpus_sentences(db: AsyncSession) -> list[Sentence]:
+    global _snapshot
+    now = time.monotonic()
+    if _snapshot is not None and now - _snapshot[0] < _SNAPSHOT_TTL_SECONDS:
+        return _snapshot[1]
+    rows = (
+        await db.execute(
+            select(
+                CorpusItem.id,
+                CorpusItem.film_id,
+                CorpusItem.text_ko,
+                CorpusItem.kind,
+                CorpusItem.level,
+                CorpusItem.register,
+                CorpusItem.topic_ids,
+                CorpusItem.grammar_point_ids,
+            ).where(CorpusItem.kind == "câu")
+        )
+    ).all()
+    sentences = corpus_browse.dedupe(
+        [
+            corpus_browse.with_effective_register(
+                Sentence(
+                    id=r[0],
+                    film_id=r[1],
+                    text_ko=r[2],
+                    kind=r[3],
+                    level=r[4],
+                    register=r[5],
+                    topic_ids=tuple(r[6] or ()),
+                    grammar_ids=tuple(r[7] or ()),
+                )
+            )
+            for r in rows
+        ]
+    )
+    _snapshot = (now, sentences)
+    return sentences
+
+
+async def _id_names(db: AsyncSession, id_col, name_col, ids: set[int]) -> dict[int, str]:
+    if not ids:
+        return {}
+    return dict((await db.execute(select(id_col, name_col).where(id_col.in_(ids)))).all())
+
+
+async def _corpus_out(db: AsyncSession, sentences: list[Sentence]) -> list[CorpusItemOut]:
+    """Names for the ids a page of sentences refers to — separate bulk queries
+    zipped in code, never a JOIN across corpus/content (module boundary)."""
+    films = await _id_names(db, Film.id, Film.title, {s.film_id for s in sentences})
+    topics = await _id_names(db, Topic.id, Topic.name, {t for s in sentences for t in s.topic_ids})
+    grammar = await _id_names(db, GrammarPoint.id, GrammarPoint.pattern, {g for s in sentences for g in s.grammar_ids})
+    return [
+        CorpusItemOut(
+            id=s.id,
+            film_id=s.film_id,
+            film_title=films.get(s.film_id, ""),
+            text_ko=s.text_ko,
+            kind=s.kind,
+            level=s.level,
+            register=s.register,
+            topics=[topics[t] for t in s.topic_ids if t in topics],
+            grammar_patterns=[grammar[g] for g in s.grammar_ids if g in grammar],
+        )
+        for s in sentences
+    ]
+
+
+@router.get("/corpus/facets", response_model=CorpusFacetsOut)
+async def corpus_facets(db: Annotated[AsyncSession, Depends(get_db)]):
+    """What the listening picker can filter by (level, speech level, topic,
+    grammar pattern, source film) and how many distinct sentences each holds.
+    Public, like the sentences themselves."""
+    counts = corpus_browse.count_facets(await _corpus_sentences(db))
+    films = await _id_names(db, Film.id, Film.title, {i for i, _ in counts.films})
+    topics = await _id_names(db, Topic.id, Topic.name, {i for i, _ in counts.topics})
+    grammar = await _id_names(db, GrammarPoint.id, GrammarPoint.pattern, {i for i, _ in counts.grammar})
+    return CorpusFacetsOut(
+        total=counts.total,
+        levels=[CorpusLevelCount(level=lv, count=n) for lv, n in counts.levels],
+        registers=[CorpusRegisterCount(register=r, count=n) for r, n in counts.registers],
+        topics=[CorpusTopicCount(id=i, name=topics[i], count=n) for i, n in counts.topics if i in topics],
+        grammar=[CorpusGrammarCount(id=i, pattern=grammar[i], count=n) for i, n in counts.grammar if i in grammar],
+        films=[CorpusFilmCount(id=i, title=films[i], count=n) for i, n in counts.films if i in films],
+    )
+
+
+@router.get("/corpus/browse", response_model=CorpusPageOut)
+async def browse_corpus(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    level: Annotated[int | None, Query(ge=1, le=6)] = None,
+    topic_id: Annotated[int | None, Query(ge=1)] = None,
+    register: Annotated[Literal["존댓말", "반말", "hỗn hợp"] | None, Query()] = None,
+    grammar_id: Annotated[int | None, Query(ge=1)] = None,
+    film_id: Annotated[int | None, Query(ge=1)] = None,
+    seed: Annotated[str, Query(max_length=40)] = "",
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+):
+    """A page of distinct sentences matching the filters, in an order fixed by
+    `seed`: ask for offset 0, 10, 20… with the same seed and every sentence
+    comes up exactly once (a fresh random sample per request cannot promise
+    that). The client picks a new random seed for each listening session."""
+    matching = [
+        s
+        for s in await _corpus_sentences(db)
+        if corpus_browse.matches(
+            s, level=level, topic_id=topic_id, register=register, grammar_id=grammar_id, film_id=film_id
+        )
+    ]
+    page = corpus_browse.seeded_order(matching, seed)[offset : offset + limit]
+    return CorpusPageOut(total=len(matching), offset=offset, items=await _corpus_out(db, page))
+
+
+@router.get("/corpus/items/{item_id}/similar", response_model=list[CorpusSimilarOut])
+async def similar_corpus_items(
+    item_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=10)] = 3,
+    max_distance: Annotated[float, Query(ge=0, le=2)] = 0.4,
+):
+    """Sentences close in meaning to this one — the same idea said another way
+    (a politer or plainer ending, other word forms) — nearest first. Uses the
+    embedding stored when the sentence was imported; word-for-word repeats are
+    never offered as "similar"."""
+    target = await db.get(CorpusItem, item_id)
+    if target is None:
+        raise _problem(status.HTTP_404_NOT_FOUND, "Corpus item not found", "not_found")
+    if target.embedding is None:
+        return []
+
+    distance = CorpusItem.embedding.cosine_distance(target.embedding)
+    rows = (
+        await db.execute(
+            select(CorpusItem.id, distance.label("distance"))
+            .where(
+                CorpusItem.id != item_id,
+                CorpusItem.kind == "câu",
+                CorpusItem.embedding.is_not(None),
+                distance <= max_distance,
+            )
+            .order_by(distance)
+            .limit(limit * 6)  # headroom: copies and repeats are filtered out below
+        )
+    ).all()
+
+    by_id = {s.id: s for s in await _corpus_sentences(db)}
+    own_key = corpus_browse.normalize_key(target.text_ko)
+    picked: list[tuple[Sentence, float]] = []
+    seen_keys = {own_key}
+    for near_id, dist in rows:
+        sentence = by_id.get(near_id)  # absent = a repeat of a sentence kept elsewhere
+        if sentence is None:
+            continue
+        key = corpus_browse.normalize_key(sentence.text_ko)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        picked.append((sentence, float(dist)))
+        if len(picked) == limit:
+            break
+
+    outs = await _corpus_out(db, [s for s, _ in picked])
+    return [CorpusSimilarOut(**o.model_dump(), distance=round(d, 3)) for o, (_, d) in zip(outs, picked)]
+
+
 @router.post("/progress/reviews", response_model=ItemStateOut)
 async def record_item_review(
     body: ItemStateReviewRequest,
@@ -328,7 +521,7 @@ async def get_my_plan(
             TodayPlanTask(
                 kind="listening",
                 title="Luyện nghe câu mẫu từ phim",
-                subtitle=f"{corpus_count} câu có sẵn, giọng đọc Gemini chuẩn Seoul",
+                subtitle=f"{corpus_count} câu có sẵn, giọng đọc chuẩn Seoul",
                 status="todo",
             )
         )

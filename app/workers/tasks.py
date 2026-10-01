@@ -579,7 +579,7 @@ def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_
             raw_text = ingestion.extract_corpus_source_text(file_bytes, mime_type)
             if is_image:
                 publish_job_event(db, jid, progress=0.4, step="Đang tách câu thoại")
-            staged, flagged = ingestion.run_corpus_extraction(db, batch, raw_text)
+            staged, flagged, duplicates = ingestion.run_corpus_extraction(db, batch, raw_text)
 
             batch.status = "awaiting_review"
             batch.flagged_count = flagged
@@ -591,7 +591,13 @@ def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_
                 status="succeeded",
                 progress=1.0,
                 step="Hoàn tất phân loại kho câu",
-                result={"import_batch_id": str(bid), "film_id": film.id, "staged": staged, "flagged": flagged},
+                result={
+                    "import_batch_id": str(bid),
+                    "film_id": film.id,
+                    "staged": staged,
+                    "flagged": flagged,
+                    "duplicates_skipped": duplicates,
+                },
             )
         except Exception as exc:  # noqa: BLE001
             batch.status = "failed"

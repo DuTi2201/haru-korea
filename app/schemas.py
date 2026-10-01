@@ -96,7 +96,9 @@ class CorpusAudioRequest(BaseModel):
 
     text_ko: str
     voice: str = "ko-female-1"
-    prompt_version: str = "v1"
+    # Part of the audio cache key. "v2" = the first generation voiced by Google
+    # Chirp 3 HD; clips cached under "v1" (Gemini voice) are therefore not reused.
+    prompt_version: str = "v2"
 
 
 class VocabAudioRequest(BaseModel):
@@ -239,6 +241,63 @@ class CorpusItemOut(BaseModel):
     grammar_patterns: list[str]
 
     model_config = {"from_attributes": True}
+
+
+class CorpusSimilarOut(CorpusItemOut):
+    """A sentence close in meaning to another one (pgvector cosine distance on
+    the stored embedding; 0 = identical, larger = further apart) — typically
+    the same idea in another speech level or with other word forms."""
+
+    distance: float
+
+
+class CorpusLevelCount(BaseModel):
+    level: int
+    count: int
+
+
+class CorpusRegisterCount(BaseModel):
+    register: str
+    count: int
+
+
+class CorpusTopicCount(BaseModel):
+    id: int
+    name: str
+    count: int
+
+
+class CorpusGrammarCount(BaseModel):
+    id: int
+    pattern: str
+    count: int
+
+
+class CorpusFilmCount(BaseModel):
+    id: int
+    title: str
+    count: int
+
+
+class CorpusFacetsOut(BaseModel):
+    """What the listening picker can filter by, with how many distinct
+    sentences each choice holds (repeated sentences counted once)."""
+
+    total: int
+    levels: list[CorpusLevelCount]
+    registers: list[CorpusRegisterCount]
+    topics: list[CorpusTopicCount]
+    grammar: list[CorpusGrammarCount]
+    films: list[CorpusFilmCount]
+
+
+class CorpusPageOut(BaseModel):
+    """One page of a listening session: `total` is the size of the whole
+    filtered set, so the client knows how far it can keep paging."""
+
+    total: int
+    offset: int
+    items: list[CorpusItemOut]
 
 
 class ItemStateReviewRequest(BaseModel):

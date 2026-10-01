@@ -47,7 +47,7 @@ from app.models import (
     Topic,
     VocabItem,
 )
-from app.services import article_extract, gemini_client
+from app.services import article_extract, corpus_browse, gemini_client
 from app.services.subtitles import Cue, chunk_cues, parse_plain_lines, parse_subtitles
 
 # ============================================================ extraction ==
@@ -663,11 +663,33 @@ def classify_corpus_chunk(
     return CorpusChunkClassification.model_validate(_parse_json(result["text"]))
 
 
-def run_corpus_extraction(db: Session, batch: ImportBatch, raw_subtitle_text: str) -> tuple[int, int]:
-    """Parses the subtitle file, classifies it in fixed-size chunks (so
+def drop_duplicate_cues(cues: list[Cue], known_keys: set[str]) -> tuple[list[Cue], int]:
+    """Cues whose sentence is not already in the corpus (known_keys) and has
+    not appeared earlier in this same file. A repeated line is never staged,
+    so it neither costs a classification call nor lands in front of the
+    reviewer twice. Returns (fresh cues in order, how many repeats were
+    dropped); a cue with no letters at all is ignored without being counted."""
+    seen = set(known_keys)
+    fresh: list[Cue] = []
+    dropped = 0
+    for cue in cues:
+        key = corpus_browse.normalize_key(cue.text)
+        if not key:
+            continue
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        fresh.append(cue)
+    return fresh, dropped
+
+
+def run_corpus_extraction(db: Session, batch: ImportBatch, raw_subtitle_text: str) -> tuple[int, int, int]:
+    """Parses the subtitle file, drops lines the corpus already has (or that
+    repeat inside the file), classifies the rest in fixed-size chunks (so
     each Gemini call's prompt stays constant-size regardless of film
     length — FR-19/Gate G6), and stages one ImportItem per kept cue.
-    Returns (staged_count, flagged_count)."""
+    Returns (staged_count, flagged_count, duplicates_dropped)."""
     cues = parse_subtitles(raw_subtitle_text)
     if not cues:
         # Not real timestamped .srt/.vtt — a plain-text paste or an
@@ -675,6 +697,8 @@ def run_corpus_extraction(db: Session, batch: ImportBatch, raw_subtitle_text: st
         # of which has timecodes for parse_subtitles to key off. Fall back
         # to one cue per line instead of silently staging nothing.
         cues = parse_plain_lines(raw_subtitle_text)
+    known_keys = corpus_browse.corpus_keys([t for (t,) in db.execute(select(CorpusItem.text_ko)).all()])
+    cues, duplicates = drop_duplicate_cues(cues, known_keys)
     known_topics = [t for (t,) in db.execute(select(Topic.name)).all()]
     known_grammar = [p for (p,) in db.execute(select(GrammarPoint.pattern)).all()][:200]
 
@@ -716,7 +740,7 @@ def run_corpus_extraction(db: Session, batch: ImportBatch, raw_subtitle_text: st
             )
             staged += 1
     db.flush()
-    return staged, flagged
+    return staged, flagged, duplicates
 
 
 def run_lesson_extraction(db: Session, batch: ImportBatch, file_bytes: bytes, mime_type: str) -> tuple[int, int]:
@@ -1031,10 +1055,19 @@ def apply_corpus_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
         return {"applied": 0, "reason": "no_confirmed_items"}
 
     grammar_rows = {p: pid for pid, p in db.execute(select(GrammarPoint.id, GrammarPoint.pattern)).all()}
+    # The extraction step already skips known lines, but two batches can be
+    # reviewed side by side (or a film re-uploaded under another title), so the
+    # write step checks again: the same sentence is stored once.
+    known_keys = corpus_browse.corpus_keys([t for (t,) in db.execute(select(CorpusItem.text_ko)).all()])
 
     applied = 0
+    duplicates_skipped = 0
     for item in items:
         payload = item.payload
+        key = corpus_browse.normalize_key(payload["text_ko"])
+        if key in known_keys:
+            duplicates_skipped += 1
+            continue
         topic_ids = [_find_or_create_topic(db, name) for name in payload.get("topics", [])]
         grammar_point_ids = [
             grammar_rows[p] for p in payload.get("grammar_patterns", []) if p in grammar_rows
@@ -1059,9 +1092,13 @@ def apply_corpus_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
         result = db.execute(stmt)
         if result.rowcount:
             applied += 1
+            known_keys.add(key)
 
     db.flush()
-    return {"applied": applied}
+    outcome: dict[str, Any] = {"applied": applied, "duplicates_skipped": duplicates_skipped}
+    if applied == 0 and duplicates_skipped:
+        outcome["reason"] = "all_duplicates"
+    return outcome
 
 
 def apply_exam_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
