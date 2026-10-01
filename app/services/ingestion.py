@@ -49,7 +49,7 @@ from app.models import (
     Topic,
     VocabItem,
 )
-from app.services import article_extract, corpus_browse, corpus_enrich, gemini_client, podcast_script
+from app.services import article_extract, corpus_browse, corpus_enrich, gemini_client, lesson_extract, podcast_script
 from app.services.subtitles import Cue, chunk_cues, parse_plain_lines, parse_subtitles
 
 # ============================================================ extraction ==
@@ -646,7 +646,10 @@ def run_exam_extraction(db: Session, batch: ImportBatch, files: list[tuple[bytes
     return staged, flagged
 
 
-def extract_lesson(file_bytes: bytes, mime_type: str) -> LessonExtraction:
+def _extract_lesson_one_shot(file_bytes: bytes, mime_type: str) -> LessonExtraction:
+    """The original single-call extraction. It lists far fewer items than the
+    lesson teaches (the model stops early), so it is only the fallback for a
+    document the inventory step finds nothing in — see lesson_extract."""
     result = gemini_client.generate_structured(
         model=settings.GEMINI_MODEL_LESSON_INGEST,
         prompt=build_lesson_prompt_parts(file_bytes, mime_type),
@@ -654,6 +657,30 @@ def extract_lesson(file_bytes: bytes, mime_type: str) -> LessonExtraction:
         prompt_version="lesson-v2",
     )
     return LessonExtraction.model_validate(_parse_json(result["text"]))
+
+
+def _draft_from(extraction: LessonExtraction) -> lesson_extract.LessonDraft:
+    return lesson_extract.LessonDraft(
+        title=extraction.title,
+        level=extraction.level,
+        content=extraction.content,
+        topics=extraction.topics,
+        confidence=extraction.confidence,
+        vocab=[lesson_extract.VocabCard(**v.model_dump()) for v in extraction.vocab],
+        grammar=[lesson_extract.GrammarCard(**g.model_dump()) for g in extraction.grammar],
+    )
+
+
+def extract_lesson(file_bytes: bytes, mime_type: str, on_progress=None) -> lesson_extract.LessonDraft:
+    """Lesson (image/PDF/plain text) -> one card per item it teaches: an
+    inventory first, then the cards in small groups (see lesson_extract for
+    why a single call loses most of a lesson)."""
+    return lesson_extract.extract(
+        file_bytes,
+        mime_type,
+        fallback=lambda: _draft_from(_extract_lesson_one_shot(file_bytes, mime_type)),
+        on_progress=on_progress,
+    )
 
 
 def classify_corpus_chunk(
@@ -843,8 +870,21 @@ def run_corpus_extraction(
     return stats
 
 
-def run_lesson_extraction(db: Session, batch: ImportBatch, file_bytes: bytes, mime_type: str) -> tuple[int, int]:
-    extraction = extract_lesson(file_bytes, mime_type)
+def clear_staged_items(db: Session, batch: ImportBatch) -> int:
+    """Drop the unreviewed proposals of a lesson batch that is about to be read
+    again (re-uploaded after the extraction improved). Nothing is written to the
+    library before the batch is confirmed, so there is nothing to undo; a
+    confirmed batch is left alone."""
+    if batch.status == "confirmed":
+        return 0
+    result = db.execute(delete(ImportItem).where(ImportItem.import_batch_id == batch.id))
+    return result.rowcount or 0
+
+
+def run_lesson_extraction(
+    db: Session, batch: ImportBatch, file_bytes: bytes, mime_type: str, on_progress=None
+) -> tuple[int, int]:
+    extraction = extract_lesson(file_bytes, mime_type, on_progress)
     staged = 0
     flagged = 0
 

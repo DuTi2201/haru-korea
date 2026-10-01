@@ -594,13 +594,22 @@ def extract_lesson_import(self, job_id: str, batch_id: str, file_b64: str, mime_
             publish_job_event(db, jid, status="failed", error={"code": "not_found", "message": "batch not found"})
             return
         try:
+            # A file read again (re-uploaded after the extraction improved) lands on
+            # the same batch: its old, unreviewed proposals are replaced.
+            cleared = ingestion.clear_staged_items(db, batch)
+            if cleared:
+                print(f"[lesson] re-reading batch {bid}: dropped {cleared} earlier proposal(s)", flush=True)
             batch.status = "extracting"
             db.add(batch)
             db.commit()
             publish_job_event(db, jid, status="running", progress=0.2, step="Đang đọc tài liệu với Gemini")
 
             file_bytes = base64.b64decode(file_b64)
-            staged, flagged = ingestion.run_lesson_extraction(db, batch, file_bytes, mime_type)
+
+            def on_progress(done: int, total: int, step: str) -> None:
+                publish_job_event(db, jid, progress=round(0.2 + 0.7 * done / max(total, 1), 3), step=step)
+
+            staged, flagged = ingestion.run_lesson_extraction(db, batch, file_bytes, mime_type, on_progress)
 
             batch.status = "awaiting_review"
             batch.flagged_count = flagged

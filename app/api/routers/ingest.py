@@ -38,7 +38,7 @@ from app.schemas import (
     ImportItemPatch,
     JobAccepted,
 )
-from app.services import corpus_enrich, ingestion
+from app.services import corpus_enrich, ingestion, lesson_extract
 from app.workers.tasks import (
     apply_import_batch_task,
     enrich_corpus_items,
@@ -243,7 +243,6 @@ async def create_import_batch(
         select(ImportBatch).where(ImportBatch.kind == kind, ImportBatch.file_hash == file_hash)
     )
     batch = existing_batch.scalar_one_or_none()
-    idempotency_key = f"{kind}:{file_hash}"
 
     if batch is None:
         batch = ImportBatch(
@@ -253,10 +252,11 @@ async def create_import_batch(
         await db.commit()
         await db.refresh(batch)
 
+    lookup_keys, idempotency_key = upload_job_keys(kind, file_hash, batch.status)
     existing_job = await db.execute(
-        select(Job).where(Job.type == f"extract_import_{kind}", Job.idempotency_key == idempotency_key)
+        select(Job).where(Job.type == f"extract_import_{kind}", Job.idempotency_key.in_(lookup_keys))
     )
-    job = existing_job.scalar_one_or_none()
+    job = existing_job.scalars().first()
     if job is not None and job.status not in ("queued", "running", "succeeded"):
         # See the editorial_article branch above: a failed row must not
         # permanently block retrying the same file upload.
@@ -285,6 +285,24 @@ async def create_import_batch(
         poll_url=f"/api/v1/jobs/{job.id}",
         events_url=f"/api/v1/jobs/{job.id}/events",
     )
+
+
+def upload_job_keys(kind: str, file_hash: str, batch_status: str) -> tuple[list[str], str]:
+    """(idempotency keys that count as "this upload already ran", key for a new job).
+
+    A lesson's key carries the extraction version, so a file that was read by an
+    older (less complete) extraction is read again when it is re-uploaded — onto
+    the same batch, which still holds only unreviewed proposals. A confirmed
+    batch is the exception: its lesson is already in the library, so re-reading
+    would only propose duplicates, and any earlier job (old key included) still
+    answers the upload."""
+    plain = f"{kind}:{file_hash}"
+    if kind != "lesson":
+        return [plain], plain
+    versioned = f"{plain}:{lesson_extract.PROMPT_VERSION}"
+    if batch_status == "confirmed":
+        return [versioned, plain], versioned
+    return [versioned], versioned
 
 
 async def _create_exam_paper_batch(
