@@ -118,8 +118,26 @@ returns a random sample of corpus.corpus_item for listening practice,
 with film/topic/grammar-pattern names resolved via separate bulk queries
 in application code rather than a cross-schema SQL join (SDD module-
 boundary principle); `POST /api/v1/progress/reviews` nudges a learner's
-`item_state.strength` up/down after a quick vocab/grammar check (not a
-full SM-2 scheduler — see `ItemState`'s docstring in `app/models.py`).
+`item_state.strength` (the readiness signal) after a quick vocab/grammar
+check and moves the item's review schedule (`app/services/srs.py`: a small
+SM-2-style ladder of 1 day, 3 days, then each gap times `ease`; a wrong answer
+restarts it and brings the card back in ten minutes; an answer given before
+the card is due does not move the schedule). `GET /api/v1/me/review-queue` is
+today's sitting: the cards that are due, then new cards (at most 8 per rolling
+24 h, about one grammar point in four) from the earliest lessons; a due
+vocabulary card that was answered right before comes with a fill-in-the-blank
+built from it without a model call (`app/services/exercises.py`: the node word
+of a chunk is blanked, the wrong choices are the card's own `distractors`, then
+the other chunks of its family).
+
+Lessons are read in chunks, not word lists (`PROMPT_VERSION = "lesson-v4"` in
+`app/services/lesson_extract.py`): an inventory call, a short call that sorts the
+terms into families (verbs that go with weather, the temperature scale) and the
+grammar patterns into contrast groups (the look-alike "것 같다" forms), then the
+cards with the chunk layers (`family`, `node_word`, `register`, `usage_note_vi`,
+`collocations`, `distractors`; grammar: `contrast_group`, `contrasts`). TOPIK
+tests which words go together and which pattern is closest in meaning, so a card
+is learned with its set.
 
 Verified end-to-end against a local Postgres+pgvector+Redis with the
 Gemini calls mocked (real network calls need a live API key, which this
@@ -139,7 +157,6 @@ Stubbed (`TODO` in code, intentionally — this is a first scaffold, not
 the finished app): ffmpeg audio transcoding (currently a `sleep`),
 Storage integration for writing-submission photo/audio uploads
 (image_key/opus_path are placeholder strings — the lesson/corpus/exam
-ingestion above solved this differently, see above), real adaptive
-next-lesson/SRS scheduling (`lessons/today` is a placeholder heuristic,
-`ItemState.strength` is a nudge not a scheduler), AI cost logging /
+ingestion above solved this differently, see above), error-driven weakness
+practice (`ErrorLog` is not written yet), AI cost logging /
 admin usage dashboard, and per-learner daily AI quota enforcement.

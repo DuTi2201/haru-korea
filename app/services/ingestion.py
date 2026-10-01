@@ -1107,8 +1107,27 @@ def run_editorial_extraction(
 
 
 # ================================================================ confirm ==
-_VOCAB_FIELDS = {"hangul", "pos", "meaning_vi", "definition_ko", "level", "hanja", "sino_vietnamese", "example_ko"}
-_GRAMMAR_FIELDS = {"pattern", "meaning_vi", "level", "example_ko", "usage_context_vi", "topik_tip_vi"}
+_VOCAB_FIELDS = {
+    "hangul", "pos", "meaning_vi", "definition_ko", "level", "hanja", "sino_vietnamese", "example_ko",
+    "family", "node_word", "register", "usage_note_vi", "collocations", "distractors",
+}
+_GRAMMAR_FIELDS = {
+    "pattern", "meaning_vi", "level", "example_ko", "usage_context_vi", "topik_tip_vi",
+    "contrast_group", "contrasts",
+}
+
+
+def _row_fields(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """The columns a confirmed vocab/grammar proposal becomes. A reviewer can edit
+    the payload by hand in Studio, so the chunk layers are tidied again here: a
+    node word that is not part of the phrase or a stray register would otherwise
+    reach learners (and break the fill-in-the-blank built from them)."""
+    data = {k: v for k, v in payload.items() if k in (_VOCAB_FIELDS if kind == "vocab_item" else _GRAMMAR_FIELDS)}
+    if kind == "vocab_item":
+        lesson_extract.tidy_vocab(data)
+    else:
+        lesson_extract.tidy_grammar(data)
+    return data
 
 
 def _find_or_create_topic(db: Session, name: str) -> int:
@@ -1161,11 +1180,10 @@ def apply_lesson_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
         if item.status != "confirmed" or item.kind not in ("vocab_item", "grammar_point"):
             continue
         model = VocabItem if item.kind == "vocab_item" else GrammarPoint
-        allowed_fields = _VOCAB_FIELDS if item.kind == "vocab_item" else _GRAMMAR_FIELDS
         already = db.execute(select(model).where(model.import_item_id == item.id)).scalar_one_or_none()
         if already is not None:
             continue
-        payload = {k: v for k, v in item.payload.items() if k in allowed_fields}
+        payload = _row_fields(item.kind, item.payload)
         db.add(model(lesson_id=lesson.id, import_item_id=item.id, **payload))
         applied += 1
 
@@ -1521,11 +1539,10 @@ def apply_editorial_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
         if item.status != "confirmed" or item.kind not in ("vocab_item", "grammar_point"):
             continue
         model = VocabItem if item.kind == "vocab_item" else GrammarPoint
-        allowed_fields = _VOCAB_FIELDS if item.kind == "vocab_item" else _GRAMMAR_FIELDS
         already = db.execute(select(model).where(model.import_item_id == item.id)).scalar_one_or_none()
         if already is not None:
             continue
-        payload = {k: v for k, v in item.payload.items() if k in allowed_fields}
+        payload = _row_fields(item.kind, item.payload)
         row = model(lesson_id=None, import_item_id=item.id, **payload)
         db.add(row)
         db.flush()

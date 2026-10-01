@@ -153,8 +153,13 @@ class PlanTests(unittest.IsolatedAsyncioTestCase):
         db.execute = execute
         return db
 
-    def _state(self, item_type, item_id, strength, when=NOW):
-        return SimpleNamespace(item_type=item_type, item_id=item_id, strength=strength, last_seen=when)
+    def _state(self, item_type, item_id, strength, when=NOW, **schedule):
+        fields = dict(reps=0, lapses=0, ease=2.2, interval_days=0.0, due_at=None, introduced_at=when)
+        return SimpleNamespace(item_type=item_type, item_id=item_id, strength=strength, last_seen=when, **{**fields, **schedule})
+
+    def _lesson_task(self, plan):
+        (task,) = [t for t in plan.tasks if t.kind == "vocab_review"]
+        return task
 
     async def _plan(self, states):
         db = self._db(
@@ -173,7 +178,7 @@ class PlanTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_learner_gets_first_lesson(self):
         plan = await self._plan([])
-        (task,) = plan.tasks
+        task = self._lesson_task(plan)
         self.assertEqual((task.kind, task.lesson_id, task.status), ("vocab_review", 1, "todo"))
         self.assertEqual(task.subtitle, "3 từ/ngữ pháp")
 
@@ -183,13 +188,13 @@ class PlanTests(unittest.IsolatedAsyncioTestCase):
         # article vocab reviewed today must not count toward any lesson
         states.append(self._state("vocab_item", 50, 1.0))
         plan = await self._plan(states)
-        (task,) = plan.tasks
+        task = self._lesson_task(plan)
         self.assertEqual((task.lesson_id, task.title, task.status), (2, "Bài 2", "todo"))
 
     async def test_half_done_lesson_reports_mastered_and_today_counts(self):
         states = [self._state("vocab_item", 1, 1.0), self._state("vocab_item", 2, 0.2)]
         plan = await self._plan(states)
-        (task,) = plan.tasks
+        task = self._lesson_task(plan)
         self.assertEqual((task.lesson_id, task.status), (1, "in_progress"))
         self.assertEqual(task.subtitle, "3 từ/ngữ pháp · đã thuộc 1/3 · đã ôn 2/3 hôm nay")
 

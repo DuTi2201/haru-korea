@@ -420,6 +420,15 @@ class VocabItem(Base):
     hanja: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sino_vietnamese: Mapped[str | None] = mapped_column(String(120), nullable=True)
     example_ko: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Chunk-first learning (lesson-v4): TOPIK tests which words go together
+    # (which verb takes 우산, which register), not isolated words. All nullable,
+    # so cards extracted before v4 keep working and simply show less.
+    family: Mapped[str | None] = mapped_column(String(120), nullable=True)  # the set it is learned in, e.g. "Động từ đi với thời tiết"
+    node_word: Mapped[str | None] = mapped_column(String(120), nullable=True)  # the part of `hangul` a learner must choose correctly (오다 in 비가 오다)
+    register: Mapped[str | None] = mapped_column(String(16), nullable=True)  # spoken | written | neutral
+    usage_note_vi: Mapped[str | None] = mapped_column(Text, nullable=True)
+    collocations: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # [{"ko": "...", "vi": "..."}]
+    distractors: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # wrong-but-tempting stand-ins for node_word
     import_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
@@ -445,17 +454,25 @@ class GrammarPoint(Base):
     # until backfilled/re-extracted.
     usage_context_vi: Mapped[str | None] = mapped_column(Text, nullable=True)
     topik_tip_vi: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # TOPIK asks "which is closest in meaning", so patterns are learned as a set:
+    # the label of the set and, for each other member, how it differs.
+    contrast_group: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    contrasts: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # [{"pattern": "...", "diff_vi": "..."}]
     import_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
 # ----------------------------------------------------------------- practice --
 class ItemState(Base):
     """SRS §5 ITEM_STATE — a single decay-style `strength` per learner
-    per (vocab_item|grammar_point), nudged by quick in-app checks; NOT a
-    full SM-2 state machine (no srs_stage/ease/next_review_at — those
-    were this scaffold's own pre-SRS guess, dropped now that the spec is
-    in hand). `item_id` is a bare id (polymorphic across two `content`
-    tables), so — same as corpus_item.topic_ids — no physical FK.
+    per (vocab_item|grammar_point), nudged by quick in-app checks.
+    `strength` stays the readiness signal (mastered >= 0.8, /me/plan).
+    On top of it sits a small SM-2-style schedule (app.services.srs):
+    `due_at` says when the item should come back, `reps` the correct answers
+    in a row, `lapses` how often it was forgotten, `ease` and `interval_days`
+    how fast the gaps grow. `introduced_at` is when it was first studied, so
+    "new items per day" can be capped. `item_id` is a bare id (polymorphic
+    across two `content` tables), so — same as corpus_item.topic_ids — no
+    physical FK.
     """
 
     __tablename__ = "item_state"
@@ -466,6 +483,12 @@ class ItemState(Base):
     item_id: Mapped[int] = mapped_column(Integer)
     strength: Mapped[float] = mapped_column(Float, default=0.0)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    reps: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    lapses: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    ease: Mapped[float] = mapped_column(Float, default=2.2, server_default="2.2")
+    interval_days: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
+    introduced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("learner_id", "item_type", "item_id", name="uq_item_state_learner_item"),

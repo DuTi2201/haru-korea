@@ -176,6 +176,16 @@ class TopicOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class CollocationOut(BaseModel):
+    ko: str
+    vi: str
+
+
+class ContrastOut(BaseModel):
+    pattern: str
+    diff_vi: str
+
+
 class VocabItemOut(BaseModel):
     id: int
     lesson_id: int | None
@@ -187,6 +197,13 @@ class VocabItemOut(BaseModel):
     hanja: str | None
     sino_vietnamese: str | None
     example_ko: str | None
+    # chunk layers (lesson-v4); null on cards extracted before they existed
+    family: str | None = None
+    node_word: str | None = None
+    register: str | None = None
+    usage_note_vi: str | None = None
+    collocations: list[CollocationOut] | None = None
+    distractors: list[str] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -200,6 +217,8 @@ class GrammarPointOut(BaseModel):
     example_ko: str | None
     usage_context_vi: str | None = None
     topik_tip_vi: str | None = None
+    contrast_group: str | None = None
+    contrasts: list[ContrastOut] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -328,9 +347,9 @@ class HiddenCorpusItemOut(BaseModel):
 
 
 class ItemStateReviewRequest(BaseModel):
-    """Records a learner's quick in-app check on one vocab/grammar item —
-    SRS §5 ITEM_STATE's `strength` nudge, not a full SM-2 scheduler (see
-    ItemState's docstring in app/models.py)."""
+    """Records a learner's quick in-app check on one vocab/grammar item: nudges
+    SRS §5 ITEM_STATE's `strength` and moves its review schedule
+    (app.services.srs)."""
 
     item_type: Literal["vocab_item", "grammar_point"]
     item_id: int
@@ -342,8 +361,46 @@ class ItemStateOut(BaseModel):
     item_id: int
     strength: float
     last_seen: datetime
+    # the spaced-review schedule (app.services.srs): when it comes back, how many
+    # right answers in a row, how often it was forgotten
+    due_at: datetime | None = None
+    reps: int = 0
+    lapses: int = 0
+    interval_days: float = 0.0
 
     model_config = {"from_attributes": True}
+
+
+class ClozeOut(BaseModel):
+    """A fill-in-the-blank question. The answer is sent along so the app can mark
+    it at once, without a round trip per card."""
+
+    prompt_ko: str
+    answer: str
+    choices: list[str]
+
+
+class ReviewQueueItem(BaseModel):
+    item_type: Literal["vocab_item", "grammar_point"]
+    item_id: int
+    is_new: bool
+    mode: Literal["recognize", "cloze"]
+    reps: int
+    lapses: int
+    due_at: datetime | None = None
+    lesson_title: str | None = None
+    vocab: VocabItemOut | None = None
+    grammar: GrammarPointOut | None = None
+    cloze: ClozeOut | None = None
+
+
+class ReviewQueueOut(BaseModel):
+    """Today's sitting: what is due, then what is new."""
+
+    due_total: int  # everything due now, which can be more than the due cards returned
+    new_available: int  # new cards today's cap still allows
+    new_today: int  # new cards started in the last 24 hours
+    items: list[ReviewQueueItem]
 
 
 class TodayPlanTask(BaseModel):
@@ -352,7 +409,7 @@ class TodayPlanTask(BaseModel):
     a task whose progress genuinely isn't tracked yet (e.g. listening)
     always reports "todo" rather than faking a checkmark."""
 
-    kind: Literal["vocab_review", "listening", "reading"]
+    kind: Literal["review", "vocab_review", "listening", "reading"]
     title: str
     subtitle: str
     status: Literal["todo", "in_progress", "done"]

@@ -16,13 +16,17 @@ from app.services.lesson_extract import (
     GRAMMAR_CARDS_SCHEMA,
     INVENTORY_PROMPT,
     INVENTORY_SCHEMA,
+    MAX_FAMILY,
+    ORGANISE_SCHEMA,
     OVERVIEW_SCHEMA,
     VOCAB_CARDS_SCHEMA,
     VOCAB_GROUP,
     bold_terms,
     clean_terms,
+    cluster_order,
     extract,
     merge_terms,
+    parse_groups,
 )
 
 # the lesson that lost most of its content (pasted note, with its citation marks)
@@ -116,15 +120,29 @@ def refs_in(prompt):
 
 
 class FakeGemini:
-    """Inventory -> `inventory`; card groups -> one card per ref in the prompt,
-    minus anything in `skip` (omitted) or `omit_first_time`; overview -> text."""
+    """Inventory -> `inventory`; organise -> `organise` (no sets by default); card
+    groups -> one card per ref in the prompt, minus anything in `skip` (omitted)
+    or `omit_first_time`, plus whatever `extra` holds for that term; overview -> text."""
 
-    def __init__(self, inventory, skip=(), omit_first_time=(), fail_overview=False, break_all_cards=False):
+    def __init__(
+        self,
+        inventory,
+        skip=(),
+        omit_first_time=(),
+        fail_overview=False,
+        break_all_cards=False,
+        organise=None,
+        fail_organise=False,
+        extra=None,
+    ):
         self.inventory = inventory
         self.skip = set(skip)
         self.omit_first_time = set(omit_first_time)
         self.fail_overview = fail_overview
         self.break_all_cards = break_all_cards
+        self.organise = organise or {"vocab_families": [], "grammar_groups": []}
+        self.fail_organise = fail_organise
+        self.extra = extra or {}
         self.calls = []
         self.seen = set()
 
@@ -133,6 +151,10 @@ class FakeGemini:
         self.calls.append((response_schema, text, document))
         if response_schema is INVENTORY_SCHEMA:
             return reply(self.inventory)
+        if response_schema is ORGANISE_SCHEMA:
+            if self.fail_organise:
+                raise RuntimeError("organise down")
+            return reply(self.organise)
         if response_schema is OVERVIEW_SCHEMA:
             if self.fail_overview:
                 raise RuntimeError("overview down")
@@ -146,10 +168,11 @@ class FakeGemini:
                 continue
             self.seen.add(term)
             if response_schema is VOCAB_CARDS_SCHEMA:
-                items.append({"ref": ref, "hangul": term, "meaning_vi": f"nghĩa của {term}", "level": 1, "confidence": 0.9})
+                items.append({"ref": ref, "hangul": term, "meaning_vi": f"nghĩa của {term}", "level": 1, "confidence": 0.9,
+                              **self.extra.get(term, {})})
             else:
                 items.append({"ref": ref, "pattern": term, "meaning_vi": f"nghĩa của {term}", "level": 2,
-                              "usage_context_vi": "dùng khi...", "confidence": 0.9})
+                              "usage_context_vi": "dùng khi...", "confidence": 0.9, **self.extra.get(term, {})})
         return reply({"items": items})
 
     def card_calls(self):
@@ -324,6 +347,280 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("usage_context_vi", prompt)
 
 
+def inventory_terms():
+    """The vocabulary list the pipeline builds for LESSON with the lazy inventory
+    (what the organise call's v1, v2... refer to)."""
+    return merge_terms(clean_terms(LAZY_VOCAB), bold_terms(LESSON))
+
+
+def ref_of(term):
+    return f"v{inventory_terms().index(term) + 1}"
+
+
+WEATHER_VERBS = ["비가 오다", "눈이 오다", "바람이 불다", "꽃이 피다", "단풍이 들다"]
+TEMPERATURE = ["덥다", "따뜻하다", "선선하다", "쌀쌀하다", "춥다"]
+
+
+def weather_organise():
+    return {
+        "vocab_families": [
+            {"label": "Động từ đi với thời tiết", "refs": [ref_of(t) for t in WEATHER_VERBS]},
+            {"label": "Thang nhiệt độ", "refs": [ref_of(t) for t in TEMPERATURE]},
+        ],
+        "grammar_groups": [{"label": "Phỏng đoán với 것 같다", "refs": ["g2", "g3"]}],
+    }
+
+
+class FamilyTests(unittest.TestCase):
+    def run_weather(self, **kw):
+        gem = FakeGemini(lazy_inventory(), organise=weather_organise(), **kw)
+        return gem, extract(LESSON.encode("utf-8"), "text/plain", generate=gem)
+
+    def test_the_members_of_a_family_sit_side_by_side_and_carry_its_label(self):
+        _gem, draft = self.run_weather()
+        names = [c.hangul for c in draft.vocab]
+        first = names.index("비가 오다")
+        self.assertEqual(names[first : first + 5], WEATHER_VERBS)
+        family = {c.hangul: c.family for c in draft.vocab}
+        for term in WEATHER_VERBS:
+            self.assertEqual(family[term], "Động từ đi với thời tiết")
+        for term in TEMPERATURE:
+            self.assertEqual(family[term], "Thang nhiệt độ")
+        self.assertIsNone(family["날씨"])  # not every word has a family
+
+    def test_the_rest_of_the_lesson_keeps_its_own_order(self):
+        _gem, draft = self.run_weather()
+        plain = [c.hangul for c in draft.vocab if c.family is None]
+        self.assertEqual(plain, [t for t in inventory_terms() if t in plain])
+        self.assertEqual(len(draft.vocab), len(inventory_terms()))  # nothing lost by regrouping
+
+    def test_a_card_call_sees_the_whole_family_even_when_only_part_of_it_is_in_the_call(self):
+        gem, _draft = self.run_weather()
+        weather_calls = [c for c in gem.card_calls() if c[0] is VOCAB_CARDS_SCHEMA and "비가 오다" in c[1]]
+        self.assertTrue(weather_calls)
+        text = weather_calls[0][1]
+        self.assertIn("Động từ đi với thời tiết: 비가 오다 | 눈이 오다 | 바람이 불다 | 꽃이 피다 | 단풍이 들다", text)
+        # the lines the model must answer stay a bare "v1. term" list
+        for _ref, term in refs_in(text):
+            self.assertNotIn("Động từ", term)
+
+    def test_organising_costs_one_short_call_and_the_progress_total_includes_it(self):
+        seen = []
+        gem = FakeGemini(lazy_inventory(), organise=weather_organise())
+        extract(LESSON.encode("utf-8"), "text/plain", generate=gem, on_progress=lambda d, t, s: seen.append((d, t, s)))
+        self.assertEqual(sum(1 for c in gem.calls if c[0] is ORGANISE_SCHEMA), 1)
+        done = [d for d, _t, _s in seen]
+        self.assertEqual(done, sorted(done))
+        self.assertTrue(all(d <= t for d, t, _s in seen))
+        self.assertEqual(len({t for _d, t, _s in seen}), 1)
+        self.assertTrue(any("họ cụm" in step for _d, _t, step in seen))
+
+    def test_a_failed_organise_call_only_means_no_sets(self):
+        gem = FakeGemini(lazy_inventory(), fail_organise=True)
+        draft = extract(LESSON.encode("utf-8"), "text/plain", generate=gem)
+        self.assertTrue(all(c.family is None for c in draft.vocab))
+        self.assertTrue(all(g.contrast_group is None for g in draft.grammar))
+        self.assertEqual(draft.missing, [])
+        self.assertEqual([c.hangul for c in draft.vocab[:3]], ["날씨", "일기예보", "맑다"])  # lesson order kept
+
+    def test_a_card_cannot_name_its_own_family(self):
+        gem = FakeGemini(lazy_inventory(), extra={"비가 오다": {"family": "tự đặt", "contrast_group": "tự đặt"}})
+        draft = extract(LESSON.encode("utf-8"), "text/plain", generate=gem)
+        self.assertIsNone(next(c for c in draft.vocab if c.hangul == "비가 오다").family)
+
+
+class ParseGroupsTests(unittest.TestCase):
+    def test_only_sets_that_hold_up_are_kept(self):
+        data = {
+            "vocab_families": [
+                {"label": "Họ A", "refs": ["v1", "v2", "v2", "v99", "x3"]},
+                {"label": "Họ B", "refs": ["v2", "v3"]},  # v2 already belongs to A: B has one member left
+                {"label": "  ", "refs": ["v4", "v5"]},  # no label
+                {"label": "Họ C", "refs": ["v4", "v5"]},
+                "not a dict",
+                {"label": "Họ D", "refs": "v6"},
+            ]
+        }
+        got = parse_groups(data, "vocab_families", "v", 10)
+        self.assertEqual(got, [("Họ A", [0, 1]), ("Họ C", [3, 4])])
+
+    def test_a_set_is_cut_at_the_cap_and_members_come_back_in_lesson_order(self):
+        refs = [f"v{i}" for i in range(12, 0, -1)]
+        (label, members), = parse_groups({"vocab_families": [{"label": "Lớn", "refs": refs}]}, "vocab_families", "v", 12)
+        self.assertEqual(members, list(range(MAX_FAMILY)))
+
+    def test_the_wrong_kind_of_ref_is_ignored(self):
+        data = {"grammar_groups": [{"label": "G", "refs": ["v1", "v2", "g1", "g2"]}]}
+        self.assertEqual(parse_groups(data, "grammar_groups", "g", 4), [("G", [0, 1])])
+
+    def test_garbage_gives_no_sets(self):
+        for data in ({}, {"vocab_families": None}, {"vocab_families": "x"}, {"vocab_families": [None]}):
+            self.assertEqual(parse_groups(data, "vocab_families", "v", 5), [])
+
+
+class ClusterOrderTests(unittest.TestCase):
+    def test_members_gather_at_the_first_members_place(self):
+        self.assertEqual(cluster_order(7, [("A", [1, 5]), ("B", [2, 3])]), [0, 1, 5, 2, 3, 4, 6])
+
+    def test_without_sets_nothing_moves(self):
+        self.assertEqual(cluster_order(4, []), [0, 1, 2, 3])
+
+    def test_every_index_appears_once(self):
+        order = cluster_order(10, [("A", [0, 9]), ("B", [4, 5, 6])])
+        self.assertEqual(sorted(order), list(range(10)))
+
+
+class ChunkLayerTests(unittest.TestCase):
+    def card(self, term, **fields):
+        gem = FakeGemini(lazy_inventory(), extra={term: fields})
+        draft = extract(LESSON.encode("utf-8"), "text/plain", generate=gem)
+        return next(c for c in draft.vocab if c.hangul == term)
+
+    def test_a_good_chunk_card_keeps_every_layer(self):
+        card = self.card(
+            "비가 오다",
+            node_word="오다",
+            distractors=["내리다", "불다", "들다"],
+            collocations=[{"ko": "눈이 오다", "vi": "tuyết rơi"}],
+            register="neutral",
+            usage_note_vi="Hàn nói 'mưa đến', không nói 'mưa rơi'.",
+        )
+        self.assertEqual(card.node_word, "오다")
+        self.assertEqual(card.distractors, ["내리다", "불다", "들다"])
+        self.assertEqual([(c.ko, c.vi) for c in card.collocations], [("눈이 오다", "tuyết rơi")])
+        self.assertEqual((card.register, card.usage_note_vi), ("neutral", "Hàn nói 'mưa đến', không nói 'mưa rơi'."))
+
+    def test_a_node_word_that_is_not_part_of_the_phrase_is_dropped_with_its_distractors(self):
+        card = self.card("비가 오다", node_word="내리다", distractors=["불다"])
+        self.assertIsNone(card.node_word)
+        self.assertIsNone(card.distractors)
+
+    def test_a_node_word_equal_to_the_whole_word_is_no_chunk(self):
+        card = self.card("날씨", node_word="날씨", distractors=["기온"])
+        self.assertIsNone(card.node_word)
+        self.assertIsNone(card.distractors)
+
+    def test_distractors_are_cleaned(self):
+        card = self.card("비가 오다", node_word="오다", distractors=["오다", "불다", "불 다", "rain", "", None, 7, "들다", "피다", "끼다"])
+        self.assertEqual(card.distractors, ["불다", "들다", "피다"])  # no answer, no repeat, no non-Korean, at most 3
+
+    def test_collocations_are_cleaned(self):
+        card = self.card(
+            "비가 오다",
+            collocations=[
+                {"ko": "비가 오다", "vi": "chính nó"},  # the headword itself
+                {"ko": "눈이 오다"},  # no meaning
+                {"ko": "snow", "vi": "tuyết"},  # not Korean
+                "눈이 오다",
+                {"ko": "눈이 오다", "vi": "tuyết rơi"},
+                {"ko": "눈이오다", "vi": "lặp lại"},
+                {"ko": "바람이 불다", "vi": "gió thổi"},
+                {"ko": "꽃이 피다", "vi": "hoa nở"},
+                {"ko": "단풍이 들다", "vi": "lá đổi màu"},
+            ],
+        )
+        self.assertEqual([c.ko for c in card.collocations], ["눈이 오다", "바람이 불다", "꽃이 피다"])
+
+    def test_an_unknown_register_is_dropped(self):
+        self.assertIsNone(self.card("비가 오다", register="colloquial").register)
+        self.assertEqual(self.card("비가 오다", register="Written").register, "written")
+
+    def test_blank_or_wrongly_typed_layers_become_none(self):
+        card = self.card("비가 오다", usage_note_vi="   ", collocations="눈이 오다", distractors={"a": 1}, node_word=3)
+        self.assertEqual((card.usage_note_vi, card.collocations, card.distractors, card.node_word), (None, None, None, None))
+
+    def test_a_card_without_any_layer_is_still_a_card(self):
+        card = self.card("날씨")
+        self.assertEqual((card.meaning_vi, card.node_word, card.collocations, card.register), ("nghĩa của 날씨", None, None, None))
+
+    def test_the_layers_survive_into_the_staged_payload(self):
+        card = self.card("비가 오다", node_word="오다", distractors=["불다"], register="spoken")
+        payload = card.model_dump(exclude={"confidence"})
+        for key in ("family", "node_word", "register", "usage_note_vi", "collocations", "distractors"):
+            self.assertIn(key, payload)
+        json.dumps(payload, ensure_ascii=False)  # JSON-safe: it goes into a JSONB column
+
+
+class ContrastTests(unittest.TestCase):
+    PAIR = {"vocab_families": [], "grammar_groups": [{"label": "Phỏng đoán với 것 같다", "refs": ["g2", "g3"]}]}
+
+    def run_pair(self, contrasts_for):
+        extra = {term: {"contrasts": c} for term, c in contrasts_for.items()}
+        gem = FakeGemini(lazy_inventory(), organise=self.PAIR, extra=extra)
+        draft = extract(LESSON.encode("utf-8"), "text/plain", generate=gem)
+        return gem, {g.pattern: g for g in draft.grammar}
+
+    def test_the_group_is_labelled_and_its_members_sit_together(self):
+        _gem, by = self.run_pair({})
+        self.assertEqual(by["V + -(으)ㄹ 것 같다"].contrast_group, "Phỏng đoán với 것 같다")
+        self.assertEqual(by["V/A + -는/은/ㄴ 것 같다"].contrast_group, "Phỏng đoán với 것 같다")
+        self.assertIsNone(by["V + -(으)면서"].contrast_group)
+
+    def test_a_contrast_is_linked_to_the_mate_it_names(self):
+        _gem, by = self.run_pair(
+            {
+                "V + -(으)ㄹ 것 같다": [{"pattern": "V/A + -는/은/ㄴ 것 같다", "diff_vi": "Tương lai, chưa xảy ra."}],
+                "V/A + -는/은/ㄴ 것 같다": [{"pattern": "V + -(으)ㄹ 것 같다", "diff_vi": "Hiện tại, đang xảy ra."}],
+            }
+        )
+        a = by["V + -(으)ㄹ 것 같다"].contrasts
+        self.assertEqual([(c.pattern, c.diff_vi) for c in a], [("V/A + -는/은/ㄴ 것 같다", "Tương lai, chưa xảy ra.")])
+        b = by["V/A + -는/은/ㄴ 것 같다"].contrasts
+        self.assertEqual([c.pattern for c in b], ["V + -(으)ㄹ 것 같다"])
+
+    def test_in_a_pair_a_reworded_name_can_only_mean_the_other_one(self):
+        _gem, by = self.run_pair({"V + -(으)ㄹ 것 같다": [{"pattern": "-는 것 같다", "diff_vi": "Hiện tại."}]})
+        self.assertEqual([c.pattern for c in by["V + -(으)ㄹ 것 같다"].contrasts], ["V/A + -는/은/ㄴ 것 같다"])
+
+    def test_a_contrast_naming_nothing_in_the_group_is_dropped(self):
+        trio = {"vocab_families": [], "grammar_groups": [{"label": "Nhóm ba", "refs": ["g1", "g2", "g3"]}]}
+        extra = {"V + -(으)ㄹ 것 같다": {"contrasts": [{"pattern": "V + -(으)면서", "diff_vi": "không cùng nhóm"}]}}
+        gem = FakeGemini(lazy_inventory(), organise=trio, extra=extra)
+        draft = extract(LESSON.encode("utf-8"), "text/plain", generate=gem)
+        card = next(g for g in draft.grammar if g.pattern == "V + -(으)ㄹ 것 같다")
+        self.assertIsNone(card.contrasts)
+
+    def test_a_pattern_never_contrasts_with_itself(self):
+        _gem, by = self.run_pair({"V + -(으)ㄹ 것 같다": [{"pattern": "V + -(으)ㄹ 것 같다", "diff_vi": "chính nó"}]})
+        self.assertIsNone(by["V + -(으)ㄹ 것 같다"].contrasts)
+
+    def test_the_card_call_is_told_to_contrast_and_sees_its_group_mates(self):
+        gem, _by = self.run_pair({})
+        grammar_calls = [c for c in gem.card_calls() if c[0] is GRAMMAR_CARDS_SCHEMA]
+        text = " ".join(grammar_calls[0][1].split())
+        self.assertIn("Phỏng đoán với 것 같다: V + -(으)ㄹ 것 같다 | V/A + -는/은/ㄴ 것 같다", text)
+        self.assertIn("contrasts", text)
+
+
+class OrganisePromptTests(unittest.TestCase):
+    def test_the_organise_prompt_numbers_both_lists_with_the_refs_the_answer_must_use(self):
+        prompt = lesson_extract.organise_prompt(["비가 오다", "눈이 오다"], ["V + -(으)면서"])
+        self.assertIn("v1. 비가 오다", prompt)
+        self.assertIn("v2. 눈이 오다", prompt)
+        self.assertIn("g1. V + -(으)면서", prompt)
+        self.assertIn("không thêm ref", " ".join(prompt.split()))
+
+    def test_the_new_schemas_are_valid_for_the_gemini_sdk(self):
+        from google.genai import types
+
+        for schema in (VOCAB_CARDS_SCHEMA, GRAMMAR_CARDS_SCHEMA, ORGANISE_SCHEMA):
+            types.Schema.model_validate(schema)
+
+    def test_the_vocab_rules_ask_for_chunk_layers_without_inviting_invention(self):
+        text = " ".join(lesson_extract.cards_prompt("vocab", "x", [("v1", "비가 오다")]).split())
+        for needle in ("node_word", "distractors", "collocations", "register", "usage_note_vi", "không bịa"):
+            self.assertIn(needle, text)
+
+    def test_a_distractor_that_is_also_good_korean_is_ruled_out_in_the_prompt(self):
+        # a learner who picks a valid alternative must not be marked wrong
+        text = " ".join(lesson_extract.cards_prompt("vocab", "x", [("v1", "비가 오다")]).split())
+        self.assertIn("người Hàn vẫn nói được", text)
+        self.assertIn("bị chấm sai oan", text)
+
+    def test_the_lesson_version_moved_so_a_reupload_reads_the_file_again(self):
+        self.assertEqual(lesson_extract.PROMPT_VERSION, "lesson-v4")
+
+
 class StagingTests(unittest.TestCase):
     def test_the_inventory_and_gap_cards_are_all_staged_with_traffic_light_status(self):
         draft = lesson_extract.LessonDraft(
@@ -345,6 +642,24 @@ class StagingTests(unittest.TestCase):
                                  ("grammar_point", "flagged_yellow")])
         self.assertEqual(added[1].payload["hangul"], "봄")
         self.assertNotIn("confidence", added[1].payload)
+
+    def test_chunk_layers_and_contrasts_are_staged_in_the_payload(self):
+        draft = lesson_extract.LessonDraft(
+            "Thời tiết", 2, "", [], 0.9,
+            vocab=[lesson_extract.VocabCard(hangul="비가 오다", meaning_vi="trời mưa", family="Thời tiết", node_word="오다",
+                                            distractors=["불다"], register="neutral", confidence=0.9)],
+            grammar=[lesson_extract.GrammarCard(pattern="V + -(으)ㄹ 것 같다", meaning_vi="có vẻ sẽ", contrast_group="것 같다",
+                                                contrasts=[lesson_extract.Contrast(pattern="-는 것 같다", diff_vi="hiện tại")],
+                                                confidence=0.9)],
+        )
+        added = []
+        db = SimpleNamespace(add=added.append, flush=lambda: None)
+        with mock.patch.object(ingestion, "extract_lesson", return_value=draft):
+            ingestion.run_lesson_extraction(db, SimpleNamespace(id="b1"), b"x", "text/plain")
+        vocab, grammar = added[1].payload, added[2].payload
+        self.assertEqual((vocab["family"], vocab["node_word"], vocab["distractors"]), ("Thời tiết", "오다", ["불다"]))
+        self.assertEqual(grammar["contrast_group"], "것 같다")
+        self.assertEqual(grammar["contrasts"], [{"pattern": "-는 것 같다", "diff_vi": "hiện tại"}])
 
 
 if __name__ == "__main__":

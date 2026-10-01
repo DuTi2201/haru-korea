@@ -30,6 +30,7 @@ from app.models import (
     VocabItem,
 )
 from app.schemas import (
+    ClozeOut,
     CorpusFacetsOut,
     CorpusFilmCount,
     CorpusGrammarCount,
@@ -45,13 +46,16 @@ from app.schemas import (
     LessonOut,
     LessonSummaryOut,
     ProfileOut,
+    ReviewQueueItem,
+    ReviewQueueOut,
     TodayPlanOut,
     TodayPlanTask,
     TopicOut,
     VocabItemOut,
 )
-from app.services import corpus_browse
+from app.services import corpus_browse, srs
 from app.services.corpus_browse import Sentence
+from app.services.exercises import build_cloze
 from app.services.progress import ItemKey, count_mastered, pick_next_lesson
 
 router = APIRouter(tags=["content"])
@@ -425,12 +429,13 @@ async def record_item_review(
     db: Annotated[AsyncSession, Depends(get_db)],
     profile: Annotated[Profile, Depends(get_current_profile)],
 ):
-    """A learner's quick in-app check nudges ItemState.strength — SRS §5
-    ITEM_STATE's decay-style nudge, not a full SM-2 scheduler (see
-    ItemState's docstring in app/models.py). The item must exist: item_id
-    has no FK (content lives in another schema), so without this check a
-    typo'd or made-up id would quietly become a phantom ItemState row that
-    skews the learner's streak and readiness."""
+    """A learner's quick in-app check. It nudges ItemState.strength (SRS §5
+    ITEM_STATE's decay-style nudge, the readiness signal) and moves the item's
+    review schedule (app.services.srs: when it is due again, how often it was
+    forgotten). The item must exist: item_id has no FK (content lives in
+    another schema), so without this check a typo'd or made-up id would
+    quietly become a phantom ItemState row that skews the learner's streak
+    and readiness."""
     content_model = VocabItem if body.item_type == "vocab_item" else GrammarPoint
     if (await db.execute(select(content_model.id).where(content_model.id == body.item_id))).first() is None:
         raise _problem(status.HTTP_404_NOT_FOUND, "Item not found", "not_found")
@@ -443,20 +448,110 @@ async def record_item_review(
         )
     )
     state = existing.scalar_one_or_none()
-    delta = 0.2 if body.correct else -0.2
-    new_strength = max(0.0, min(1.0, (state.strength if state else 0.0) + delta))
     now = datetime.now(timezone.utc)
+    after = srs.review(_schedule_of(state) if state is not None else None, body.correct, now)
     if state is None:
-        state = ItemState(
-            learner_id=profile.id, item_type=body.item_type, item_id=body.item_id, strength=new_strength, last_seen=now
-        )
+        state = ItemState(learner_id=profile.id, item_type=body.item_type, item_id=body.item_id, last_seen=now)
         db.add(state)
-    else:
-        state.strength = new_strength
-        state.last_seen = now
+    state.strength = after.strength
+    state.reps = after.reps
+    state.lapses = after.lapses
+    state.ease = after.ease
+    state.interval_days = after.interval_days
+    state.due_at = after.due_at
+    state.introduced_at = after.introduced_at
+    state.last_seen = now
     await db.commit()
     await db.refresh(state)
     return state
+
+
+def _schedule_of(state: ItemState) -> srs.Schedule:
+    return srs.Schedule(
+        strength=state.strength,
+        reps=state.reps or 0,
+        lapses=state.lapses or 0,
+        ease=state.ease or srs.START_EASE,
+        interval_days=state.interval_days or 0.0,
+        due_at=state.due_at,
+        introduced_at=state.introduced_at,
+    )
+
+
+@router.get("/me/review-queue", response_model=ReviewQueueOut)
+async def get_review_queue(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile, Depends(get_current_profile)],
+    limit: Annotated[int, Query(ge=1, le=60)] = srs.DEFAULT_REVIEW_LIMIT,
+    new: Annotated[int, Query(ge=0, le=30)] = srs.DEFAULT_NEW_PER_DAY,
+):
+    """Today's sitting: the cards that are due (most overdue first), then new
+    ones from the earliest lessons that still have unseen cards, at most `new`
+    per rolling 24 hours (about one grammar point in four). A due vocabulary
+    card that has been answered right before is asked as a fill-in-the-blank
+    when one can be built from it (app.services.exercises); a new, forgotten or
+    grammar card is shown for the ordinary flip-and-judge review. Lesson content
+    only — words that belong to no lesson (editorial articles) are reviewed in
+    their own page."""
+    now = datetime.now(timezone.utc)
+    states = (await db.execute(select(ItemState).where(ItemState.learner_id == profile.id))).scalars().all()
+    lesson_items = await _lesson_item_keys(db)
+    schedules = {(s.item_type, s.item_id): _schedule_of(s) for s in states}
+    queue = srs.build_queue(schedules, lesson_items, now, limit=limit, new_limit=new)
+
+    keys = [*queue.due, *queue.new]
+    vocab_ids = [i for t, i in keys if t == "vocab_item"]
+    grammar_ids = [i for t, i in keys if t == "grammar_point"]
+    vocab = {}
+    if vocab_ids:
+        vocab = {v.id: v for v in (await db.execute(select(VocabItem).where(VocabItem.id.in_(vocab_ids)))).scalars().all()}
+    grammar = {}
+    if grammar_ids:
+        grammar = {
+            g.id: g for g in (await db.execute(select(GrammarPoint).where(GrammarPoint.id.in_(grammar_ids)))).scalars().all()
+        }
+    lesson_ids = {v.lesson_id for v in vocab.values() if v.lesson_id} | {g.lesson_id for g in grammar.values() if g.lesson_id}
+    titles: dict[int, str] = {}
+    mates: dict[int, list[VocabItem]] = defaultdict(list)
+    if lesson_ids:
+        titles = dict((await db.execute(select(Lesson.id, Lesson.title).where(Lesson.id.in_(lesson_ids)))).all())
+        for v in (await db.execute(select(VocabItem).where(VocabItem.lesson_id.in_(lesson_ids)))).scalars().all():
+            mates[v.lesson_id].append(v)
+
+    items: list[ReviewQueueItem] = []
+    due_keys = set(queue.due)
+    for item_type, item_id in keys:
+        row = vocab.get(item_id) if item_type == "vocab_item" else grammar.get(item_id)
+        if row is None:  # deleted between the two queries
+            continue
+        schedule = schedules.get((item_type, item_id))
+        is_new = (item_type, item_id) not in due_keys
+        cloze = None
+        if item_type == "vocab_item" and not is_new and schedule is not None and schedule.reps >= 1:
+            built = build_cloze(row, mates.get(row.lesson_id, []), seed=f"{profile.id}:{item_id}:{schedule.reps}")
+            if built is not None:
+                cloze = ClozeOut(prompt_ko=built.prompt_ko, answer=built.answer, choices=list(built.choices))
+        items.append(
+            ReviewQueueItem(
+                item_type=item_type,  # type: ignore[arg-type]
+                item_id=item_id,
+                is_new=is_new,
+                mode="cloze" if cloze is not None else "recognize",
+                reps=schedule.reps if schedule else 0,
+                lapses=schedule.lapses if schedule else 0,
+                due_at=schedule.due_at if schedule else None,
+                lesson_title=titles.get(row.lesson_id) if row.lesson_id else None,
+                vocab=VocabItemOut.model_validate(row) if item_type == "vocab_item" else None,
+                grammar=GrammarPointOut.model_validate(row) if item_type == "grammar_point" else None,
+                cloze=cloze,
+            )
+        )
+    return ReviewQueueOut(
+        due_total=queue.due_total,
+        new_available=queue.new_budget,
+        new_today=queue.new_today,
+        items=items,
+    )
 
 
 @router.get("/me/plan", response_model=TodayPlanOut)
@@ -497,6 +592,39 @@ async def get_my_plan(
     # lesson (editorial-article imports) are left out, they are not lesson
     # content.
     lesson_items = await _lesson_item_keys(db)
+
+    # -- today's review sitting (the /review screen): cards that are due plus the
+    # day's new ones, counted by the same rule that builds the queue itself.
+    now = datetime.now(timezone.utc)
+    queue = srs.build_queue({(s.item_type, s.item_id): _schedule_of(s) for s in states}, lesson_items, now)
+    lesson_keys_all = {key for keys in lesson_items.values() for key in keys}
+    studied_today = sum(
+        1
+        for s in states
+        if (s.item_type, s.item_id) in lesson_keys_all and s.last_seen.astimezone(timezone.utc).date() == today
+    )
+    waiting = queue.due_total + len(queue.new)
+    if waiting > 0:
+        parts = [f"{queue.due_total} thẻ đến hạn"] if queue.due_total else []
+        if queue.new:
+            parts.append(f"{len(queue.new)} thẻ mới")
+        tasks.append(
+            TodayPlanTask(
+                kind="review",
+                title="Ôn tập hôm nay",
+                subtitle=" · ".join(parts),
+                status="in_progress" if studied_today else "todo",
+            )
+        )
+    elif studied_today:
+        tasks.append(
+            TodayPlanTask(
+                kind="review",
+                title="Ôn tập hôm nay",
+                subtitle="Đã ôn hết thẻ đến hạn, hẹn lần sau",
+                status="done",
+            )
+        )
 
     picked = pick_next_lesson(lesson_items, {(s.item_type, s.item_id): (s.strength, s.last_seen) for s in states})
     lesson = await db.get(Lesson, picked.lesson_id) if picked is not None else None
