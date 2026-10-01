@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     # word breakdown) — see app/services/study_pack.py. Override via env to use
     # a stronger model without a code change.
     GEMINI_MODEL_STUDY: str = "gemini-3.5-flash-lite"
+    # Model that writes the "Bài giảng tổng hợp" script (story, phrases,
+    # synonyms, idioms — see app/services/podcast_script.py). Empty = use
+    # GEMINI_MODEL_LESSON_INGEST; set a stronger model here for richer lectures.
+    GEMINI_MODEL_PODCAST: str = ""
     GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-2"
     # TTS: a real Gemini call (app/services/tts.py), not a stub — always
     # cache the result (audio.lecture_audio / audio.corpus_item_audio) and

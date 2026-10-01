@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field, field_validator
 
 # Bump when the prompt/schema changes in a way that should re-run the backfill:
 # a row whose `enriched_version` differs is picked up again.
-ENRICH_VERSION = "e1"
+ENRICH_VERSION = "e2"
 ENRICH_PROMPT_VERSION = f"corpus-enrich-{ENRICH_VERSION}"
 
 NATURAL = "natural"
@@ -168,11 +168,14 @@ Với MỖI câu, trả về:
 2. meaning_vi — nghĩa tiếng Việt tự nhiên của cả câu: dịch thoát ý theo văn
    nói, giữ đúng sắc thái lịch sự/thân mật của câu gốc, tối đa khoảng 25 từ.
    Không thêm thông tin không có trong câu. Câu cụt thì dịch cụt.
-3. usage_note_vi — 1 đến 3 câu ngắn giúp người học ÁP DỤNG: câu này dùng khi
-   nào/trong tình huống nào, nói với ai (người lớn hay bạn bè), sắc thái gì;
-   chỉ ra đuôi câu, từ hoặc mẫu ngữ pháp đáng chú ý nhất và nó làm gì; nếu có
-   ích, nói cách đổi câu khi nói với người ở bậc khác (ví dụ chuyển sang
-   존댓말). KHÔNG lặp lại bản dịch.
+3. usage_note_vi — 1 đến 3 câu ngắn của một giảng viên giàu kinh nghiệm, giúp
+   người học ÁP DỤNG chứ không chỉ hiểu: câu này dùng khi nào/trong tình huống
+   nào, nói với ai (người lớn hay bạn bè), sắc thái gì. Dạy theo CỤM: nếu câu
+   chứa một cụm hay cách nói cố định đáng nhớ thì nêu cả cụm đó (không chỉ một
+   từ đơn) và nó làm gì. Nếu có ích, thêm MỘT trong các ý sau: cách nói gần
+   nghĩa hoặc trái nghĩa và khác nhau ở đâu; cách đổi câu khi nói với người ở
+   bậc khác (ví dụ sang 존댓말); một thành ngữ/tục ngữ Hàn liên quan — chỉ khi
+   bạn chắc chắn nó có thật, không chắc thì bỏ qua. KHÔNG lặp lại bản dịch.
 4. topics — 1 đến 3 chủ đề phù hợp nhất, CHỈ chọn từ danh sách sau, viết đúng
    từng chữ. Chọn chủ đề về NỘI DUNG câu nói (nói về cái gì), không phải kiểu
    nói. Nếu không chủ đề nào hợp thì chọn "{FALLBACK_TOPIC}":

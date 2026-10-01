@@ -119,7 +119,10 @@ class PodcastRequest(BaseModel):
     handing it to TTS. See app.workers.tasks.generate_content_podcast."""
 
     voice: str = "ko-female-1"
-    prompt_version: str = "podcast-v1"
+    # Accepted for compatibility but ignored: the server decides which prompt
+    # version writes the lecture (app.services.podcast_script.PODCAST_VERSION),
+    # so improving the prompt regenerates lectures without a client release.
+    prompt_version: str = "podcast-v2"
 
 
 class ArticleAudioRequest(BaseModel):

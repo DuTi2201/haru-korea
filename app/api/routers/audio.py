@@ -31,6 +31,7 @@ from app.api.deps import get_current_profile
 from app.db import get_db
 from app.models import CorpusItemAudio, GrammarPoint, Job, LectureAudio, Lesson, Profile, VocabItem, VocabItemAudio
 from app.schemas import CorpusAudioRequest, JobAccepted, LectureAudioRequest, PodcastRequest, VocabAudioRequest
+from app.services import podcast_script
 from app.workers.tasks import (
     generate_content_podcast,
     generate_corpus_audio,
@@ -95,7 +96,11 @@ async def _request_podcast(
     vocab_ids: list[int],
     grammar_ids: list[int],
 ) -> JobAccepted:
-    cache_key = await _podcast_cache_key(db, owner_kind, owner_id, body.voice, body.prompt_version, vocab_ids, grammar_ids)
+    # The prompt version belongs to the server: bumping podcast_script.PODCAST_VERSION
+    # makes every lecture regenerate with the new prompt, whatever an older
+    # client still sends in the request body.
+    prompt_version = podcast_script.PODCAST_VERSION
+    cache_key = await _podcast_cache_key(db, owner_kind, owner_id, body.voice, prompt_version, vocab_ids, grammar_ids)
 
     cached = await db.execute(select(LectureAudio).where(LectureAudio.cache_key == cache_key))
     hit = cached.scalar_one_or_none()
@@ -139,7 +144,7 @@ async def _request_podcast(
 
         if not hit:
             generate_content_podcast.delay(
-                str(job.id), owner_kind, owner_id, body.voice, body.prompt_version, cache_key
+                str(job.id), owner_kind, owner_id, body.voice, prompt_version, cache_key
             )
 
     return JobAccepted(

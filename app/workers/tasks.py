@@ -221,7 +221,7 @@ def generate_content_podcast(
                     else []
                 )
 
-            vocab = [(v.hangul, v.pos, v.meaning_vi, v.example_ko) for v in vocab_rows]
+            vocab = [(v.hangul, v.pos, v.meaning_vi, v.example_ko, v.hanja, v.sino_vietnamese) for v in vocab_rows]
             grammar = [
                 (g.pattern, g.meaning_vi, g.example_ko, g.usage_context_vi, g.topik_tip_vi) for g in grammar_rows
             ]

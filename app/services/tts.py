@@ -53,6 +53,21 @@ class TransientTTSError(RuntimeError):
     burns more quota. Still a RuntimeError, so every existing caller that
     catches RuntimeError is unaffected."""
 
+class TTSContentShapeError(RuntimeError):
+    """Gemini TTS refused a chunk because it read like a task to perform (an
+    order, an exam question, a stack of questions) instead of a transcript to
+    voice — 400 "Model tried to generate text, but it should only be used for
+    TTS". Not transient and not a quota problem: the same text fails again, so
+    `_synthesize_chunk_pcm` changes how the text is presented instead of
+    repeating it. Still a RuntimeError for every caller that catches that."""
+
+
+# Said in front of a chunk the voice has refused once. It is the documented way
+# to steer Gemini TTS ("Say cheerfully: ..."): a style instruction followed by
+# a colon, then the transcript. It makes "read this out" unmistakable without a
+# system_instruction (which broke every podcast request, see _tts_config).
+_TRANSCRIPT_FRAME = "Say slowly and warmly, like a friendly teacher talking to a student: "
+
 # The actual cause of the podcast 500s turned out to be the (now-removed)
 # system_instruction field, not length — a ~1600-char chunk reproduced the
 # same 500 regardless. Kept as a defensive ceiling anyway: Google doesn't
@@ -131,10 +146,11 @@ def transcode_pcm(pcm_bytes: bytes, sample_rate: int = 24000) -> tuple[bytes, by
     return opus_bytes, aac_bytes, duration_sec
 
 
-def _synthesize_chunk_pcm(client: genai.Client, text: str, config: dict, models_to_try: list[str]) -> tuple[bytes, int]:
-    """One chunk of text -> (pcm_bytes, sample_rate), trying each model in
-    order and falling through to the next only on a quota (429) error.
-    Raises RuntimeError with a clean, user-facing message otherwise."""
+def _synthesize_once(client: genai.Client, text: str, config: dict, models_to_try: list[str]) -> tuple[bytes, int]:
+    """One request -> (pcm_bytes, sample_rate), trying each model in order and
+    falling through to the next only on a quota (429) error. Raises
+    RuntimeError with a clean, user-facing message otherwise
+    (TTSContentShapeError when the text read like a task)."""
     response = None
     for i, model_name in enumerate(models_to_try):
         try:
@@ -159,13 +175,10 @@ def _synthesize_chunk_pcm(client: genai.Client, text: str, config: dict, models_
                 # wording like "hãy chọn đáp án...") reads to the TTS model
                 # like a task to perform rather than a transcript to voice.
                 # Confirmed in production against a TOPIK-tip sentence
-                # phrased as a command; build_podcast_prompt now steers the
-                # script generator away from that phrasing, but since each
-                # retry regenerates a fresh script, retrying can still help.
-                raise RuntimeError(
+                # phrased as a command. _synthesize_chunk_pcm recovers.
+                raise TTSContentShapeError(
                     "Một đoạn trong kịch bản bị Gemini hiểu nhầm là câu lệnh thay vì lời thoại cần "
-                    "đọc (thường do câu mẹo TOPIK viết theo kiểu ra lệnh). Thử lại để kịch bản được "
-                    "viết lại theo cách diễn đạt khác."
+                    "đọc, dù đã thử đọc lại theo cách khác. Thử lại để kịch bản được viết lại."
                 ) from exc
             raise TransientTTSError(
                 f"Gemini TTS tạm thời gặp lỗi ({exc.code} {exc.status or 'unknown'}), thử lại sau ít phút."
@@ -181,6 +194,43 @@ def _synthesize_chunk_pcm(client: genai.Client, text: str, config: dict, models_
     match = _RATE_RE.search(inline.mime_type or "")
     sample_rate = int(match.group(1)) if match else 24000
     return inline.data, sample_rate
+
+
+def _synthesize_chunk_pcm(client: genai.Client, text: str, config: dict, models_to_try: list[str]) -> tuple[bytes, int]:
+    """One chunk of text -> (pcm_bytes, sample_rate). When the voice treats the
+    chunk as a task it is not given up on (that used to fail the whole lecture,
+    throw away the chunks already voiced and, on retry, regenerate the script
+    and spend the daily TTS quota again). Instead, in order:
+
+    1. the chunk as it is (the normal case — nothing changes for chunks that
+       work);
+    2. the same text introduced as a transcript to say aloud;
+    3. the chunk cut in two at a sentence boundary, each half introduced the
+       same way — a long chunk with a few command-like sentences usually has
+       halves that read as plain speech.
+
+    Only then does the error reach the caller. Each step is logged, so the logs
+    show which one finally worked."""
+    try:
+        return _synthesize_once(client, text, config, models_to_try)
+    except TTSContentShapeError as first:
+        print(f"[tts] chunk of {len(text)} chars read as a task; retrying framed as a transcript", flush=True)
+        failure = first
+    try:
+        return _synthesize_once(client, _TRANSCRIPT_FRAME + text, config, models_to_try)
+    except TTSContentShapeError as second:
+        failure = second
+
+    halves = _split_for_tts(text, max(len(text) // 2 + 1, 80))
+    if len(halves) < 2:
+        raise failure
+    print(f"[tts] still refused; voicing it as {len(halves)} smaller parts", flush=True)
+    parts: list[bytes] = []
+    sample_rate = 24000
+    for half in halves:
+        pcm, sample_rate = _synthesize_once(client, _TRANSCRIPT_FRAME + half, config, models_to_try)
+        parts.append(pcm)
+    return b"".join(parts), sample_rate
 
 
 def _tts_config(voice: str) -> tuple[dict, str]:

@@ -49,7 +49,7 @@ from app.models import (
     Topic,
     VocabItem,
 )
-from app.services import article_extract, corpus_browse, corpus_enrich, gemini_client
+from app.services import article_extract, corpus_browse, corpus_enrich, gemini_client, podcast_script
 from app.services.subtitles import Cue, chunk_cues, parse_plain_lines, parse_subtitles
 
 # ============================================================ extraction ==
@@ -107,7 +107,7 @@ LESSON_SCHEMA: dict[str, Any] = {
                     "topik_tip_vi": {
                         "type": "STRING",
                         "nullable": True,
-                        "description": "Mẹo bằng tiếng Việt: mẫu này thường xuất hiện ở dạng câu hỏi TOPIK nào, cách nhận diện/dùng khi làm bài thi",
+                        "description": "Nhận xét bằng tiếng Việt (câu khẳng định, không phải lời ra lệnh): mẫu này hay xuất hiện ở dạng bài/ngữ cảnh TOPIK nào và dấu hiệu nhận biết là gì",
                     },
                     "confidence": {"type": "NUMBER"},
                 },
@@ -261,7 +261,7 @@ EDITORIAL_SCHEMA: dict[str, Any] = {
                     "topik_tip_vi": {
                         "type": "STRING",
                         "nullable": True,
-                        "description": "Mẹo bằng tiếng Việt: mẫu này thường xuất hiện ở dạng câu hỏi TOPIK nào (đặc biệt viết câu 54), cách dùng khi làm bài thi",
+                        "description": "Nhận xét bằng tiếng Việt (câu khẳng định, không phải lời ra lệnh): mẫu này hay xuất hiện ở dạng bài/ngữ cảnh TOPIK nào (đặc biệt viết câu 54) và cách vận dụng",
                     },
                     "confidence": {"type": "NUMBER"},
                 },
@@ -423,8 +423,10 @@ LESSON_PROMPT = """Bạn là biên tập viên nội dung học tiếng Hàn cho
   pháp, viết THÊM usage_context_vi giải thích bằng tiếng Việt: dùng khi nào,
   trong hoàn cảnh/tình huống nào, với sắc thái/thái độ gì so với các mẫu gần
   nghĩa khác (người học cần biết ÁP DỤNG chứ không chỉ nhớ công thức). Nếu
-  mẫu này thường gặp trong đề thi TOPIK, thêm topik_tip_vi: dạng câu hỏi hay
-  gặp, cách nhận diện/vận dụng khi làm bài.
+  mẫu này thường gặp trong đề thi TOPIK, thêm topik_tip_vi: viết như MỘT NHẬN
+  XÉT VỀ NGÔN NGỮ (câu khẳng định: mẫu này hay xuất hiện ở dạng bài/ngữ cảnh
+  nào, dấu hiệu nhận biết là gì), KHÔNG viết như lời ra lệnh hay lời dặn làm bài
+  (tránh "hãy chọn...", "khi gặp câu hỏi... thì...").
 Trả về đúng JSON schema đã cho, không thêm giải thích. Với mỗi mục, tự đánh
 giá độ tự tin (confidence, 0-1) dựa trên độ rõ ràng của tài liệu gốc."""
 
@@ -649,7 +651,7 @@ def extract_lesson(file_bytes: bytes, mime_type: str) -> LessonExtraction:
         model=settings.GEMINI_MODEL_LESSON_INGEST,
         prompt=build_lesson_prompt_parts(file_bytes, mime_type),
         response_schema=LESSON_SCHEMA,
-        prompt_version="lesson-v1",
+        prompt_version="lesson-v2",
     )
     return LessonExtraction.model_validate(_parse_json(result["text"]))
 
@@ -954,7 +956,9 @@ vào nội dung bài xã luận/chuyên mục chính.
    có, Hán tự/âm Hán Việt nếu là từ Hán Hàn, câu ví dụ). Với MỖI mẫu ngữ
    pháp: viết usage_context_vi (tiếng Việt) giải thích dùng khi nào/hoàn
    cảnh nào — không chỉ nêu công thức; và topik_tip_vi nếu mẫu này thường
-   gặp trong đề thi TOPIK (đặc biệt viết câu 54) — nêu cách vận dụng thực tế.
+   gặp trong đề thi TOPIK (đặc biệt viết câu 54) — nêu cách vận dụng thực tế
+   dưới dạng nhận xét về ngôn ngữ (câu khẳng định), không viết thành lời ra
+   lệnh hay lời dặn làm bài.
 3. Viết MỘT dàn ý mẫu bằng tiếng Hàn theo đúng cấu trúc 4 phần của câu 54:
    hiện tượng, nguyên nhân, kết quả/ảnh hưởng, giải pháp/kiến nghị — mỗi
    phần 2-4 câu, lấy cảm hứng từ chủ đề bài xã luận này (không cần bám sát
@@ -1780,109 +1784,55 @@ def discover_editorial_candidates(db: Session) -> dict[str, Any]:
 # This generates that lecture script; app.workers.tasks.generate_content_podcast
 # then feeds it into the existing tts.synthesize_korean_tts and stores both
 # script + audio in audio.lecture_audio (cache_key prefixed "podcast:...").
-PODCAST_SCHEMA: dict[str, Any] = {
-    "type": "OBJECT",
-    "properties": {
-        "script": {
-            "type": "STRING",
-            "description": "Toàn bộ kịch bản bài giảng audio, xen kẽ tiếng Hàn và tiếng Việt, có nhắc học viên lặp lại",
-        },
-    },
-    "required": ["script"],
-}
+PODCAST_SCHEMA = podcast_script.PODCAST_SCHEMA
+PODCAST_VERSION = podcast_script.PODCAST_VERSION
+# Writing the lecture is creative work a flash-lite model does thinly; set
+# GEMINI_MODEL_PODCAST on Railway to use a stronger model without a deploy.
+_PODCAST_ATTEMPTS = 2
 
 
 def build_podcast_prompt(
     title: str,
-    vocab: list[tuple[str, str | None, str, str | None]],
-    grammar: list[tuple[str, str, str | None, str | None, str | None]],
+    vocab: list[podcast_script.Vocab],
+    grammar: list[podcast_script.Grammar],
+    *,
+    retry_note: str | None = None,
 ) -> str:
-    """vocab: (hangul, pos, meaning_vi, example_ko).
-    grammar: (pattern, meaning_vi, example_ko, usage_context_vi, topik_tip_vi)."""
-    vocab_lines = (
-        "\n".join(
-            f"- {hangul}" + (f" ({pos})" if pos else "") + f": {meaning_vi}"
-            + (f" — ví dụ: {ex}" if ex else "")
-            for hangul, pos, meaning_vi, ex in vocab
-        )
-        or "(không có từ vựng)"
-    )
-    grammar_lines = (
-        "\n".join(
-            f"- {pattern}: {meaning_vi}"
-            + (f"\n  Cách dùng: {usage}" if usage else "")
-            + (f"\n  Mẹo TOPIK: {tip}" if tip else "")
-            + (f"\n  Ví dụ: {ex}" if ex else "")
-            for pattern, meaning_vi, ex, usage, tip in grammar
-        )
-        or "(không có ngữ pháp)"
-    )
-
-    return f"""Bạn là giáo viên tiếng Hàn thu âm một bài giảng audio (kiểu podcast) cho
-người Việt học tiếng Hàn, học theo phương pháp NGHE VÀ NHẠI LẠI (shadowing) —
-KHÔNG phải học từng thẻ từ vựng rời rạc như flashcard/từ điển đọc to.
-
-Chủ đề bài học: {title}
-
-Hãy viết MỘT kịch bản audio liền mạch, nói xen kẽ tiếng Việt (giải thích,
-dẫn dắt) và tiếng Hàn (từ/câu để học viên nhại lại), theo đúng cấu trúc:
-1. Mở đầu ngắn gọn bằng tiếng Việt giới thiệu bài học sẽ nói về gì.
-2. Với TỪNG từ vựng dưới đây: đọc từ đó, nói "Nhắc lại nào:" rồi đọc lại từ
-   đó, giải thích nghĩa bằng tiếng Việt, rồi đọc câu ví dụ (nếu có) kèm
-   "Nhắc lại nào:" và đọc lại câu ví dụ.
-3. Với TỪNG mẫu ngữ pháp dưới đây: đọc mẫu ngữ pháp, giải thích bằng tiếng
-   Việt NGHĨA LÀ GÌ và QUAN TRỌNG HƠN — dùng khi nào/trong hoàn cảnh nào
-   (dựa vào phần "Cách dùng" bên dưới, diễn giải lại tự nhiên chứ không đọc
-   y nguyên như liệt kê). Nếu có mẹo thi TOPIK, hãy kể nó như một QUAN SÁT
-   VỀ NGÔN NGỮ, KHÔNG PHẢI về việc thi cử hay trả lời câu hỏi — ví dụ nói
-   "Mẫu -(으)시 này rất hay xuất hiện khi câu nói về ông bà, cha mẹ hoặc
-   người lớn tuổi trong đề TOPIK" thay vì nhắc đến việc chọn/xác định câu
-   trả lời. TUYỆT ĐỐI CẤM các từ "đáp án", "chọn", "trả lời", "câu hỏi" và
-   bất kỳ câu nào mô phỏng một đề thi trắc nghiệm (nghe giống đang ra đề
-   hoặc yêu cầu chọn phương án dễ khiến máy đọc hiểu nhầm thành một tác vụ
-   cần thực hiện thay vì lời thoại cần đọc, thay vì chỉ đơn thuần đọc to).
-   Sau đó đọc câu ví dụ kèm "Nhắc lại nào:" và đọc lại.
-4. Kết thúc bằng một câu động viên ngắn bằng tiếng Việt.
-
-Giọng văn: thân thiện, chậm rãi, như một giáo viên thật đang giảng bài trực
-tiếp — không liệt kê khô khan như tra từ điển. Đây là văn bản sẽ được đọc
-thành tiếng (text-to-speech), nên viết câu ngắn, tự nhiên khi đọc lên, dùng
-dấu câu (dấu chấm, dấu phẩy, dấu ba chấm "...") để tạo khoảng dừng tự nhiên
-thay vì dùng thẻ định dạng.
-
-QUAN TRỌNG: trường "script" PHẢI là lời thoại thật sự, TỰ NÓ ĐÃ LÀ bài giảng
-hoàn chỉnh — không được chép lại hay diễn giải các chỉ dẫn ở trên (ví dụ:
-tuyệt đối không viết những câu như "giải thích nghĩa bằng tiếng Việt" hay
-"đọc câu ví dụ kèm nhắc lại nào" — hãy TỰ THỰC HIỆN điều đó, tức là viết
-thẳng lời giải thích và lời nhắc thật ra). Không được có bất kỳ câu nào
-nghe giống một yêu cầu/câu hỏi/chỉ thị gửi tới người đọc máy — toàn bộ phải
-là câu nói trực tiếp của người giáo viên. Điều này áp dụng cả với phần mẹo
-TOPIK: tuyệt đối không dùng các từ "đáp án", "chọn", "trả lời", "câu hỏi"
-và không mô phỏng bất kỳ câu hỏi trắc nghiệm nào — hãy kể mẹo TOPIK như một
-quan sát thuần về ngôn ngữ (mẫu này hay xuất hiện trong ngữ cảnh/chủ đề
-nào), không nhắc gì đến việc thi cử, chọn hay trả lời.
-
-DANH SÁCH TỪ VỰNG:
-{vocab_lines}
-
-DANH SÁCH NGỮ PHÁP:
-{grammar_lines}
-
-Trả về đúng JSON schema đã cho (trường "script"), không thêm giải thích."""
+    """vocab: (hangul, pos, meaning_vi, example_ko, hanja, sino_vietnamese).
+    grammar: (pattern, meaning_vi, example_ko, usage_context_vi, topik_tip_vi).
+    The prompt and the checks around it live in app/services/podcast_script.py."""
+    return podcast_script.build_prompt(title, vocab, grammar, retry_note=retry_note)
 
 
 def generate_podcast_script(
     title: str,
-    vocab: list[tuple[str, str | None, str, str | None]],
-    grammar: list[tuple[str, str, str | None, str | None, str | None]],
+    vocab: list[podcast_script.Vocab],
+    grammar: list[podcast_script.Grammar],
 ) -> str:
-    result = gemini_client.generate_structured(
-        model=settings.GEMINI_MODEL_LESSON_INGEST,
-        prompt=build_podcast_prompt(title, vocab, grammar),
-        response_schema=PODCAST_SCHEMA,
-        prompt_version="podcast-v1",
-    )
-    return _parse_json(result["text"])["script"]
+    """Asks Gemini for the lecture, cleans it for the voice and checks it before
+    any text-to-speech quota is spent. A script that is empty, far too long or
+    that reads out its own instructions is asked for once more with a note about
+    what was wrong; after that the cleaned script is used as it is (unless it
+    is empty) — a slightly long lecture is better than no lecture."""
+    model = settings.GEMINI_MODEL_PODCAST or settings.GEMINI_MODEL_LESSON_INGEST
+    note: str | None = None
+    script = ""
+    for attempt in range(1, _PODCAST_ATTEMPTS + 1):
+        result = gemini_client.generate_structured(
+            model=model,
+            prompt=build_podcast_prompt(title, vocab, grammar, retry_note=note),
+            response_schema=PODCAST_SCHEMA,
+            prompt_version=PODCAST_VERSION,
+        )
+        script = podcast_script.clean_script_for_tts(str(_parse_json(result["text"]).get("script") or ""))
+        problems = podcast_script.script_problems(script)
+        if not problems:
+            return script
+        print(f"[podcast] attempt {attempt}: script problems={problems} chars={len(script)}", flush=True)
+        note = podcast_script.retry_note(problems) or None
+    if not script:
+        raise RuntimeError("Gemini không viết được kịch bản bài giảng (kịch bản rỗng).")
+    return script
 
 
 # ============================================== editorial outline feedback ==
