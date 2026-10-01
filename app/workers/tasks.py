@@ -173,9 +173,57 @@ def generate_vocab_audio(self, job_id: str, vocab_item_id: str, text_ko: str, vo
             raise
 
 
+def _voice_podcast(
+    db: Session,
+    script: str,
+    voice: str,
+    cache_key: str,
+    fallback_cache_key: str | None,
+    on_progress,
+):
+    """Voice a lecture script. Returns (reuse_row, opus, aac, duration_sec,
+    stored_key).
+
+    `fallback_cache_key` None: Gemini only, stored under `cache_key`.
+
+    Otherwise Chirp 3 HD first (stored under `cache_key`, which embeds the voice
+    spec). If Chirp fails, the WHOLE lecture is redone with Gemini (never two
+    engines in one recording) and stored under `fallback_cache_key`, so a later
+    play retries Chirp instead of being stuck with the fallback voice. A fallback
+    recording that already exists is reused while Chirp is still down, rather
+    than spending Gemini's small daily quota again."""
+    if fallback_cache_key is None:
+        opus, aac, dur = tts.synthesize_korean_tts(script, voice)
+        return None, opus, aac, dur, cache_key
+
+    try:
+        if not tts.chirp_enabled():
+            raise RuntimeError("TTS_GG_Chirp is not set on the worker service")
+        opus, aac, dur = tts.synthesize_lecture_chirp(script, on_progress)
+        return None, opus, aac, dur, cache_key
+    except Exception as chirp_exc:  # noqa: BLE001 - ANY Chirp failure must fall back, not lose the lecture
+        reason = tts.describe_error(chirp_exc)
+        print(f"[tts] lecture: Google Chirp failed ({reason}); using Gemini fallback", flush=True)
+        existing = db.execute(select(LectureAudio).where(LectureAudio.cache_key == fallback_cache_key)).scalar_one_or_none()
+        if existing is not None:
+            return existing, b"", b"", existing.duration_sec, fallback_cache_key
+        try:
+            opus, aac, dur = tts.synthesize_korean_tts(script, voice)
+        except RuntimeError as gemini_exc:
+            raise RuntimeError(f"Google Chirp lỗi ({reason}); Gemini dự phòng cũng lỗi: {gemini_exc}") from gemini_exc
+        return None, opus, aac, dur, fallback_cache_key
+
+
 @celery_app.task(name="app.workers.tasks.generate_content_podcast", bind=True, max_retries=3)
 def generate_content_podcast(
-    self, job_id: str, owner_kind: str, owner_id: str, voice: str, prompt_version: str, cache_key: str
+    self,
+    job_id: str,
+    owner_kind: str,
+    owner_id: str,
+    voice: str,
+    prompt_version: str,
+    cache_key: str,
+    fallback_cache_key: str | None = None,
 ):
     """Gemini synthesizes a lesson's/article's ENTIRE vocab+grammar into
     one consolidated "bài giảng" script (ingestion.generate_podcast_script)
@@ -190,7 +238,13 @@ def generate_content_podcast(
 
     `owner_kind` is "lesson" or "article" — re-queries vocab/grammar fresh
     from the DB rather than trusting caller-supplied payloads, same as
-    every other extraction task here."""
+    every other extraction task here.
+
+    Voice: Google Chirp 3 HD first — Korean runs with the Korean voice and
+    Vietnamese runs with the Vietnamese one (tts.synthesize_lecture_chirp) —
+    and Gemini TTS as the fallback; see _voice_podcast. `fallback_cache_key`
+    is None when the API did not have Chirp on: Gemini only, stored under
+    `cache_key`, as before."""
     jid = uuid.UUID(job_id)
     with Session(_sync_engine) as db:
         try:
@@ -226,28 +280,52 @@ def generate_content_podcast(
                 (g.pattern, g.meaning_vi, g.example_ko, g.usage_context_vi, g.topik_tip_vi) for g in grammar_rows
             ]
 
-            publish_job_event(db, jid, progress=0.3, step="Đang viết kịch bản với Gemini")
-            script = ingestion.generate_podcast_script(title, vocab, grammar)
-
-            # The script alternates Vietnamese explanation with Korean examples, so it
-            # stays on Gemini (a ko-KR Chirp voice cannot read Vietnamese).
-            publish_job_event(db, jid, progress=0.6, step="Đang tạo giọng đọc với Gemini")
-            opus_bytes, aac_bytes, duration_sec = tts.synthesize_korean_tts(script, voice)
-
-            publish_job_event(db, jid, progress=0.9, step="Đang lưu bài giảng")
-            row = LectureAudio(
-                cache_key=cache_key,
-                opus_path=f"/api/v1/lessons/audio/{cache_key}.opus",
-                aac_path=f"/api/v1/lessons/audio/{cache_key}.aac",
-                opus_data=opus_bytes,
-                aac_data=aac_bytes,
-                prompt_version=prompt_version,
-                voice=voice,
-                duration_sec=duration_sec,
-                script_text=script,
+            # A lecture already voiced by the Gemini fallback has its script on the
+            # row: when only the voice is being redone, the same lecture is kept
+            # instead of paying for (and getting) a different one.
+            earlier = (
+                db.execute(select(LectureAudio).where(LectureAudio.cache_key == fallback_cache_key)).scalar_one_or_none()
+                if fallback_cache_key
+                else None
             )
-            db.add(row)
-            db.commit()
+            if earlier is not None and (earlier.script_text or "").strip():
+                script = earlier.script_text
+            else:
+                publish_job_event(db, jid, progress=0.3, step="Đang viết kịch bản với Gemini")
+                script = ingestion.generate_podcast_script(title, vocab, grammar)
+
+            def on_progress(done: int, total: int) -> None:
+                if total <= 0:
+                    return
+                publish_job_event(
+                    db,
+                    jid,
+                    progress=round(0.5 + 0.4 * done / total, 3),
+                    step=f"Đang tạo giọng đọc ({done}/{total})" if done < total else "Đang ghép âm thanh",
+                )
+
+            publish_job_event(db, jid, progress=0.5, step="Đang tạo giọng đọc")
+            reuse, opus_bytes, aac_bytes, duration_sec, stored_key = _voice_podcast(
+                db, script, voice, cache_key, fallback_cache_key, on_progress
+            )
+
+            if reuse is not None:
+                row = reuse
+            else:
+                publish_job_event(db, jid, progress=0.95, step="Đang lưu bài giảng")
+                row = LectureAudio(
+                    cache_key=stored_key,
+                    opus_path=f"/api/v1/lessons/audio/{stored_key}.opus",
+                    aac_path=f"/api/v1/lessons/audio/{stored_key}.aac",
+                    opus_data=opus_bytes,
+                    aac_data=aac_bytes,
+                    prompt_version=prompt_version,
+                    voice=voice,
+                    duration_sec=duration_sec,
+                    script_text=script,
+                )
+                db.add(row)
+                db.commit()
 
             publish_job_event(
                 db,
@@ -256,10 +334,10 @@ def generate_content_podcast(
                 progress=1.0,
                 step="Hoàn tất",
                 result={
-                    "cache_key": cache_key,
+                    "cache_key": stored_key,
                     "opus_path": row.opus_path,
                     "aac_path": row.aac_path,
-                    "duration_sec": duration_sec,
+                    "duration_sec": row.duration_sec,
                     "script_text": script,
                 },
             )

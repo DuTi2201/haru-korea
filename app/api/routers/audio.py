@@ -31,7 +31,7 @@ from app.api.deps import get_current_profile
 from app.db import get_db
 from app.models import CorpusItemAudio, GrammarPoint, Job, LectureAudio, Lesson, Profile, VocabItem, VocabItemAudio
 from app.schemas import CorpusAudioRequest, JobAccepted, LectureAudioRequest, PodcastRequest, VocabAudioRequest
-from app.services import podcast_script
+from app.services import podcast_script, tts
 from app.workers.tasks import (
     generate_content_podcast,
     generate_corpus_audio,
@@ -100,7 +100,18 @@ async def _request_podcast(
     # makes every lecture regenerate with the new prompt, whatever an older
     # client still sends in the request body.
     prompt_version = podcast_script.PODCAST_VERSION
-    cache_key = await _podcast_cache_key(db, owner_kind, owner_id, body.voice, prompt_version, vocab_ids, grammar_ids)
+    base_key = await _podcast_cache_key(db, owner_kind, owner_id, body.voice, prompt_version, vocab_ids, grammar_ids)
+    # With Google Chirp on, the key also carries the two voices' spec: lectures
+    # recorded earlier by Gemini do not match and are redone in the Chirp voice,
+    # and changing a voice or pace on Railway redoes them again. The plain key is
+    # where the worker files a Gemini FALLBACK recording (Chirp failed), so a
+    # later play retries Chirp instead of staying on the fallback voice.
+    if tts.chirp_enabled():
+        cache_key = f"{base_key}:{tts.lecture_spec()}"
+        fallback_cache_key: str | None = base_key
+    else:
+        cache_key = base_key
+        fallback_cache_key = None
 
     cached = await db.execute(select(LectureAudio).where(LectureAudio.cache_key == cache_key))
     hit = cached.scalar_one_or_none()
@@ -110,7 +121,14 @@ async def _request_podcast(
         select(Job).where(Job.type == "generate_content_podcast", Job.idempotency_key == idempotency_key)
     )
     job = existing_job.scalar_one_or_none()
-    if job is not None and job.status not in ("queued", "running", "succeeded"):
+    if job is not None and (
+        job.status not in ("queued", "running", "succeeded")
+        # A "succeeded" job whose recording is not in the cache under the key we
+        # want NOW: the Gemini fallback was used (Chirp failed), or a voice or
+        # pace changed. Run again so Chirp gets another chance — the worker
+        # reuses the fallback lecture's script and recording while Chirp is down.
+        or (job.status == "succeeded" and hit is None)
+    ):
         # A prior attempt with this exact idempotency key ended in "failed"
         # (or another terminal-but-not-usable state). `idempotency_key` has
         # a DB-level unique constraint per job type, so leaving that row in
@@ -144,7 +162,7 @@ async def _request_podcast(
 
         if not hit:
             generate_content_podcast.delay(
-                str(job.id), owner_kind, owner_id, body.voice, prompt_version, cache_key
+                str(job.id), owner_kind, owner_id, body.voice, prompt_version, cache_key, fallback_cache_key
             )
 
     return JobAccepted(

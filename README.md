@@ -57,6 +57,9 @@ the environment level):
 | `TTS_GG_Chirp` | Google Cloud Text-to-Speech API key (Chirp 3 HD, the primary Korean voice). Set ONLY as a Railway variable on the api AND worker services, never in code; empty = Gemini TTS only |
 | `TTS_CHIRP_VOICE` | optional, defaults to `ko-KR-Chirp3-HD-Iapetus`; changing it regenerates article audio |
 | `TTS_CHIRP_SPEAKING_RATE` | optional, defaults to `0.85` (API range 0.25–2.0); changing it regenerates article audio |
+| `TTS_CHIRP_VOICE_VI` | optional; the Vietnamese voice of the "Bài giảng tổng hợp" lecture (Hangul runs use `TTS_CHIRP_VOICE`, everything else this one). Empty = the same persona in vi-VN (e.g. `vi-VN-Chirp3-HD-Iapetus`); changing it regenerates lectures |
+| `TTS_CHIRP_SPEAKING_RATE_VI` | optional, defaults to `0.95`; changing it regenerates lectures |
+| `GEMINI_MODEL_PODCAST` | optional; the model that WRITES the lecture script (empty = `GEMINI_MODEL_LESSON_INGEST`). A stronger model gives richer lectures |
 | `GEMINI_EMBEDDING_MODEL` | optional, defaults to `gemini-embedding-2` |
 | `MAX_INGEST_FILE_MB` | optional, defaults to `20` — caps a single Studio upload |
 | `CORPUS_CHUNK_SIZE` | optional, defaults to `40` — subtitle cues per Gemini call |

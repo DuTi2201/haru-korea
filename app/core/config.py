@@ -81,6 +81,14 @@ class Settings(BaseSettings):
     # (see google_tts.spec), so recordings regenerate with the new voice.
     TTS_CHIRP_VOICE: str = "ko-KR-Chirp3-HD-Iapetus"
     TTS_CHIRP_SPEAKING_RATE: float = 0.85
+    # The "Bài giảng tổng hợp" lecture mixes Vietnamese explanation with Korean
+    # examples. A Chirp voice belongs to ONE language, so the lecture is voiced
+    # run by run: Hangul with TTS_CHIRP_VOICE (pace above, slowed for
+    # shadowing) and Vietnamese with the voice below. Empty voice = the same
+    # persona as the Korean one in vi-VN (e.g. vi-VN-Chirp3-HD-Iapetus), so
+    # the lecturer sounds like one person. Both are cache-key inputs.
+    TTS_CHIRP_VOICE_VI: str = ""
+    TTS_CHIRP_SPEAKING_RATE_VI: float = 0.95
 
     # Content-ingestion tuning (Studio uploads — admin.py/ingest.py)
     MAX_INGEST_FILE_MB: int = 20

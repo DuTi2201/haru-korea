@@ -5,8 +5,9 @@
 Voices: Google Chirp 3 HD (app/services/google_tts.py) is the PRIMARY voice
 for Korean-only text whenever the `TTS_GG_Chirp` credential is configured
 (`synthesize_article_chirp`, `synthesize_korean_tts_chirp_first`); Gemini TTS
-below is the fallback, and the only voice for the podcast script, which mixes
-Vietnamese with Korean (a ko-KR voice cannot read Vietnamese). One call
+below is the fallback. The podcast script mixes Vietnamese with Korean, and a
+Chirp voice speaks one language only, so `synthesize_lecture_chirp` voices it
+run by run (Hangul with the ko-KR voice, Vietnamese with the vi-VN one). One call
 here == one TTS request, so every caller MUST go through the
 content-addressed cache (cache_key = f"{content_id}:{voice}:{prompt_version}",
 already the pattern audio.py's lecture-audio route uses) rather than
@@ -30,7 +31,7 @@ from google import genai
 from google.genai import errors as genai_errors
 
 from app.core.config import settings
-from app.services import google_tts, read_along
+from app.services import google_tts, lecture_voice, read_along
 
 # Friendly ids (already the shape of LectureAudioRequest.voice's default,
 # "ko-female-1") mapped to one of Gemini's prebuilt voice names. Kept as a
@@ -633,11 +634,107 @@ def _synthesize_korean_chirp(text: str) -> tuple[bytes, bytes, int]:
     return transcode_pcm(pcm_all, rate)
 
 
+# ------------------------------------------ bilingual lecture (Chirp, primary)
+_LECTURE_MAX_CHARS = 9000  # the script lint's own ceiling (podcast_script.script_problems)
+_LECTURE_SPLIT_GAP_MS = 200  # between two requests of one long run
+
+
+def lecture_spec() -> str:
+    """Id of the two voices + paces a lecture is voiced with (cache keys)."""
+    return google_tts.lecture_spec()
+
+
+def plan_lecture(script: str) -> list[tuple[str, str, int]]:
+    """script -> [(language, text, silence_after_ms)], one entry per Chirp
+    request: the script cut where the language changes, long runs cut again at
+    sentence boundaries so every request stays inside the byte limit."""
+    plan: list[tuple[str, str, int]] = []
+    for run in lecture_voice.split_runs(script[:_LECTURE_MAX_CHARS]):
+        if len(run.text) <= google_tts.CHUNK_CHARS:
+            plan.append((run.lang, run.text, run.pause_after_ms))
+            continue
+        pieces = _split_for_tts(run.text, google_tts.CHUNK_CHARS)
+        for i, piece in enumerate(pieces):
+            last = i == len(pieces) - 1
+            plan.append((run.lang, piece, run.pause_after_ms if last else _LECTURE_SPLIT_GAP_MS))
+    return plan
+
+
+def _lecture_request(lang: str, voices: dict[str, str]) -> Callable[[str], tuple[bytes, int]]:
+    """The one-request function for a language, so the shared retry loop can
+    drive it. The Vietnamese voice is derived (same persona in vi-VN) unless
+    configured, so it is the one that can turn out not to exist: when Google
+    refuses it, a Vietnamese Chirp voice that does exist is picked once and
+    used for the rest of the lecture."""
+    rate = google_tts.speaking_rate() if lang == lecture_voice.KO else google_tts.vi_speaking_rate()
+
+    def one(text: str) -> tuple[bytes, int]:
+        try:
+            return google_tts.synthesize_pcm(text, voice=voices[lang], rate=rate)
+        except google_tts.GoogleTTSTransient as exc:
+            raise TransientTTSError(str(exc)) from exc
+        except google_tts.GoogleTTSError as exc:
+            if lang != lecture_voice.VI:
+                raise
+            replacement = google_tts.pick_vi_voice(voices[lang])
+            if not replacement:
+                raise
+            print(f"[tts] vi voice {voices[lang]} refused ({describe_error(exc)}); using {replacement}", flush=True)
+            voices[lang] = replacement
+            try:
+                return google_tts.synthesize_pcm(text, voice=replacement, rate=rate)
+            except google_tts.GoogleTTSTransient as again:
+                raise TransientTTSError(str(again)) from again
+
+    return one
+
+
+def synthesize_lecture_chirp(
+    script: str, on_progress: Callable[[int, int], None] | None = None
+) -> tuple[bytes, bytes, int]:
+    """Voice a Vietnamese+Korean lecture with Google Chirp 3 HD: Hangul with
+    the Korean voice (slow, for shadowing), everything else with the
+    Vietnamese voice, silence between runs, one transcode at the end. Chirp
+    is a plain text-to-speech engine, so — unlike Gemini's — it never mistakes
+    a line of the lecture for a task to answer. Raises RuntimeError on any
+    failure; the Celery task decides about the Gemini fallback, and the two
+    engines are never mixed inside one recording."""
+    if not google_tts.is_configured():
+        raise RuntimeError("TTS_GG_Chirp is not set")
+    plan = plan_lecture(script)
+    if not plan:
+        raise RuntimeError("empty lecture script")
+    voices = {lecture_voice.KO: google_tts.voice_name(), lecture_voice.VI: google_tts.vi_voice_name()}
+    senders = {lang: _lecture_request(lang, voices) for lang in voices}
+    n_ko = sum(1 for lang, _t, _p in plan if lang == lecture_voice.KO)
+    print(
+        f"[tts] lecture provider=google-chirp spec={google_tts.lecture_spec()} chars={len(script)} "
+        f"requests={len(plan)} (ko={n_ko} vi={len(plan) - n_ko})",
+        flush=True,
+    )
+    if on_progress:
+        on_progress(0, len(plan))
+
+    parts: list[tuple[bytes, int, int]] = []
+    heard: dict[tuple[str, str], tuple[bytes, int]] = {}  # a repeated phrase is voiced once
+    for idx, (lang, text, pause_ms) in enumerate(plan):
+        key = (lang, text)
+        if key not in heard:
+            heard[key] = _retry_transient(senders[lang], text)
+        pcm, rate = heard[key]
+        parts.append((pcm, rate, pause_ms))
+        if on_progress:
+            on_progress(idx + 1, len(plan))
+
+    pcm_all, rate = _join_pcm(parts)
+    return transcode_pcm(pcm_all, rate)
+
+
 def synthesize_korean_tts_chirp_first(text_ko: str, voice: str = "ko-female-1") -> tuple[bytes, bytes, int]:
     """Korean-ONLY text (a lesson passage, one listening sentence, one word):
     Google Chirp 3 HD when configured, Gemini when it is not or when Chirp
     fails. Not for the podcast script — that mixes in Vietnamese, which a
-    ko-KR voice cannot read; it stays on synthesize_korean_tts."""
+    ko-KR voice cannot read; it uses synthesize_lecture_chirp."""
     text = text_ko.strip()
     if not text:
         raise RuntimeError("empty text_ko")

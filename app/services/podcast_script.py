@@ -119,7 +119,9 @@ CÁCH BẠN DẠY (áp dụng xuyên suốt)
    thành một cụm bài, thay vì đi lần lượt từng từ theo danh sách.
 3. Mở rộng có chọn lọc. Với từ quan trọng, nêu một hoặc hai từ đồng nghĩa hay trái
    nghĩa phổ biến và nói rõ khác nhau ở sắc thái hay hoàn cảnh dùng. Với từ gốc Hán
-   có sẵn âm Hán Việt trong dữ liệu, nối với âm Hán Việt để học viên đoán nghĩa nhanh.
+   có sẵn âm Hán Việt trong dữ liệu, nối với âm Hán Việt để học viên đoán nghĩa nhanh
+   (chỉ nói âm Hán Việt bằng chữ quốc ngữ, đừng viết chữ Hán vào lời giảng vì giọng
+   đọc không đọc được chữ Hán).
 4. Thành ngữ, tục ngữ, cách nói quen thuộc: chỉ đưa vào khi bạn CHẮC CHẮN đó là câu
    người Hàn thật sự dùng và liên quan tới từ hay chủ đề đang học. Nói câu tiếng Hàn,
    nghĩa đen, nghĩa bóng và lúc người Hàn hay dùng. Không chắc thì bỏ qua, tuyệt đối
@@ -207,11 +209,21 @@ _BLANK_RUN_RE = re.compile(r"\n{3,}")
 _SPACE_RUN_RE = re.compile(r"[ \t]{2,}")
 
 
+def _is_han_ideograph(ch: str) -> bool:
+    o = ord(ch)
+    return 0x3400 <= o <= 0x4DBF or 0x4E00 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF
+
+
 def _drop_symbols_and_emoji(text: str) -> str:
+    """Also drops Han characters (hanja): neither the Korean nor the Vietnamese
+    voice can read them, and the lecture says the Sino-Vietnamese reading aloud
+    anyway."""
     out = []
     for ch in text:
         cat = unicodedata.category(ch)
         if cat in ("So", "Sk", "Cs", "Co", "Cf"):  # symbols, emoji, private-use, zero-width marks
+            continue
+        if _is_han_ideograph(ch):
             continue
         out.append(ch)
     return "".join(out)
@@ -234,6 +246,7 @@ def clean_script_for_tts(script: str) -> str:
     text = _drop_symbols_and_emoji(text)
     text = _LEFTOVER_SYMBOLS_RE.sub(" ", text)
     text = _SPACE_RUN_RE.sub(" ", text)
+    text = re.sub(r" +([,.;:!?])", r"\1", text)  # what is left where a hanja was dropped
     text = re.sub(r" *\n *", "\n", text)
     text = _BLANK_RUN_RE.sub("\n\n", text)
     return text.strip()
