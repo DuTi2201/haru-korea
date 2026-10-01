@@ -94,6 +94,8 @@ def _candidate(row) -> exam_drill.Candidate:
         skill=skill,
         passage_kind=passage_kind,
         passage_ko=passage_ko,
+        instruction_ko=item.instruction_ko or "",
+        passage_linked=item.passage_id is not None,
     )
 
 
@@ -135,6 +137,7 @@ async def get_exam_drill(
                 number=c.number,
                 qtype_code=c.qtype_code,
                 qtype_name_vi=row[2],
+                instruction_ko=c.instruction_ko.strip() or None,
                 stem_ko=c.stem_ko,
                 options=exam_drill.clean_options(c.options) or [],
                 passage_ko=(c.passage_ko or "").strip() or None,

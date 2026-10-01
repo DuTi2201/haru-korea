@@ -49,7 +49,15 @@ from app.models import (
     Topic,
     VocabItem,
 )
-from app.services import article_extract, corpus_browse, corpus_enrich, gemini_client, lesson_extract, podcast_script
+from app.services import (
+    article_extract,
+    corpus_browse,
+    corpus_enrich,
+    exam_extract,
+    gemini_client,
+    lesson_extract,
+    podcast_script,
+)
 from app.services.subtitles import Cue, chunk_cues, parse_plain_lines, parse_subtitles
 
 # ============================================================ extraction ==
@@ -150,66 +158,6 @@ CORPUS_CHUNK_SCHEMA: dict[str, Any] = {
     },
     "required": ["items"],
 }
-
-# Exam-paper extraction: one multimodal call per uploaded paper (bounded
-# size — an exam paper is a fixed handful of pages, not open-ended like a
-# film script, so FR-19/Gate G6's chunking constraint doesn't apply here).
-# Passages carry a `local_ref` the model invents (e.g. "P1") purely so it
-# can point items at the passage they belong to within the SAME response;
-# apply_exam_batch resolves local_ref -> real content.exam_passage.id.
-EXAM_SCHEMA: dict[str, Any] = {
-    "type": "OBJECT",
-    "properties": {
-        "passages": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "local_ref": {"type": "STRING", "description": "id tạm, vd 'P1', để items tham chiếu tới"},
-                    "kind": {"type": "STRING", "enum": ["đọc hiểu", "nghe", "biểu đồ"]},
-                    "body_ko": {"type": "STRING", "nullable": True, "description": "toàn văn đoạn văn/kịch bản nghe"},
-                    "source_page": {"type": "INTEGER"},
-                    "confidence": {"type": "NUMBER"},
-                },
-                "required": ["local_ref", "kind", "source_page", "confidence"],
-            },
-        },
-        "items": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "number": {"type": "INTEGER", "description": "số thứ tự câu hỏi trong đề"},
-                    "passage_ref": {
-                        "type": "STRING",
-                        "nullable": True,
-                        "description": "local_ref của đoạn văn/bài nghe liên quan, để trống nếu câu hỏi độc lập",
-                    },
-                    "qtype_code": {
-                        "type": "STRING",
-                        "nullable": True,
-                        "description": "CHỈ chọn từ danh sách mã loại câu hỏi đã cho, để trống nếu không khớp mã nào",
-                    },
-                    "stem_ko": {"type": "STRING"},
-                    "options": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "các lựa chọn, thường 4"},
-                    "answer": {
-                        "type": "INTEGER",
-                        "nullable": True,
-                        "description": "số thứ tự đáp án đúng (1-based), để trống nếu không xác định được",
-                    },
-                    "answer_from_key": {
-                        "type": "BOOLEAN",
-                        "description": "true nếu đáp án đọc được từ bảng đáp án in trong tài liệu, false nếu là suy đoán của mô hình",
-                    },
-                    "confidence": {"type": "NUMBER"},
-                },
-                "required": ["number", "stem_ko", "options", "answer_from_key", "confidence"],
-            },
-        },
-    },
-    "required": ["passages", "items"],
-}
-
 
 # Editorial reading (사설/칼럼 luyện đọc + luyện dàn ý cho TOPIK viết câu 54):
 # one call per article. body_ko is the admin-reviewable staged text (see
@@ -345,30 +293,6 @@ class CorpusCueClassification(BaseModel):
 
 class CorpusChunkClassification(BaseModel):
     items: list[CorpusCueClassification] = Field(default_factory=list)
-
-
-class ExamPassageExtraction(BaseModel):
-    local_ref: str
-    kind: Literal["đọc hiểu", "nghe", "biểu đồ"]
-    body_ko: str | None = None
-    source_page: int = 1
-    confidence: float = Field(ge=0, le=1, default=0.5)
-
-
-class ExamItemExtraction(BaseModel):
-    number: int
-    passage_ref: str | None = None
-    qtype_code: str | None = None
-    stem_ko: str
-    options: list[str] = Field(default_factory=list)
-    answer: int | None = Field(default=None, ge=1, le=5)
-    answer_from_key: bool = False
-    confidence: float = Field(ge=0, le=1, default=0.5)
-
-
-class ExamExtraction(BaseModel):
-    passages: list[ExamPassageExtraction] = Field(default_factory=list)
-    items: list[ExamItemExtraction] = Field(default_factory=list)
 
 
 class ModelOutline(BaseModel):
@@ -519,131 +443,222 @@ def extract_corpus_source_text(file_bytes: bytes, mime_type: str | None) -> str:
     return file_bytes.decode("utf-8", errors="replace")
 
 
-def build_exam_prompt(known_qtypes: list[tuple[str, str]], *, multi_file: bool = False) -> str:
-    qtype_hint = "\n".join(f"- {code}: {name_vi}" for code, name_vi in known_qtypes) or (
-        "(chưa có loại câu hỏi nào trong hệ thống — để qtype_code trống cho mọi câu)"
-    )
-    multi_file_note = (
-        """
-Đề thi này được cung cấp dưới dạng NHIỀU TỆP riêng biệt cho CÙNG MỘT đề thi
-(vd: một tệp đề đọc hiểu, một tệp đề nghe/viết, và một tệp đáp án riêng —
-thứ tự các tệp không nói lên tệp nào là gì, hãy tự nhận diện qua nội dung).
-Hãy đọc TẤT CẢ các tệp và kết hợp chúng thành MỘT đề thi thống nhất (số thứ
-tự câu hỏi không được trùng lặp giữa các tệp — nếu hai tệp đều có "câu 1",
-đó là hai câu hỏi khác nhau thuộc hai phần khác nhau của đề, không phải bản
-sao). Nếu một trong các tệp là bảng đáp án riêng (chỉ liệt kê số câu + đáp
-án đúng, không có đề bài), hãy dùng nó để điền answer/answer_from_key=true
-cho các câu hỏi tương ứng đọc được từ (các) tệp còn lại — đừng tạo exam_item
-riêng cho bản thân tệp đáp án đó.
-"""
-        if multi_file
-        else ""
-    )
-    return f"""Bạn là biên tập viên đề thi TOPIK cho người Việt học tiếng Hàn.
-Đọc ảnh/tài liệu đề thi được đính kèm (có thể nhiều trang) và trích xuất:
-{multi_file_note}
-1) Các đoạn văn/bài nghe (passages): mỗi đoạn đọc hiểu, kịch bản nghe, hoặc
-   biểu đồ/quảng cáo dùng chung cho một hoặc nhiều câu hỏi. Đặt cho mỗi đoạn
-   một local_ref ngắn tự chọn (vd "P1", "P2") để các câu hỏi tham chiếu tới.
-2) Từng câu hỏi (items): số thứ tự, đoạn văn liên quan (passage_ref, để
-   trống nếu câu hỏi độc lập không cần đoạn văn), đề bài, các lựa chọn.
-
-Với qtype_code, CHỈ chọn từ danh sách mã đã có trong hệ thống dưới đây nếu
-đúng khớp; để trống nếu không có mã nào khớp (không tự đặt mã mới):
-{qtype_hint}
-
-Với đáp án: nếu tài liệu có in kèm bảng đáp án (answer key, kể cả khi đó là
-một tệp riêng), đọc chính xác đáp án cho từng câu và đánh dấu
-answer_from_key=true. Nếu KHÔNG có bảng đáp án ở đâu cả, có thể tự suy luận
-đáp án khả dĩ nhất (answer_from_key=false) hoặc để answer trống nếu không đủ
-căn cứ — không suy đoán bừa.
-
-Trả về đúng JSON schema đã cho, không thêm giải thích. Tự đánh giá độ tự tin
-(confidence, 0-1) cho từng đoạn văn và từng câu hỏi."""
+def run_exam_extraction(
+    db: Session,
+    batch: ImportBatch,
+    files: list[tuple[bytes, str]],
+    *,
+    session_label: str = "",
+    on_progress=None,
+) -> tuple[int, int]:
+    """Reads the paper (see app/services/exam_extract.py) and stages the result.
+    `files` is (bytes, mime_type) per uploaded file; they are the pages of ONE paper."""
+    qtypes = [
+        (code, name_vi, skill)
+        for code, name_vi, skill in db.execute(
+            select(QuestionType.code, QuestionType.name_vi, QuestionType.skill).where(QuestionType.active.is_(True))
+        ).all()
+    ]
+    draft = exam_extract.extract(files, qtypes, session_label=session_label, on_progress=on_progress)
+    return stage_exam_draft(db, batch, draft)
 
 
-def build_exam_prompt_parts(
-    files: list[tuple[bytes, str]], known_qtypes: list[tuple[str, str]]
-) -> list[Any]:
-    """`files` is (bytes, mime_type) per uploaded file — 1 to 3 of them
-    (reading passage / listening+writing / answer key; see Studio's
-    exam_paper upload form), all handed to Gemini as separate multimodal
-    parts of the SAME call so it can cross-reference an answer key against
-    the actual questions (FR-19/Gate G6 doesn't apply here — an exam paper
-    is a fixed handful of pages regardless of how many files it's split
-    across)."""
-    parts: list[Any] = [gemini_client.part_from_bytes(data, mime) for data, mime in files]
-    parts.append(build_exam_prompt(known_qtypes, multi_file=len(files) > 1))
-    return parts
-
-
-def extract_exam_paper(files: list[tuple[bytes, str]], known_qtypes: list[tuple[str, str]]) -> ExamExtraction:
-    result = gemini_client.generate_structured(
-        model=settings.GEMINI_MODEL_LESSON_INGEST,
-        prompt=build_exam_prompt_parts(files, known_qtypes),
-        response_schema=EXAM_SCHEMA,
-        prompt_version="exam-v1",
-    )
-    return ExamExtraction.model_validate(_parse_json(result["text"]))
-
-
-def run_exam_extraction(db: Session, batch: ImportBatch, files: list[tuple[bytes, str]]) -> tuple[int, int]:
-    """Stages one ImportItem per extracted passage (kind="exam_passage")
-    and per extracted question (kind="exam_item"). A question whose answer
-    is the model's own guess (no printed answer key found) is ALWAYS
-    flagged for review regardless of confidence — getting an exam answer
-    wrong is worse than a wrong vocab gloss, so it never slips through on
-    a high self-reported confidence alone (same force_flag idea as
-    corpus's is_crude). `files` is 1-3 (bytes, mime_type) pairs — see
-    build_exam_prompt_parts."""
-    known_qtypes = db.execute(
-        select(QuestionType.code, QuestionType.name_vi).where(QuestionType.active.is_(True))
-    ).all()
-    extraction = extract_exam_paper(files, known_qtypes)
+def stage_exam_draft(db: Session, batch: ImportBatch, draft: exam_extract.Draft) -> tuple[int, int]:
+    """One ImportItem per passage (kind="exam_passage") and per question
+    (kind="exam_item"), each with the reasons it needs a look in payload["flags"],
+    plus one "exam_summary" item that records how the paper was read (pages, the
+    section, missing question numbers, where the answers came from) and is not
+    itself reviewed. Returns (staged, flagged)."""
     staged = 0
     flagged = 0
-
-    for p in extraction.passages:
-        status = confidence_status(p.confidence)
-        if status != "pending":
-            flagged += 1
+    for entry in draft.passages:
+        status = exam_extract.status_for(entry["flags"], entry["confidence"])
+        flagged += status != "pending"
         db.add(
             ImportItem(
                 import_batch_id=batch.id,
                 kind="exam_passage",
                 status=status,
-                confidence=p.confidence,
-                payload={"local_ref": p.local_ref, "kind": p.kind, "body_ko": p.body_ko, "source_page": p.source_page},
+                confidence=entry["confidence"],
+                payload=entry["payload"],
             )
         )
         staged += 1
-
-    for it in extraction.items:
-        needs_human_answer_check = it.answer is not None and not it.answer_from_key
-        status = confidence_status(it.confidence, force_flag=needs_human_answer_check)
-        if status != "pending":
-            flagged += 1
+    for entry in draft.items:
+        status = exam_extract.status_for(entry["flags"], entry["confidence"])
+        flagged += status != "pending"
         db.add(
             ImportItem(
                 import_batch_id=batch.id,
                 kind="exam_item",
                 status=status,
-                confidence=it.confidence,
-                payload={
-                    "number": it.number,
-                    "passage_ref": it.passage_ref,
-                    "qtype_code": it.qtype_code,
-                    "stem_ko": it.stem_ko,
-                    "options": it.options,
-                    "answer": it.answer,
-                    "answer_from_key": it.answer_from_key,
-                },
+                confidence=entry["confidence"],
+                payload=entry["payload"],
             )
         )
         staged += 1
-
+    db.add(
+        ImportItem(
+            import_batch_id=batch.id, kind=EXAM_SUMMARY, status="confirmed", confidence=1.0, payload=draft.summary
+        )
+    )
     db.flush()
+
+    # An answer key printed on the paper's own pages is used like an uploaded one.
+    skill = exam_extract.choose_key_section(draft.key, draft.summary.get("section"))
+    if skill is not None:
+        apply_answers(db, batch, draft.key[skill], skill=skill, source="paper")
     return staged, flagged
+
+
+EXAM_SUMMARY = "exam_summary"
+
+
+def _answer_rows(
+    items: list[ImportItem], live: list[ExamItem], answers: dict[int, int], *, commit: bool
+) -> exam_extract.AnswerReport:
+    """Put the answers on the staged questions (and on the questions already in the
+    library, if the batch was confirmed). With commit=False nothing changes — it only
+    reports what would."""
+    questions = [i for i in items if i.kind == "exam_item" and i.status != "rejected"]
+    by_number = {i.payload.get("number"): i for i in questions}
+    applied: list[int] = []
+    changed: list[int] = []
+    for number, answer in sorted(answers.items()):
+        item = by_number.get(number)
+        if item is None:
+            continue
+        applied.append(number)
+        if item.payload.get("answer") not in (None, answer):
+            changed.append(number)
+        if not commit:
+            continue
+        flags = [f for f in item.payload.get("flags", []) if f != "no_answer"]
+        item.payload = {**item.payload, "answer": answer, "answer_from_key": True, "flags": flags}
+        if item.status in ("pending", "flagged_yellow", "flagged_red"):
+            item.status = exam_extract.status_for(flags, item.confidence)
+    missing = sorted(n for n in by_number if n not in answers)
+    if commit:
+        for number in missing:
+            item = by_number[number]
+            flags = list(item.payload.get("flags", []))
+            if "no_answer" not in flags:
+                flags.append("no_answer")
+            item.payload = {**item.payload, "flags": flags}
+            if item.status in ("pending", "flagged_yellow", "flagged_red"):
+                item.status = exam_extract.status_for(flags, item.confidence)
+        for row in live:
+            if row.number in answers:
+                row.answer = answers[row.number]
+                row.answer_source = "editor"
+    return exam_extract.AnswerReport(
+        skill=None,
+        applied=applied,
+        changed=changed,
+        unmatched=sorted(n for n in answers if n not in by_number),
+        missing=missing,
+    )
+
+
+def _record_key(
+    summary: ImportItem | None, report: exam_extract.AnswerReport, *, skill: str | None, source: str, conflicts: list[int]
+) -> None:
+    if summary is None:
+        return
+    summary.payload = {
+        **summary.payload,
+        "key": {
+            "source": source,
+            "skill": skill,
+            "applied": len(report.applied),
+            "missing": report.missing,
+            "unmatched": report.unmatched,
+            "conflicts": conflicts,
+            "at": exam_extract.now_iso(),
+        },
+    }
+
+
+def apply_answers(
+    db: Session,
+    batch: ImportBatch,
+    answers: dict[int, int],
+    *,
+    skill: str | None,
+    source: str,
+    conflicts: list[int] | None = None,
+    commit: bool = True,
+) -> exam_extract.AnswerReport:
+    """Set the answers of a paper's questions from a key ("file" = an uploaded
+    answer key, "paper" = a key printed on the paper's own pages, "manual" = typed
+    by an editor). Questions already in the library get the answer too, so a key can
+    arrive after the batch was confirmed."""
+    items = db.execute(select(ImportItem).where(ImportItem.import_batch_id == batch.id)).scalars().all()
+    live = (
+        db.execute(select(ExamItem).where(ExamItem.paper_id == batch.exam_paper_id)).scalars().all()
+        if batch.exam_paper_id is not None
+        else []
+    )
+    report = _answer_rows(list(items), list(live), answers, commit=commit)
+    report.skill = skill
+    report.conflicts = conflicts or []
+    if commit:
+        summary = next((i for i in items if i.kind == EXAM_SUMMARY), None)
+        _record_key(summary, report, skill=skill, source=source, conflicts=report.conflicts)
+        paper = db.get(ExamPaper, batch.exam_paper_id) if batch.exam_paper_id is not None else None
+        if paper is not None:
+            paper.answer_status = _answer_status(items)
+        db.flush()
+    return report
+
+
+async def apply_answers_async(
+    db: AsyncSession,
+    batch: ImportBatch,
+    answers: dict[int, int],
+    *,
+    skill: str | None,
+    source: str,
+    commit: bool = True,
+) -> exam_extract.AnswerReport:
+    """The same as apply_answers, for a request handler's async session."""
+    items = (await db.execute(select(ImportItem).where(ImportItem.import_batch_id == batch.id))).scalars().all()
+    live = (
+        (await db.execute(select(ExamItem).where(ExamItem.paper_id == batch.exam_paper_id))).scalars().all()
+        if batch.exam_paper_id is not None
+        else []
+    )
+    report = _answer_rows(list(items), list(live), answers, commit=commit)
+    report.skill = skill
+    if commit:
+        summary = next((i for i in items if i.kind == EXAM_SUMMARY), None)
+        _record_key(summary, report, skill=skill, source=source, conflicts=[])
+        paper = await db.get(ExamPaper, batch.exam_paper_id) if batch.exam_paper_id is not None else None
+        if paper is not None:
+            paper.answer_status = _answer_status(items)
+        await db.commit()
+    return report
+
+
+def _answer_status(items: list[ImportItem]) -> str:
+    """content.exam_paper.answer_status: pending (no answers), partial, complete."""
+    questions = [i for i in items if i.kind == "exam_item" and i.status != "rejected"]
+    have = sum(1 for i in questions if i.payload.get("answer") is not None)
+    if not questions or have == 0:
+        return "pending"
+    return "complete" if have == len(questions) else "partial"
+
+
+def paper_skill(items: list[ImportItem], session_label: str | None) -> str | None:
+    """Which part of the exam this batch is (đọc / nghe / viết): the editor's own
+    label first, then what extraction recorded, then the staged question types."""
+    from_label = exam_extract.section_from_label(session_label)
+    if from_label:
+        return from_label
+    summary = next((i for i in items if i.kind == EXAM_SUMMARY), None)
+    if summary is not None and summary.payload.get("section"):
+        return summary.payload["section"]
+    return None
 
 
 def _extract_lesson_one_shot(file_bytes: bytes, mime_type: str) -> LessonExtraction:
@@ -1433,11 +1448,15 @@ def apply_exam_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
         if applied_id:
             local_to_real[p.payload["local_ref"]] = uuid.UUID(applied_id)
             continue
+        # A passage the exam withholds (copyright notice) is kept as a row with no
+        # text, so the questions that rest on it stay linked to it and the drill
+        # can tell they cannot be answered.
+        withheld = bool(p.payload.get("withheld"))
         passage = ExamPassage(
             paper_id=batch.exam_paper_id,
             kind=p.payload["kind"],
-            body_ko=p.payload.get("body_ko"),
-            chart_data=None,
+            body_ko=None if withheld else p.payload.get("body_ko"),
+            chart_data={"withheld": True} if withheld else None,
             image_key=None,
             audio_key=None,
             source_page=p.payload.get("source_page", 1),
@@ -1466,7 +1485,8 @@ def apply_exam_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
                 passage_id=local_to_real.get(passage_ref) if passage_ref else None,
                 number=it.payload["number"],
                 qtype_id=qtype_id,
-                stem_ko=it.payload["stem_ko"],
+                instruction_ko=it.payload.get("instruction_ko"),
+                stem_ko=it.payload.get("stem_ko") or "",
                 options=it.payload.get("options", []),
                 answer=answer,
                 answer_source=("editor" if answer_from_key else "ai_guess") if answer is not None else None,
@@ -1677,13 +1697,14 @@ def find_or_create_exam_paper(
         select(ExamPaper).where(ExamPaper.owner_id == owner_id, ExamPaper.file_hash == file_hash)
     ).scalar_one_or_none()
     if existing:
+        existing.prompt_version = exam_extract.PROMPT_VERSION  # a re-read by the current extraction
         return existing
     paper = ExamPaper(
         exam_kind=exam_kind.strip(),
         session_label=session_label.strip(),
         owner_id=owner_id,
         file_hash=file_hash,
-        prompt_version="exam-v1",
+        prompt_version=exam_extract.PROMPT_VERSION,
     )
     db.add(paper)
     db.flush()

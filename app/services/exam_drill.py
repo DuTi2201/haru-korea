@@ -12,6 +12,7 @@ hands them over — so the rules are unit-tested without a database.
 from __future__ import annotations
 
 import random
+import re
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
@@ -27,7 +28,11 @@ WRONG_AGAIN_AFTER = timedelta(hours=12)  # ...one answered wrong may come back a
 JUST_ASKED = timedelta(minutes=30)  # nothing is asked twice in one sitting
 
 # Question types that cannot be read without the passage they belong to.
-NEEDS_PASSAGE = {"read_short_passage", "read_long_passage", "read_title_topic", "read_chart_info"}
+NEEDS_PASSAGE = {"read_short_passage", "read_long_passage", "read_title_topic", "read_chart_info", "read_order"}
+# Wording that points back at a passage (the text above, a marked spot, a <보기> box):
+# a question that says it with no passage to look at cannot be answered. "밑줄" is
+# not here: an underlined phrase is checked separately (it must be marked as <u>).
+PASSAGE_REFERENCE = re.compile(r"윗글|위 글|위의 글|위 내용|㉠|㉡|㉢|㉣|<보기>|다음 글|이 글|\([가나다라]\)")
 READING_SKILL = "đọc"
 LISTENING_PASSAGE_KIND = "nghe"
 
@@ -44,6 +49,8 @@ class Candidate:
     skill: str
     passage_kind: str | None
     passage_ko: str | None
+    instruction_ko: str = ""  # the group instruction printed above the question
+    passage_linked: bool = False  # a passage row exists (its text may be missing: withheld, a chart)
 
 
 def clean_options(options: object) -> list[str] | None:
@@ -66,10 +73,17 @@ def usable(c: Candidate) -> bool:
     options = clean_options(c.options)
     if options is None or not 1 <= c.answer <= len(options):
         return False
-    if not c.stem_ko.strip():
+    stem, instruction = c.stem_ko.strip(), (c.instruction_ko or "").strip()
+    passage = (c.passage_ko or "").strip()
+    if not (stem or instruction):
         return False
-    if c.qtype_code in NEEDS_PASSAGE and not (c.passage_ko or "").strip():
+    if c.passage_linked and not passage:
+        return False  # its passage is withheld or has no text the app can show
+    wording = f"{instruction} {stem}"
+    if (c.qtype_code in NEEDS_PASSAGE or PASSAGE_REFERENCE.search(wording)) and not passage:
         return False
+    if "밑줄" in wording and "<u>" not in f"{stem} {passage}":
+        return False  # which words are underlined is part of the question
     return True
 
 

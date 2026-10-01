@@ -19,8 +19,10 @@ from app.models import (
     CorpusItemAudio,
     EditorialArticle,
     EditorialOutlineSubmission,
+    ExamPaper,
     GrammarPoint,
     ImportBatch,
+    ImportItem,
     Job,
     LectureAudio,
     Lesson,
@@ -30,7 +32,17 @@ from app.models import (
     WritingDrill,
 )
 from app.models import ErrorLog
-from app.services import article_extract, corpus_enrich, ingestion, read_along, srs, study_pack, tts, writing_drill
+from app.services import (
+    article_extract,
+    corpus_enrich,
+    exam_extract,
+    ingestion,
+    read_along,
+    srs,
+    study_pack,
+    tts,
+    writing_drill,
+)
 from app.services import gemini_client
 from app.services.job_events import publish_job_event
 
@@ -883,12 +895,10 @@ def extract_exam_paper_import(
     trích xuất; không ghi content.exam_passage/exam_item ở đây — chỉ POST
     /imports/{id}/confirm mới ghi.
 
-    `files_b64` is 1-3 files (Studio's exam_paper upload now accepts a
-    reading-passage file, a listening/writing file, and/or a separate
-    answer-key file for the SAME đề thi — see app/api/routers/ingest.py),
-    each `{"data": <base64>, "mime_type": <str>}`. All of them go into ONE
-    Gemini call as separate multimodal parts (ingestion.build_exam_prompt_parts)
-    so it can cross-reference an answer key against the actual questions."""
+    `files_b64` are the pages of ONE paper, each `{"data": <base64>, "mime_type":
+    <str>}` (a paper may arrive as several files). exam_extract cuts a PDF into
+    pages and reads them a few at a time, twice, so a file's size never decides
+    how much of the paper Gemini sees at once."""
     jid, bid = uuid.UUID(job_id), uuid.UUID(batch_id)
     with Session(_sync_engine) as db:
         batch = db.get(ImportBatch, bid)
@@ -898,13 +908,24 @@ def extract_exam_paper_import(
         try:
             paper = ingestion.find_or_create_exam_paper(db, batch.owner_id, batch.file_hash, exam_kind, session_label)
             batch.exam_paper_id = paper.id
+            # A paper read again (re-uploaded after the extraction improved) lands on
+            # the same batch: its old, unreviewed proposals are replaced.
+            cleared = ingestion.clear_staged_items(db, batch)
+            if cleared:
+                print(f"[exam] re-reading batch {bid}: dropped {cleared} earlier proposal(s)", flush=True)
             batch.status = "extracting"
             db.add(batch)
             db.commit()
-            publish_job_event(db, jid, status="running", progress=0.2, step="Đang đọc đề thi với Gemini")
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang tách các trang của đề")
 
             files = [(base64.b64decode(f["data"]), f["mime_type"]) for f in files_b64]
-            staged, flagged = ingestion.run_exam_extraction(db, batch, files)
+
+            def on_progress(done: int, total: int, step: str) -> None:
+                publish_job_event(db, jid, progress=round(0.1 + 0.8 * done / max(total, 1), 3), step=step)
+
+            staged, flagged = ingestion.run_exam_extraction(
+                db, batch, files, session_label=session_label, on_progress=on_progress
+            )
 
             batch.status = "awaiting_review"
             batch.flagged_count = flagged
@@ -919,11 +940,68 @@ def extract_exam_paper_import(
                 result={"import_batch_id": str(bid), "exam_paper_id": str(paper.id), "staged": staged, "flagged": flagged},
             )
         except Exception as exc:  # noqa: BLE001
+            db.rollback()
             batch.status = "failed"
             db.add(batch)
             db.commit()
             publish_job_event(
-                db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc)[:300], "retryable": True}
+            )
+            raise
+
+
+@celery_app.task(name="app.workers.tasks.extract_answer_key_import", bind=True, max_retries=1)
+def extract_answer_key_import(self, job_id: str, batch_id: str, files_b64: list[dict], skill: str | None):
+    """Bảng đáp án (정답표) tải lên riêng -> Gemini đọc hai lượt -> đáp án chỉ được
+    dùng khi hai lượt khớp nhau -> ghi vào các câu của lô đề thi `batch_id` (kể cả
+    những câu đã xác nhận vào thư viện). Không có AI nào đoán đáp án ở đây: chỉ
+    chép bảng in sẵn. `skill` (đọc/nghe) chọn bảng nào của đáp án nhiều phần thuộc
+    về đề này; để trống thì suy ra từ nhãn phiên thi và nội dung đề."""
+    jid, bid = uuid.UUID(job_id), uuid.UUID(batch_id)
+    with Session(_sync_engine) as db:
+        batch = db.get(ImportBatch, bid)
+        if batch is None or batch.kind != "exam_paper":
+            publish_job_event(db, jid, status="failed", error={"code": "not_found", "message": "exam batch not found"})
+            return
+        try:
+            publish_job_event(db, jid, status="running", progress=0.1, step="Đang đọc bảng đáp án")
+
+            def on_progress(done: int, total: int, step: str) -> None:
+                publish_job_event(db, jid, progress=round(0.1 + 0.8 * done / max(total, 1), 3), step=step)
+
+            read = exam_extract.extract_key([(base64.b64decode(f["data"]), f["mime_type"]) for f in files_b64], on_progress=on_progress)
+
+            paper = db.get(ExamPaper, batch.exam_paper_id) if batch.exam_paper_id else None
+            items = db.execute(select(ImportItem).where(ImportItem.import_batch_id == bid)).scalars().all()
+            target = skill or ingestion.paper_skill(list(items), paper.session_label if paper else None)
+            chosen = exam_extract.choose_key_section(read.sections, target)
+            if chosen is None:
+                found = ", ".join(sorted(read.sections)) or "không có bảng nào"
+                raise RuntimeError(
+                    f"Không biết bảng đáp án nào thuộc đề này (đọc được: {found}). "
+                    "Hãy ghi rõ đề đọc/nghe ở nhãn phiên thi hoặc chọn phần thi khi tải đáp án."
+                )
+            report = ingestion.apply_answers(
+                db,
+                batch,
+                read.sections[chosen],
+                skill=chosen,
+                source="file",
+                conflicts=read.conflicts.get(chosen, []),
+            )
+            db.commit()
+            publish_job_event(
+                db,
+                jid,
+                status="succeeded",
+                progress=1.0,
+                step=f"Đã áp {len(report.applied)} đáp án",
+                result={"import_batch_id": str(bid), **report.as_dict()},
+            )
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            publish_job_event(
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc)[:300], "retryable": True}
             )
             raise
 

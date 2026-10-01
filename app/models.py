@@ -331,6 +331,9 @@ class ExamItem(Base):
     )
     number: Mapped[int] = mapped_column(Integer)
     qtype_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("content.question_type.id"))
+    # The instruction printed once above a group of questions ("[9~12] 다음 글 또는
+    # 도표의 내용과 같은 것을 고르십시오."), copied onto each question of the group.
+    instruction_ko: Mapped[str | None] = mapped_column(Text, nullable=True)
     stem_ko: Mapped[str] = mapped_column(Text)
     options: Mapped[dict] = mapped_column(JSONB)
     answer: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)

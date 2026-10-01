@@ -465,6 +465,7 @@ class ExamDrillQuestion(BaseModel):
     number: int
     qtype_code: str
     qtype_name_vi: str
+    instruction_ko: str | None = None  # the group instruction above the question
     stem_ko: str
     options: list[str]
     passage_ko: str | None = None
@@ -617,6 +618,26 @@ class ImportItemOut(BaseModel):
     confidence: float
 
     model_config = {"from_attributes": True}
+
+
+class ExamAnswerTextRequest(BaseModel):
+    """Answers an editor typed or pasted for an exam batch: "1-2, 2-1, …" pairs, or an
+    unbroken run of digits taken as the answers from question `start`."""
+
+    text: str = Field(min_length=1, max_length=4000)
+    start: int = Field(default=1, ge=1, le=200)
+    dry_run: bool = False  # only report what would change
+
+
+class ExamAnswerReportOut(BaseModel):
+    dry_run: bool
+    skill: str | None = None
+    answers: dict[int, int]  # what was read from the text / key
+    applied: list[int]  # question numbers that got an answer
+    changed: list[int]  # ...of which replaced a different answer
+    unmatched: list[int]  # given, but no such question in the paper
+    missing: list[int]  # questions of the paper with no answer given
+    conflicts: list[int] = []  # numbers a key could not be read reliably for
 
 
 class ImportItemPatch(BaseModel):

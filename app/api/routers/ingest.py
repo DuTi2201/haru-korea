@@ -31,6 +31,8 @@ from app.db import get_db
 from app.models import CorpusItem, Film, ImportBatch, ImportItem, Job, Profile
 from app.schemas import (
     CorpusEnrichmentStatusOut,
+    ExamAnswerReportOut,
+    ExamAnswerTextRequest,
     HiddenCorpusItemOut,
     ImportBatchAccepted,
     ImportBatchOut,
@@ -38,10 +40,11 @@ from app.schemas import (
     ImportItemPatch,
     JobAccepted,
 )
-from app.services import corpus_enrich, ingestion, lesson_extract
+from app.services import corpus_enrich, exam_extract, ingestion, lesson_extract
 from app.workers.tasks import (
     apply_import_batch_task,
     enrich_corpus_items,
+    extract_answer_key_import,
     extract_corpus_import,
     extract_editorial_import,
     extract_exam_paper_import,
@@ -54,6 +57,7 @@ _editor_or_admin = require_role("editor", "admin")
 
 _LESSON_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf", "text/plain"}
 _MAX_BYTES = settings.MAX_INGEST_FILE_MB * 1024 * 1024
+MAX_EXAM_FILES = 6
 
 
 async def start_editorial_import(
@@ -290,16 +294,17 @@ async def create_import_batch(
 def upload_job_keys(kind: str, file_hash: str, batch_status: str) -> tuple[list[str], str]:
     """(idempotency keys that count as "this upload already ran", key for a new job).
 
-    A lesson's key carries the extraction version, so a file that was read by an
-    older (less complete) extraction is read again when it is re-uploaded — onto
-    the same batch, which still holds only unreviewed proposals. A confirmed
-    batch is the exception: its lesson is already in the library, so re-reading
-    would only propose duplicates, and any earlier job (old key included) still
-    answers the upload."""
+    A lesson's and an exam paper's key carries the extraction version, so a file that
+    was read by an older (less complete) extraction is read again when it is
+    re-uploaded — onto the same batch, which still holds only unreviewed proposals. A
+    confirmed batch is the exception: its content is already in the library, so
+    re-reading would only propose duplicates, and any earlier job (old key included)
+    still answers the upload."""
     plain = f"{kind}:{file_hash}"
-    if kind != "lesson":
+    version = {"lesson": lesson_extract.PROMPT_VERSION, "exam_paper": exam_extract.PROMPT_VERSION}.get(kind)
+    if version is None:
         return [plain], plain
-    versioned = f"{plain}:{lesson_extract.PROMPT_VERSION}"
+    versioned = f"{plain}:{version}"
     if batch_status == "confirmed":
         return [versioned, plain], versioned
     return [versioned], versioned
@@ -312,19 +317,21 @@ async def _create_exam_paper_batch(
     exam_kind: str | None,
     session_label: str | None,
 ) -> ImportBatchAccepted:
-    """Reading passage / listening+writing / answer-key files (1-3 of
-    them) for ONE đề thi, all staged as a single import_batch and sent to
-    Gemini as separate multimodal parts of ONE call (see
-    ingestion.build_exam_prompt_parts) so it can cross-reference an answer
-    key against the actual questions. `file_hash` covers the whole set
-    (sorted by filename first, so upload ORDER never changes the dedup
-    identity), which is what both ImportBatch's and ExamPaper's
-    (owner_id, file_hash) uniqueness keys off."""
+    """The file(s) of ONE đề thi — a paper split over several files is still one
+    paper: their pages follow each other — staged as a single import_batch. The
+    paper is cut into pages and read a few at a time (exam_extract), so neither the
+    number of files nor their size decides what Gemini sees in one request. The
+    answer key is NOT part of this upload: send it afterwards with
+    POST /imports/{id}/answer-key (or type the answers), which is how a key is
+    matched to the right part of the exam. `file_hash` covers the whole set (sorted
+    by filename first, so upload ORDER never changes the dedup identity), which is
+    what both ImportBatch's and ExamPaper's (owner_id, file_hash) uniqueness keys
+    off."""
     if not upload_files:
         raise _problem(status.HTTP_400_BAD_REQUEST, "file is required for this kind", "validation_error")
-    if len(upload_files) > 3:
+    if len(upload_files) > MAX_EXAM_FILES:
         raise _problem(
-            status.HTTP_400_BAD_REQUEST, "At most 3 files per exam paper", "validation_error"
+            status.HTTP_400_BAD_REQUEST, f"At most {MAX_EXAM_FILES} files per exam paper", "validation_error"
         )
     if not (exam_kind and session_label):
         raise _problem(
@@ -361,24 +368,24 @@ async def _create_exam_paper_batch(
         select(ImportBatch).where(ImportBatch.kind == "exam_paper", ImportBatch.file_hash == file_hash)
     )
     batch = existing_batch.scalar_one_or_none()
-    idempotency_key = f"exam_paper:{file_hash}"
 
     if batch is None:
         batch = ImportBatch(
             kind="exam_paper",
             owner_id=profile.id,
             status="queued",
-            source_file=source_label,
+            source_file=source_label[:255],
             file_hash=file_hash,
         )
         db.add(batch)
         await db.commit()
         await db.refresh(batch)
 
+    lookup_keys, idempotency_key = upload_job_keys("exam_paper", file_hash, batch.status)
     existing_job = await db.execute(
-        select(Job).where(Job.type == "extract_import_exam_paper", Job.idempotency_key == idempotency_key)
+        select(Job).where(Job.type == "extract_import_exam_paper", Job.idempotency_key.in_(lookup_keys))
     )
-    job = existing_job.scalar_one_or_none()
+    job = existing_job.scalars().first()
     if job is not None and job.status not in ("queued", "running", "succeeded"):
         # See the editorial_article branch above: a failed row must not
         # permanently block retrying the same upload.
@@ -615,6 +622,101 @@ async def confirm_import_batch(
         status=job.status,
         poll_url=f"/api/v1/jobs/{job.id}",
         events_url=f"/api/v1/jobs/{job.id}/events",
+    )
+
+
+async def _exam_batch(db: AsyncSession, import_id: uuid.UUID) -> ImportBatch:
+    batch = await db.get(ImportBatch, import_id)
+    if batch is None:
+        raise _problem(status.HTTP_404_NOT_FOUND, "Import batch not found", "not_found")
+    if batch.kind != "exam_paper":
+        raise _problem(
+            status.HTTP_409_CONFLICT, "Not an exam paper", "not_exam_paper", "Chỉ lô đề thi mới có đáp án."
+        )
+    return batch
+
+
+@router.post("/{import_id}/answer-key", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
+async def upload_answer_key(
+    import_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile, Depends(_editor_or_admin)],
+    files: list[UploadFile],
+    section: Annotated[str | None, Form()] = None,
+):
+    """The printed answer key (정답표) of an exam batch, uploaded on its own. It is
+    read twice; only answers the two reads agree on are used, and they go onto the
+    batch's questions — also those already confirmed into the library. `section`
+    (đọc / nghe, or 읽기 / 듣기) says which table of a multi-part key belongs to this
+    paper; left empty it is taken from the session label and the extraction."""
+    batch = await _exam_batch(db, import_id)
+    if not files or len(files) > 3:
+        raise _problem(status.HTTP_400_BAD_REQUEST, "1 to 3 answer-key files expected", "validation_error")
+    skill = None
+    if section:
+        skill = exam_extract.section_skill(section)
+        if skill not in ("đọc", "nghe"):
+            raise _problem(status.HTTP_400_BAD_REQUEST, "section must be đọc or nghe", "validation_error")
+    files_b64: list[dict[str, str]] = []
+    for f in sorted(files, key=lambda f: f.filename or ""):
+        raw = await f.read()
+        if len(raw) > _MAX_BYTES:
+            raise _problem(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                "File too large",
+                "file_too_large",
+                f"{f.filename}: limit is {settings.MAX_INGEST_FILE_MB} MB",
+            )
+        mime_type = f.content_type or mimetypes.guess_type(f.filename or "")[0]
+        if mime_type not in _LESSON_MIME_TYPES:
+            raise _problem(
+                status.HTTP_400_BAD_REQUEST,
+                "Unsupported file type",
+                "unsupported_media_type",
+                f"{f.filename}: expected one of {sorted(_LESSON_MIME_TYPES)}, got {mime_type!r}",
+            )
+        files_b64.append({"data": base64.b64encode(raw).decode("ascii"), "mime_type": mime_type})
+
+    job = Job(type="extract_answer_key", owner_id=profile.id, status="queued")
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    extract_answer_key_import.delay(str(job.id), str(batch.id), files_b64, skill)
+    return JobAccepted(
+        job_id=job.id,
+        status=job.status,
+        poll_url=f"/api/v1/jobs/{job.id}",
+        events_url=f"/api/v1/jobs/{job.id}/events",
+    )
+
+
+@router.post("/{import_id}/answers", response_model=ExamAnswerReportOut)
+async def type_answers(
+    import_id: uuid.UUID,
+    body: ExamAnswerTextRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile, Depends(_editor_or_admin)],
+):
+    """Answers typed or pasted by an editor, for when there is no key file or the key
+    could not be read. With `dry_run` nothing is saved: the reply says what would be
+    set, so a pasted list can be checked before it is applied. The text must be read
+    exactly — anything unclear is refused rather than guessed."""
+    batch = await _exam_batch(db, import_id)
+    try:
+        answers = exam_extract.parse_answer_text(body.text, start=body.start)
+    except exam_extract.AnswerTextError as exc:
+        raise _problem(status.HTTP_400_BAD_REQUEST, "Cannot read the answers", "invalid_answers", str(exc)) from exc
+    report = await ingestion.apply_answers_async(
+        db, batch, answers, skill=None, source="manual", commit=not body.dry_run
+    )
+    return ExamAnswerReportOut(
+        dry_run=body.dry_run,
+        skill=report.skill,
+        answers=answers,
+        applied=report.applied,
+        changed=report.changed,
+        unmatched=report.unmatched,
+        missing=report.missing,
     )
 
 
