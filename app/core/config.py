@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     # kịch bản" true: each call's prompt is this many cues, however long
     # the film is; a longer film means more calls, never a bigger prompt.
     CORPUS_CHUNK_SIZE: int = 40
+    # Sentences per Gemini call when adding a meaning / usage note to corpus
+    # sentences (app/services/corpus_enrich.py). Smaller than the classifier's
+    # chunk because the answer is long-form text per sentence; the pause keeps
+    # a backfill of the whole corpus under the per-minute request limit.
+    CORPUS_ENRICH_CHUNK_SIZE: int = 20
+    CORPUS_ENRICH_PAUSE_SEC: float = 1.0
 
     # Rate limiting (Postgres-table equivalent of the SDD's Redis quota)
     AI_DAILY_JOB_LIMIT: int = 200

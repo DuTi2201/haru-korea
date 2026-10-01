@@ -18,21 +18,30 @@ import base64
 import hashlib
 import mimetypes
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Form, Query, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import _problem, require_role
 from app.core.config import settings
 from app.db import get_db
-from app.models import ImportBatch, ImportItem, Job, Profile
-from app.schemas import ImportBatchAccepted, ImportBatchOut, ImportItemOut, ImportItemPatch
-from app.services import ingestion
+from app.models import CorpusItem, Film, ImportBatch, ImportItem, Job, Profile
+from app.schemas import (
+    CorpusEnrichmentStatusOut,
+    HiddenCorpusItemOut,
+    ImportBatchAccepted,
+    ImportBatchOut,
+    ImportItemOut,
+    ImportItemPatch,
+    JobAccepted,
+)
+from app.services import corpus_enrich, ingestion
 from app.workers.tasks import (
     apply_import_batch_task,
+    enrich_corpus_items,
     extract_corpus_import,
     extract_editorial_import,
     extract_exam_paper_import,
@@ -395,6 +404,123 @@ async def list_import_batches(
         query = query.where(ImportBatch.kind == kind)
     result = await db.execute(query)
     return result.scalars().all()
+
+
+# ------------------------------------------------- corpus enrichment (Studio) --
+# Declared BEFORE the "/{import_id}" routes below: a literal path must come
+# first or "/imports/corpus-enrichment" would be read as an import id.
+_ENRICH_JOB_TYPE = "enrich_corpus_items"
+# A run that has not reported progress for this long is treated as dead (its
+# worker was killed), so it cannot block a new run forever.
+_ENRICH_STALE_AFTER = timedelta(minutes=15)
+
+
+async def _count(db: AsyncSession, *conditions) -> int:
+    query = select(func.count()).select_from(CorpusItem)
+    for condition in conditions:
+        query = query.where(condition)
+    return int((await db.execute(query)).scalar_one())
+
+
+async def _active_enrichment_job(db: AsyncSession) -> Job | None:
+    fresh = datetime.now(timezone.utc) - _ENRICH_STALE_AFTER
+    return (
+        await db.execute(
+            select(Job)
+            .where(Job.type == _ENRICH_JOB_TYPE, Job.status.in_(["queued", "running"]), Job.updated_at > fresh)
+            .order_by(Job.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+@router.get("/corpus-enrichment", response_model=CorpusEnrichmentStatusOut)
+async def corpus_enrichment_status(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile, Depends(_editor_or_admin)],
+):
+    """How much of the corpus has a Vietnamese meaning, usage note and
+    naturalness verdict — what the Studio "Làm giàu kho câu" card shows."""
+    total = await _count(db)
+    pending = await _count(db, ingestion.corpus_enrichment_pending_filter())
+    active = await _active_enrichment_job(db)
+    return CorpusEnrichmentStatusOut(
+        version=corpus_enrich.ENRICH_VERSION,
+        total=total,
+        pending=pending,
+        enriched=total - pending,
+        hidden=await _count(db, CorpusItem.naturalness == corpus_enrich.UNNATURAL),
+        awkward=await _count(db, CorpusItem.naturalness == corpus_enrich.AWKWARD),
+        active_job_id=active.id if active else None,
+    )
+
+
+@router.post("/corpus-enrichment", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)
+async def start_corpus_enrichment(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile, Depends(_editor_or_admin)],
+):
+    """Starts the background run that adds a meaning, usage note, naturalness
+    verdict and topics to every sentence that lacks them. One run at a time:
+    pressing the button while a run is going returns that run. Resumable — a
+    later run only does what is still missing."""
+    job = await _active_enrichment_job(db)
+    if job is None:
+        if await _count(db, ingestion.corpus_enrichment_pending_filter()) == 0:
+            raise _problem(
+                status.HTTP_409_CONFLICT,
+                "Nothing to enrich",
+                "nothing_pending",
+                "Mọi câu trong kho đã có nghĩa và ghi chú cách dùng.",
+            )
+        job = Job(type=_ENRICH_JOB_TYPE, owner_id=profile.id, status="queued")
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+        enrich_corpus_items.delay(str(job.id))
+    return JobAccepted(
+        job_id=job.id,
+        status=job.status,
+        poll_url=f"/api/v1/jobs/{job.id}",
+        events_url=f"/api/v1/jobs/{job.id}/events",
+    )
+
+
+@router.get("/corpus-enrichment/hidden", response_model=list[HiddenCorpusItemOut])
+async def list_hidden_corpus_items(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile, Depends(_editor_or_admin)],
+    limit: Annotated[int, Query(ge=1, le=300)] = 100,
+):
+    """Sentences the model judged unnatural and learners therefore never see —
+    listed so an editor can check the filter and restore a good line."""
+    rows = (
+        await db.execute(
+            select(CorpusItem.id, CorpusItem.film_id, CorpusItem.text_ko)
+            .where(CorpusItem.naturalness == corpus_enrich.UNNATURAL)
+            .order_by(CorpusItem.film_id, CorpusItem.id)
+            .limit(limit)
+        )
+    ).all()
+    film_ids = {r[1] for r in rows}
+    films = dict((await db.execute(select(Film.id, Film.title).where(Film.id.in_(film_ids)))).all()) if film_ids else {}
+    return [HiddenCorpusItemOut(id=r[0], film_title=films.get(r[1], ""), text_ko=r[2]) for r in rows]
+
+
+@router.post("/corpus-enrichment/hidden/{item_id}/restore", status_code=status.HTTP_204_NO_CONTENT)
+async def restore_hidden_corpus_item(
+    item_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    profile: Annotated[Profile, Depends(_editor_or_admin)],
+):
+    """An editor says this line is fine: learners see it again, the model's
+    verdict can no longer hide it, and the next enrichment run adds its meaning."""
+    item = await db.get(CorpusItem, item_id)
+    if item is None or item.naturalness != corpus_enrich.UNNATURAL:
+        raise _problem(status.HTTP_404_NOT_FOUND, "Hidden corpus item not found", "not_found")
+    item.naturalness = corpus_enrich.APPROVED
+    item.enriched_version = None  # so the next run gives it a meaning
+    await db.commit()
 
 
 @router.get("/{import_id}", response_model=ImportBatchOut)

@@ -40,6 +40,10 @@ class Sentence:
     register: str
     topic_ids: tuple[int, ...] = ()
     grammar_ids: tuple[int, ...] = ()
+    # What the line means / how it is used (None until the enrichment step has
+    # covered it); never part of a sentence's identity.
+    meaning_vi: str | None = None
+    usage_note_vi: str | None = None
 
 
 # ------------------------------------------------------------ normalising --
@@ -139,10 +143,12 @@ def with_effective_register(s: Sentence) -> Sentence:
 # ------------------------------------------------------------ de-duplicating --
 def dedupe(sentences: list[Sentence]) -> list[Sentence]:
     """One entry per distinct sentence (see normalize_key). Which copy stays
-    is deterministic — the lowest (film_id, id) — so a learner never sees the
-    list reshuffle between requests."""
+    is deterministic — a copy that already has its meaning wins, then the
+    lowest (film_id, id) — so a learner never sees the list reshuffle between
+    requests, and a repeat that is still waiting for its translation never
+    hides the copy that has one."""
     seen: dict[str, Sentence] = {}
-    for s in sorted(sentences, key=lambda x: (x.film_id, str(x.id))):
+    for s in sorted(sentences, key=lambda x: (x.meaning_vi is None, x.film_id, str(x.id))):
         key = normalize_key(s.text_ko)
         if key and key not in seen:
             seen[key] = s

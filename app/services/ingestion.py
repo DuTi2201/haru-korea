@@ -16,14 +16,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
 import feedparser
 import httpx
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
@@ -47,7 +49,7 @@ from app.models import (
     Topic,
     VocabItem,
 )
-from app.services import article_extract, corpus_browse, gemini_client
+from app.services import article_extract, corpus_browse, corpus_enrich, gemini_client
 from app.services.subtitles import Cue, chunk_cues, parse_plain_lines, parse_subtitles
 
 # ============================================================ extraction ==
@@ -449,8 +451,9 @@ Với MỖI câu thoại dưới đây, phân loại:
   "mẫu ngữ pháp" (câu minh hoạ rõ một mẫu ngữ pháp cụ thể).
 - level: 1-6, ước lượng theo TOPIK.
 - register: "존댓말", "반말", hoặc "hỗn hợp".
-- topics: chọn từ danh sách chủ đề đã có nếu phù hợp ({topics_hint}); có thể
-  đề xuất chủ đề mới bằng tên tiếng Việt ngắn gọn nếu không có chủ đề nào khớp.
+- topics: 1-3 chủ đề về NỘI DUNG câu nói (nói về cái gì), CHỈ chọn từ danh
+  sách sau và viết đúng từng chữ — không tự đặt chủ đề mới, không dùng "khẩu
+  ngữ" làm chủ đề (kiểu nói đã có trường register): {topics_hint}.
 - grammar_patterns: CHỈ chọn từ danh sách mẫu ngữ pháp đã có trong hệ thống
   dưới đây nếu câu thực sự minh hoạ mẫu đó; để trống nếu không khớp mẫu nào
   (không tự tạo mẫu ngữ pháp mới ở bước này):
@@ -658,7 +661,7 @@ def classify_corpus_chunk(
         model=settings.GEMINI_MODEL_CORPUS_INGEST,
         prompt=build_corpus_chunk_prompt(cues, known_topics, known_grammar_patterns),
         response_schema=CORPUS_CHUNK_SCHEMA,
-        prompt_version="corpus-v1",
+        prompt_version="corpus-v2",
     )
     return CorpusChunkClassification.model_validate(_parse_json(result["text"]))
 
@@ -684,12 +687,74 @@ def drop_duplicate_cues(cues: list[Cue], known_keys: set[str]) -> tuple[list[Cue
     return fresh, dropped
 
 
-def run_corpus_extraction(db: Session, batch: ImportBatch, raw_subtitle_text: str) -> tuple[int, int, int]:
+@dataclass
+class CorpusExtractionStats:
+    """What one subtitle import did, for the job result the Studio shows."""
+
+    staged: int = 0
+    flagged: int = 0
+    duplicates: int = 0
+    # lines judged not natural Korean (machine-translated, garbled): never
+    # staged, so they cannot reach a learner; a few are kept for the report
+    unnatural: int = 0
+    unnatural_samples: list[str] = field(default_factory=list)
+    # staged lines that have no meaning/usage note yet (their enrichment call
+    # failed) — the Studio "Làm giàu kho câu" run fills them in after confirm
+    unenriched: int = 0
+
+
+_UNNATURAL_SAMPLE_LIMIT = 15
+
+
+def drop_garbled_cues(cues: list[Cue]) -> tuple[list[Cue], list[str]]:
+    """Cues that are not garbled by the rule-based pre-check (see
+    corpus_enrich.is_garbled), and the texts that were dropped."""
+    kept: list[Cue] = []
+    dropped: list[str] = []
+    for cue in cues:
+        (dropped if corpus_enrich.is_garbled(cue.text) else kept).append(cue)
+    return kept, dropped
+
+
+def _enrich_texts(
+    texts: list[str],
+    known_grammar: list[str],
+    generate: corpus_enrich.Generate,
+    *,
+    chunk_size: int,
+    pause: float,
+) -> list[corpus_enrich.Enrichment | None]:
+    """Enriches `texts` in fixed-size calls. Best effort: a failed call leaves
+    its sentences None (un-enriched) instead of failing the import — the
+    backfill picks them up later."""
+    out: list[corpus_enrich.Enrichment | None] = []
+    for start in range(0, len(texts), chunk_size):
+        part = texts[start : start + chunk_size]
+        if start and pause:
+            time.sleep(pause)
+        try:
+            out.extend(corpus_enrich.enrich_sentences(part, known_grammar, generate))
+        except Exception as exc:  # noqa: BLE001 — keep the import going
+            print(f"[corpus-enrich] import chunk skipped: {str(exc)[:200]}", flush=True)
+            out.extend([None] * len(part))
+    return out
+
+
+def run_corpus_extraction(
+    db: Session,
+    batch: ImportBatch,
+    raw_subtitle_text: str,
+    generate: corpus_enrich.Generate | None = None,
+    pause: float | None = None,
+) -> CorpusExtractionStats:
     """Parses the subtitle file, drops lines the corpus already has (or that
-    repeat inside the file), classifies the rest in fixed-size chunks (so
-    each Gemini call's prompt stays constant-size regardless of film
-    length — FR-19/Gate G6), and stages one ImportItem per kept cue.
-    Returns (staged_count, flagged_count, duplicates_dropped)."""
+    repeat inside the file) and lines that are plainly garbled, classifies the
+    rest in fixed-size chunks (so each Gemini call's prompt stays constant-size
+    regardless of film length — FR-19/Gate G6), then enriches the kept lines
+    (Vietnamese meaning, usage note, a naturalness verdict, topics). A line the
+    model judges unnatural is not staged at all. One ImportItem is staged per
+    remaining cue."""
+    stats = CorpusExtractionStats()
     cues = parse_subtitles(raw_subtitle_text)
     if not cues:
         # Not real timestamped .srt/.vtt — a plain-text paste or an
@@ -698,49 +763,82 @@ def run_corpus_extraction(db: Session, batch: ImportBatch, raw_subtitle_text: st
         # to one cue per line instead of silently staging nothing.
         cues = parse_plain_lines(raw_subtitle_text)
     known_keys = corpus_browse.corpus_keys([t for (t,) in db.execute(select(CorpusItem.text_ko)).all()])
-    cues, duplicates = drop_duplicate_cues(cues, known_keys)
-    known_topics = [t for (t,) in db.execute(select(Topic.name)).all()]
+    cues, stats.duplicates = drop_duplicate_cues(cues, known_keys)
+    cues, garbled = drop_garbled_cues(cues)
+    stats.unnatural += len(garbled)
+    stats.unnatural_samples.extend(garbled[:_UNNATURAL_SAMPLE_LIMIT])
     known_grammar = [p for (p,) in db.execute(select(GrammarPoint.pattern)).all()][:200]
+    if generate is None:
+        generate = corpus_enrich.make_generate(settings.GEMINI_MODEL_CORPUS_INGEST, gemini_client.generate_structured)
+    if pause is None:
+        pause = settings.CORPUS_ENRICH_PAUSE_SEC
 
-    staged = 0
-    flagged = 0
     for chunk in chunk_cues(cues, settings.CORPUS_CHUNK_SIZE):
         by_ref = {c.source_ref: c for c in chunk}
         try:
-            classification = classify_corpus_chunk(chunk, known_topics, known_grammar)
+            classification = classify_corpus_chunk(chunk, list(corpus_enrich.CORPUS_TOPICS), known_grammar)
         except (ValidationError, json.JSONDecodeError, KeyError):
             # One bad chunk shouldn't sink the whole film — skip it; the
             # reviewer will simply see fewer candidates from this stretch.
             continue
 
-        for entry in classification.items:
-            cue = by_ref.get(entry.source_ref)
-            if cue is None or not entry.keep:
+        kept = [
+            (by_ref[entry.source_ref], entry)
+            for entry in classification.items
+            if entry.keep and entry.source_ref in by_ref
+        ]
+        enrichments = _enrich_texts(
+            [cue.text for cue, _ in kept],
+            known_grammar,
+            generate,
+            chunk_size=settings.CORPUS_ENRICH_CHUNK_SIZE,
+            pause=pause,
+        )
+
+        for (cue, entry), enrichment in zip(kept, enrichments):
+            if enrichment is not None and enrichment.naturalness == corpus_enrich.UNNATURAL:
+                stats.unnatural += 1
+                if len(stats.unnatural_samples) < _UNNATURAL_SAMPLE_LIMIT:
+                    stats.unnatural_samples.append(cue.text)
                 continue
             status = confidence_status(entry.confidence, force_flag=entry.is_crude)
+            if enrichment is not None and enrichment.naturalness == corpus_enrich.AWKWARD and status == "pending":
+                status = "flagged_yellow"  # readable but stiff — a human should look
             if status != "pending":
-                flagged += 1
+                stats.flagged += 1
+            payload: dict[str, Any] = {
+                "text_ko": cue.text,  # always the ORIGINAL subtitle line, never Gemini's paraphrase
+                "source_ref": cue.source_ref,
+                "kind": entry.kind,
+                "level": entry.level,
+                "register": entry.register,
+                "topics": corpus_enrich.normalize_topics(entry.topics),
+                "grammar_patterns": entry.grammar_patterns,
+                "is_crude": entry.is_crude,
+            }
+            if enrichment is not None:
+                payload.update(
+                    topics=enrichment.topics,
+                    grammar_patterns=list(dict.fromkeys([*entry.grammar_patterns, *enrichment.grammar_patterns])),
+                    meaning_vi=enrichment.meaning_vi,
+                    usage_note_vi=enrichment.usage_note_vi,
+                    naturalness=enrichment.naturalness,
+                    enriched_version=corpus_enrich.ENRICH_VERSION,
+                )
+            else:
+                stats.unenriched += 1
             db.add(
                 ImportItem(
                     import_batch_id=batch.id,
                     kind="corpus_item",
                     status=status,
                     confidence=entry.confidence,
-                    payload={
-                        "text_ko": cue.text,  # always the ORIGINAL subtitle line, never Gemini's paraphrase
-                        "source_ref": cue.source_ref,
-                        "kind": entry.kind,
-                        "level": entry.level,
-                        "register": entry.register,
-                        "topics": entry.topics,
-                        "grammar_patterns": entry.grammar_patterns,
-                        "is_crude": entry.is_crude,
-                    },
+                    payload=payload,
                 )
             )
-            staged += 1
+            stats.staged += 1
     db.flush()
-    return staged, flagged, duplicates
+    return stats
 
 
 def run_lesson_extraction(db: Session, batch: ImportBatch, file_bytes: bytes, mime_type: str) -> tuple[int, int]:
@@ -1086,6 +1184,13 @@ def apply_corpus_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
                 topic_ids=topic_ids,
                 grammar_point_ids=grammar_point_ids,
                 embedding=embedding,
+                # filled at import time by the enrichment step (and editable by
+                # the reviewer); absent on older payloads, which the backfill
+                # then completes
+                meaning_vi=payload.get("meaning_vi") or None,
+                usage_note_vi=payload.get("usage_note_vi") or None,
+                naturalness=payload.get("naturalness"),
+                enriched_version=payload.get("enriched_version"),
             )
             .on_conflict_do_nothing(index_elements=["film_id", "source_ref"])
         )
@@ -1099,6 +1204,139 @@ def apply_corpus_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:
     if applied == 0 and duplicates_skipped:
         outcome["reason"] = "all_duplicates"
     return outcome
+
+
+@dataclass
+class CorpusEnrichmentStats:
+    """Outcome of one backfill run (becomes the job result)."""
+
+    pending_before: int = 0
+    processed: int = 0
+    enriched: int = 0
+    hidden: int = 0  # judged unnatural in this run: now hidden from learners
+    awkward: int = 0
+    skipped: int = 0  # the model gave nothing usable; retried by the next run
+    failed_chunks: int = 0
+    stopped_early: bool = False
+    error: str | None = None
+    hidden_samples: list[str] = field(default_factory=list)
+
+
+# After this many chunks in a row fail (quota exhausted, outage, bad key) the
+# run stops instead of burning through the whole corpus on guaranteed errors.
+_MAX_CONSECUTIVE_FAILED_CHUNKS = 3
+
+
+def corpus_enrichment_pending_filter():
+    """SQL condition: sentences the current enrichment prompt has not covered."""
+    return or_(
+        CorpusItem.enriched_version.is_(None),
+        CorpusItem.enriched_version != corpus_enrich.ENRICH_VERSION,
+    )
+
+
+def run_corpus_enrichment(
+    db: Session,
+    generate: corpus_enrich.Generate,
+    *,
+    chunk_size: int | None = None,
+    pause: float | None = None,
+    on_progress: Any = None,
+) -> CorpusEnrichmentStats:
+    """Adds a Vietnamese meaning, a usage note, a naturalness verdict and
+    re-tagged topics to every corpus sentence the current prompt version has
+    not covered yet. Safe to run again and again:
+
+    - only un-enriched rows are selected, and each chunk is COMMITTED as it
+      finishes, so a crash/redeploy loses at most the chunk in flight and the
+      next run continues where this one stopped;
+    - a sentence the model returns nothing usable for stays un-enriched (and is
+      tried again next run) rather than being marked done with an empty note;
+    - a line judged unnatural gets only the verdict (it is hidden, nothing else
+      about it is changed) — Studio can restore it;
+    - for the rest, `topic_ids` is REPLACED by the fresh tags (the old free-text
+      tags like "Khẩu ngữ" were the noise being fixed) and grammar patterns are
+      only ever ADDED to, never removed.
+    The Korean text itself is never touched."""
+    size = chunk_size or settings.CORPUS_ENRICH_CHUNK_SIZE
+    wait = settings.CORPUS_ENRICH_PAUSE_SEC if pause is None else pause
+    stats = CorpusEnrichmentStats()
+
+    rows = db.execute(
+        select(CorpusItem.id, CorpusItem.text_ko, CorpusItem.grammar_point_ids, CorpusItem.naturalness)
+        .where(corpus_enrichment_pending_filter())
+        .order_by(CorpusItem.id)
+    ).all()
+    stats.pending_before = len(rows)
+    if not rows:
+        return stats
+
+    grammar_rows = {p: pid for pid, p in db.execute(select(GrammarPoint.id, GrammarPoint.pattern)).all()}
+    known_grammar = list(grammar_rows)[:200]
+    topic_ids: dict[str, int] = {}
+
+    def topic_id(name: str) -> int:
+        if name not in topic_ids:
+            topic_ids[name] = _find_or_create_topic(db, name)
+        return topic_ids[name]
+
+    consecutive_failures = 0
+    total_chunks = (len(rows) + size - 1) // size
+    for number, start in enumerate(range(0, len(rows), size), 1):
+        chunk = rows[start : start + size]
+        if number > 1 and wait:
+            time.sleep(wait)
+        try:
+            results = corpus_enrich.enrich_sentences([text for _, text, _, _ in chunk], known_grammar, generate)
+        except Exception as exc:  # noqa: BLE001 — recorded; the run decides whether to go on
+            db.rollback()
+            stats.failed_chunks += 1
+            consecutive_failures += 1
+            stats.error = str(exc)[:200]
+            print(f"[corpus-enrich] chunk {number}/{total_chunks} failed: {stats.error}", flush=True)
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILED_CHUNKS:
+                stats.stopped_early = True
+                break
+            continue
+        consecutive_failures = 0
+
+        for (row_id, text, grammar_ids, current), result in zip(chunk, results):
+            stats.processed += 1
+            if result is None:
+                stats.skipped += 1
+                continue
+            approved = current == corpus_enrich.APPROVED  # an editor restored this line: never hide it again
+            values: dict[str, Any] = {"enriched_version": corpus_enrich.ENRICH_VERSION}
+            if not approved:
+                values["naturalness"] = result.naturalness
+            if result.naturalness == corpus_enrich.UNNATURAL:
+                if approved:
+                    # keep the editor's decision; there is no meaning to add
+                    db.execute(update(CorpusItem).where(CorpusItem.id == row_id).values(**values))
+                    continue
+                values.update(meaning_vi=None, usage_note_vi=None)
+                stats.hidden += 1
+                if len(stats.hidden_samples) < _UNNATURAL_SAMPLE_LIMIT:
+                    stats.hidden_samples.append(text)
+            else:
+                values.update(meaning_vi=result.meaning_vi, usage_note_vi=result.usage_note_vi)
+                stats.enriched += 1
+                if result.naturalness == corpus_enrich.AWKWARD:
+                    stats.awkward += 1
+                values["topic_ids"] = [topic_id(name) for name in result.topics]
+                added = [grammar_rows[p] for p in result.grammar_patterns if p in grammar_rows]
+                if added:
+                    values["grammar_point_ids"] = sorted({*(grammar_ids or []), *added})
+            db.execute(update(CorpusItem).where(CorpusItem.id == row_id).values(**values))
+        db.commit()
+        print(
+            f"[corpus-enrich] chunk {number}/{total_chunks}: enriched={stats.enriched} "
+            f"hidden={stats.hidden} skipped={stats.skipped}",
+            flush=True,
+        )
+        if on_progress is not None:
+            on_progress(min(start + size, len(rows)), len(rows))
+    return stats
 
 
 def apply_exam_batch(db: Session, batch: ImportBatch) -> dict[str, Any]:

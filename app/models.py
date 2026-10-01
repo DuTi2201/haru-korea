@@ -230,6 +230,15 @@ class CorpusItem(Base):
     topic_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
     grammar_point_ids: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
     embedding = mapped_column(Vector(768), nullable=True)
+    # What the line means / how it is used, for the learner (filled by the
+    # AI enrichment step; NULL until then). `naturalness` is that step's
+    # verdict — 'natural' | 'awkward' | 'unnatural' — and 'unnatural' lines
+    # are hidden from learners. `enriched_version` records which prompt wrote
+    # the three, so the backfill is resumable and re-runnable.
+    meaning_vi: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage_note_vi: Mapped[str | None] = mapped_column(Text, nullable=True)
+    naturalness: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    enriched_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 # --------------------------------------------------------------- analytics --

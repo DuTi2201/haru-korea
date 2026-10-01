@@ -4,9 +4,10 @@ process uses the async session instead (see app/db.py AsyncSessionLocal).
 """
 import base64
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import Session
 
 from sqlalchemy import select
@@ -14,6 +15,7 @@ from sqlalchemy import select
 from app.core.celery_app import celery_app
 from app.core.config import settings
 from app.models import (
+    CorpusItem,
     CorpusItemAudio,
     EditorialArticle,
     EditorialOutlineSubmission,
@@ -25,7 +27,7 @@ from app.models import (
     VocabItem,
     VocabItemAudio,
 )
-from app.services import article_extract, ingestion, read_along, study_pack, tts
+from app.services import article_extract, corpus_enrich, ingestion, read_along, study_pack, tts
 from app.services import gemini_client
 from app.services.job_events import publish_job_event
 
@@ -579,10 +581,11 @@ def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_
             raw_text = ingestion.extract_corpus_source_text(file_bytes, mime_type)
             if is_image:
                 publish_job_event(db, jid, progress=0.4, step="Đang tách câu thoại")
-            staged, flagged, duplicates = ingestion.run_corpus_extraction(db, batch, raw_text)
+            publish_job_event(db, jid, progress=0.5, step="Đang phân loại, lọc câu thiếu tự nhiên và dịch nghĩa")
+            stats = ingestion.run_corpus_extraction(db, batch, raw_text)
 
             batch.status = "awaiting_review"
-            batch.flagged_count = flagged
+            batch.flagged_count = stats.flagged
             db.add(batch)
             db.commit()
             publish_job_event(
@@ -594,9 +597,15 @@ def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_
                 result={
                     "import_batch_id": str(bid),
                     "film_id": film.id,
-                    "staged": staged,
-                    "flagged": flagged,
-                    "duplicates_skipped": duplicates,
+                    "staged": stats.staged,
+                    "flagged": stats.flagged,
+                    "duplicates_skipped": stats.duplicates,
+                    # lines judged unnatural/garbled: never staged (a few shown
+                    # so the reviewer can tell if the filter is too strict)
+                    "unnatural_skipped": stats.unnatural,
+                    "unnatural_samples": stats.unnatural_samples,
+                    # staged without a meaning/usage note (enrichment call failed)
+                    "unenriched": stats.unenriched,
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -605,6 +614,54 @@ def extract_corpus_import(self, job_id: str, batch_id: str, file_b64: str, film_
             db.commit()
             publish_job_event(
                 db, jid, status="failed", error={"code": "internal_error", "message": str(exc), "retryable": True}
+            )
+            raise
+
+
+@celery_app.task(name="app.workers.tasks.enrich_corpus_items", bind=True, max_retries=0)
+def enrich_corpus_items(self, job_id: str):
+    """Điền bù nghĩa tiếng Việt, ghi chú cách dùng, nhận định "có tự nhiên không"
+    và chủ đề cho các câu trong kho câu chưa được xử lý (câu import trước khi có
+    tính năng này, hoặc câu mà lần làm giàu lúc import bị lỗi). Chạy theo lô,
+    COMMIT sau mỗi lô nên chạy lại được: lần sau chỉ làm tiếp phần còn thiếu.
+    Dừng sớm nếu nhiều lô liên tiếp lỗi (hết hạn mức Gemini, sự cố) thay vì đốt
+    cả kho vào những lần gọi chắc chắn hỏng."""
+    jid = uuid.UUID(job_id)
+    with Session(_sync_engine) as db:
+        try:
+            publish_job_event(db, jid, status="running", progress=0.02, step="Đang chuẩn bị làm giàu kho câu")
+            generate = corpus_enrich.make_generate(
+                settings.GEMINI_MODEL_CORPUS_INGEST, gemini_client.generate_structured
+            )
+
+            def progress(done: int, total: int) -> None:
+                publish_job_event(
+                    db, jid, status="running", progress=0.05 + 0.9 * done / max(total, 1),
+                    step=f"Đã xử lý {done}/{total} câu",
+                )
+
+            stats = ingestion.run_corpus_enrichment(db, generate, on_progress=progress)
+            remaining = db.scalar(
+                select(func.count()).select_from(CorpusItem).where(ingestion.corpus_enrichment_pending_filter())
+            )
+            result = {**asdict(stats), "remaining": remaining}
+            if stats.stopped_early:
+                publish_job_event(
+                    db, jid, status="failed", step="Dừng sớm vì Gemini liên tục lỗi", result=result,
+                    error={
+                        "code": "gemini_unavailable",
+                        "message": stats.error or "Gemini liên tục lỗi",
+                        "retryable": True,
+                    },
+                )
+            else:
+                publish_job_event(
+                    db, jid, status="succeeded", progress=1.0, step="Hoàn tất làm giàu kho câu", result=result
+                )
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            publish_job_event(
+                db, jid, status="failed", error={"code": "internal_error", "message": str(exc)[:300], "retryable": True}
             )
             raise
 

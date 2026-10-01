@@ -239,6 +239,10 @@ class CorpusItemOut(BaseModel):
     register: str
     topics: list[str]
     grammar_patterns: list[str]
+    # Vietnamese meaning of the line and how/when to use it; null until the
+    # enrichment step has covered the sentence (the app shows the Korean alone).
+    meaning_vi: str | None = None
+    usage_note_vi: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -298,6 +302,26 @@ class CorpusPageOut(BaseModel):
     total: int
     offset: int
     items: list[CorpusItemOut]
+
+
+class CorpusEnrichmentStatusOut(BaseModel):
+    """Studio: how far the corpus is from having a Vietnamese meaning, usage
+    note and naturalness verdict on every sentence. Counts are stored rows
+    (a sentence imported twice counts twice here, once for learners)."""
+
+    version: str
+    total: int
+    pending: int  # not yet covered by the current enrichment prompt
+    enriched: int
+    hidden: int  # judged unnatural: not shown to learners
+    awkward: int  # readable but stiff: shown
+    active_job_id: uuid.UUID | None = None  # a run in progress, if any
+
+
+class HiddenCorpusItemOut(BaseModel):
+    id: uuid.UUID
+    film_title: str
+    text_ko: str
 
 
 class ItemStateReviewRequest(BaseModel):

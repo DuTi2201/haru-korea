@@ -190,7 +190,7 @@ async def list_corpus_items(
     JOIN across corpus/content (SDD module-boundary principle) — film/
     topic/grammar names are resolved via separate bulk queries and zipped
     together in application code instead."""
-    query = select(CorpusItem).where(CorpusItem.kind == "câu")
+    query = select(CorpusItem).where(CorpusItem.kind == "câu", _visible_to_learners())
     if level is not None:
         query = query.where(CorpusItem.level == level)
     items = (await db.execute(query.order_by(func.random()).limit(limit))).scalars().all()
@@ -219,6 +219,8 @@ async def list_corpus_items(
             register=i.register,
             topics=[topics[t] for t in i.topic_ids if t in topics],
             grammar_patterns=[grammar[g] for g in i.grammar_point_ids if g in grammar],
+            meaning_vi=i.meaning_vi,
+            usage_note_vi=i.usage_note_vi,
         )
         for i in items
     ]
@@ -239,6 +241,12 @@ def reset_corpus_snapshot() -> None:
     _snapshot = None
 
 
+def _visible_to_learners():
+    """Lines the enrichment step judged unnatural (machine-translated, garbled)
+    are kept in the table but never offered; not-yet-judged lines (NULL) are."""
+    return CorpusItem.naturalness.is_distinct_from("unnatural")
+
+
 async def _corpus_sentences(db: AsyncSession) -> list[Sentence]:
     global _snapshot
     now = time.monotonic()
@@ -255,7 +263,9 @@ async def _corpus_sentences(db: AsyncSession) -> list[Sentence]:
                 CorpusItem.register,
                 CorpusItem.topic_ids,
                 CorpusItem.grammar_point_ids,
-            ).where(CorpusItem.kind == "câu")
+                CorpusItem.meaning_vi,
+                CorpusItem.usage_note_vi,
+            ).where(CorpusItem.kind == "câu", _visible_to_learners())
         )
     ).all()
     sentences = corpus_browse.dedupe(
@@ -270,6 +280,8 @@ async def _corpus_sentences(db: AsyncSession) -> list[Sentence]:
                     register=r[5],
                     topic_ids=tuple(r[6] or ()),
                     grammar_ids=tuple(r[7] or ()),
+                    meaning_vi=r[8],
+                    usage_note_vi=r[9],
                 )
             )
             for r in rows
@@ -302,6 +314,8 @@ async def _corpus_out(db: AsyncSession, sentences: list[Sentence]) -> list[Corpu
             register=s.register,
             topics=[topics[t] for t in s.topic_ids if t in topics],
             grammar_patterns=[grammar[g] for g in s.grammar_ids if g in grammar],
+            meaning_vi=s.meaning_vi,
+            usage_note_vi=s.usage_note_vi,
         )
         for s in sentences
     ]

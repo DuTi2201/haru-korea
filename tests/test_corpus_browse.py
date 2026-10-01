@@ -168,8 +168,8 @@ class ImportDedupeTests(unittest.TestCase):
 
 
 # ------------------------------------------------------------------ endpoints --
-def corpus_row(n, text, *, film=1, level=2, register="존댓말", topics=(), grammar=()):
-    return (uuid.UUID(int=n), film, text, "câu", level, register, list(topics), list(grammar))
+def corpus_row(n, text, *, film=1, level=2, register="존댓말", topics=(), grammar=(), meaning=None, usage=None):
+    return (uuid.UUID(int=n), film, text, "câu", level, register, list(topics), list(grammar), meaning, usage)
 
 
 ROWS = [
@@ -244,6 +244,36 @@ class CorpusEndpointTests(unittest.IsolatedAsyncioTestCase):
         out = await content.browse_corpus(FakeDB(), topic_id=10)
         self.assertEqual(out.items[0].topics, ["Công việc"])
         self.assertEqual(out.items[0].grammar_patterns, ["V/A + -았/었-"])
+
+    async def test_browse_carries_the_meaning_and_usage_note(self):
+        rows = [
+            corpus_row(1, "기다려요.", meaning="Tôi đợi đây.", usage="Lịch sự, dùng với người lớn."),
+            corpus_row(2, "기다려", register="반말"),  # not enriched yet: both are null, not missing
+        ]
+        out = await content.browse_corpus(FakeDB(rows=rows), seed="s")
+        by_text = {i.text_ko: i for i in out.items}
+        self.assertEqual(by_text["기다려요."].meaning_vi, "Tôi đợi đây.")
+        self.assertEqual(by_text["기다려요."].usage_note_vi, "Lịch sự, dùng với người lớn.")
+        self.assertIsNone(by_text["기다려"].meaning_vi)
+        self.assertIsNone(by_text["기다려"].usage_note_vi)
+
+    async def test_unnatural_lines_are_filtered_in_the_query_not_in_python(self):
+        seen = []
+
+        class SpyDB(FakeDB):
+            async def execute(self, stmt):
+                seen.append(str(stmt))
+                return await super().execute(stmt)
+
+        await content.corpus_facets(SpyDB())
+        snapshot_sql = next(q for q in seen if "FROM corpus.corpus_item" in q)
+        self.assertIn("naturalness IS DISTINCT FROM", snapshot_sql)  # NULL (not judged yet) stays visible
+
+    def test_a_repeat_with_a_meaning_wins_over_one_still_waiting_for_it(self):
+        waiting = sentence(1, "기다려요.", film=1)
+        done = Sentence(**{**waiting.__dict__, "id": uuid.UUID(int=2), "film_id": 2, "meaning_vi": "Tôi đợi."})
+        self.assertEqual(dedupe([waiting, done])[0].id, done.id)
+        self.assertEqual(dedupe([done, waiting])[0].id, done.id)  # whatever the input order
 
     async def test_browse_past_the_end_is_an_empty_page(self):
         out = await content.browse_corpus(FakeDB(), offset=40)
