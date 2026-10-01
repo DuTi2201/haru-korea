@@ -122,14 +122,14 @@ class StagingTests(unittest.TestCase):
 class UploadKeyTests(unittest.TestCase):
     def test_an_exam_paper_job_key_carries_the_extraction_version(self):
         lookup, new = ingest.upload_job_keys("exam_paper", "h", "awaiting_review")
-        self.assertEqual((lookup, new), (["exam_paper:h:exam-v2"], "exam_paper:h:exam-v2"))
+        self.assertEqual((lookup, new), (["exam_paper:h:exam-v3"], "exam_paper:h:exam-v3"))
         # a paper read by the first version (plain key) is read again
         self.assertNotIn("exam_paper:h", lookup)
 
     def test_a_confirmed_paper_is_not_read_again(self):
         lookup, new = ingest.upload_job_keys("exam_paper", "h", "confirmed")
-        self.assertEqual(lookup, ["exam_paper:h:exam-v2", "exam_paper:h"])
-        self.assertEqual(new, "exam_paper:h:exam-v2")
+        self.assertEqual(lookup, ["exam_paper:h:exam-v3", "exam_paper:h"])
+        self.assertEqual(new, "exam_paper:h:exam-v3")
 
 
 if __name__ == "__main__":

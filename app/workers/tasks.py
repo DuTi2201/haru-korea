@@ -615,7 +615,7 @@ def generate_writing_drill(self, job_id: str, drill_id: str):
             profile = db.get(Profile, drill.learner_id)
             level = srs.article_level_cap(profile.goal if profile else None)
             exercise = writing_drill.build_exercise(
-                targets, level, gemini_client.generate_structured, settings.GEMINI_MODEL_STUDY
+                targets, level, gemini_client.generate_structured, exam_extract.analysis_model()
             )
             drill.prompt = exercise
             drill.status = "ready"
@@ -659,7 +659,7 @@ def grade_writing_drill(self, job_id: str, drill_id: str):
         try:
             publish_job_event(db, jid, status="running", progress=0.3, step="Đang chấm bài viết")
             result = writing_drill.grade_answers(
-                drill.prompt, drill.answers, gemini_client.generate_structured, settings.GEMINI_MODEL_STUDY
+                drill.prompt, drill.answers, gemini_client.generate_structured, exam_extract.analysis_model()
             )
             drill.result = result
             drill.grade_status = "ready"

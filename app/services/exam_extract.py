@@ -32,6 +32,24 @@ So:
    (the two reads disagree, the passage is withheld, a word marked unreadable ...),
    and only the serious ones turn it red.
 
+exam-v3 (read off the same paper after the first import was checked page by page):
+
+6. THE MODEL IS STRONGER (GEMINI_MODEL_EXAM_INGEST, default gemini-3.8-flash) and the
+   model that read the paper is recorded in the summary.
+7. EVERY PAGE CARRIES ITS NUMBER: a "[Trang N]" label (N = position in the file, not the
+   printed page number) goes before each page, so `source_page` can be trusted and the
+   editor can open exactly that page next to the card.
+8. THE TWO READS ARE COMPARED ON WHAT THEY SAY: spacing and punctuation never count
+   (except inside numbers: 23.6 is not 236). A difference is shown as readable words
+   and the whole second reading is kept, so the editor can take it in one tap.
+9. STANDARD WORDING IS CHECKED: the group instructions printed on every TOPIK paper are
+   known. An instruction that is one of them with a few characters missing ("가장"
+   dropped, "고르시오") is flagged with the standard text as a suggestion. It is never
+   corrected by itself.
+10. HARD SPOTS ARE READ AGAIN, ONE PAGE AT A TIME: a question that says "밑줄" but shows no
+    underline, or one that needs a banner / poster / chart that came back empty. The
+    answer is marked `refined`, so a human compares it with the page.
+
 Nothing here touches the database; ingestion.stage_exam_draft stages the result.
 """
 from __future__ import annotations
@@ -50,7 +68,7 @@ from typing import Any
 from app.core.config import settings
 from app.services import exam_drill, gemini_client
 
-PROMPT_VERSION = "exam-v2"
+PROMPT_VERSION = "exam-v3"
 
 WINDOW_PAGES = 5  # consecutive pages the model reads in one call
 WINDOW_STRIDE = 3  # the next window starts this many pages later (overlap = 2)
@@ -60,6 +78,9 @@ WORKERS = 3  # windows read at the same time
 OPTION_COUNT = 4  # every TOPIK multiple-choice question has four choices
 KEY_WINDOW_PAGES = 6  # an answer key is a page or three; longer ones are cut into groups of this many
 PASSAGE_SIMILARITY = 0.9  # two readings of a passage this alike are the same passage
+STANDARD_MAX_MISSING = 6  # an instruction missing up to this many characters of a standard one is a near-miss
+STANDARD_MIN_RATIO = 0.8  # ... and at least this much like it
+REFINE_MIN_SIMILARITY = 0.85  # a targeted re-read must say the same words as the first read, plus what was missing
 UNREADABLE = "[?]"
 LOW_CONFIDENCE = 0.8
 
@@ -87,7 +108,7 @@ EXAM_SCHEMA: dict[str, Any] = {
                         "description": "toàn văn chép nguyên văn; null nếu bị che bản quyền",
                     },
                     "withheld": {"type": "BOOLEAN", "description": "true nếu đề in thông báo không công bố đoạn văn"},
-                    "page": {"type": "INTEGER", "description": "trang (1..n trong tập này) nơi đoạn văn bắt đầu"},
+                    "page": {"type": "INTEGER", "description": "số N trong nhãn [Trang N] của trang nơi đoạn văn bắt đầu"},
                     "confidence": {"type": "NUMBER"},
                 },
                 "required": ["local_ref", "kind", "withheld", "page", "confidence"],
@@ -107,7 +128,7 @@ EXAM_SCHEMA: dict[str, Any] = {
                     "stem_ko": {"type": "STRING", "description": "chữ in ngay sau số câu; chuỗi rỗng nếu không có"},
                     "options": {"type": "ARRAY", "items": {"type": "STRING"}},
                     "answer_guess": {"type": "INTEGER", "nullable": True},
-                    "page": {"type": "INTEGER"},
+                    "page": {"type": "INTEGER", "description": "số N trong nhãn [Trang N] của trang nơi câu hỏi bắt đầu"},
                     "confidence": {"type": "NUMBER"},
                 },
                 "required": ["number", "stem_ko", "options", "page", "confidence"],
@@ -154,17 +175,54 @@ KEY_SCHEMA: dict[str, Any] = {
     "required": ["sections"],
 }
 
+REFINE_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "items": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "number": {"type": "INTEGER"},
+                    "stem_ko": {
+                        "type": "STRING",
+                        "nullable": True,
+                        "description": "chữ in ngay sau số câu, có <u>…</u> ở phần bị gạch chân; null nếu không yêu cầu",
+                    },
+                    "passage_ko": {
+                        "type": "STRING",
+                        "nullable": True,
+                        "description": "mọi chữ/số trong khung/biển/biểu đồ/đoạn văn của câu, có <u>…</u> nếu có gạch chân; null nếu không có",
+                    },
+                    "underline_in": {
+                        "type": "STRING",
+                        "nullable": True,
+                        "enum": ["stem", "passage", "none"],
+                        "description": "phần bị gạch chân nằm ở stem hay passage; none nếu thật sự không có gạch chân",
+                    },
+                    "confidence": {"type": "NUMBER"},
+                },
+                "required": ["number", "confidence"],
+            },
+        }
+    },
+    "required": ["items"],
+}
+
 
 # ------------------------------------------------------------------- prompts --
-def build_prompt(page_count: int, qtypes: list[tuple[str, str, str]]) -> str:
+def build_prompt(page_count: int, qtypes: list[tuple[str, str, str]], first_page: int = 1) -> str:
     qtype_hint = "\n".join(f"- {code} ({skill}): {name_vi}" for code, name_vi, skill in qtypes) or (
         "(chưa có loại câu hỏi nào — để qtype_code là null)"
     )
     return f"""Bạn đang số hóa đề thi TOPIK thành ngân hàng câu hỏi học thuật. Người học sẽ tin
 những gì bạn chép, nên chép ĐÚNG TỪNG CHỮ quan trọng hơn mọi thứ khác.
 
-Các tệp đính kèm là {page_count} trang LIÊN TIẾP của đề (tệp đầu tiên là trang 1). Chỉ
-trích xuất những gì in trên các trang này.
+Các tệp đính kèm là {page_count} trang LIÊN TIẾP của đề, từ [Trang {first_page}] đến
+[Trang {first_page + page_count - 1}]. Mỗi trang có nhãn "[Trang N]" đứng ngay trước nó: N là
+số thứ tự của trang trong tệp (KHÔNG phải số in ở chân trang đề). Trường "page" của mỗi
+đoạn văn / câu hỏi là số N của trang nơi mục đó bắt đầu. Chỉ trích xuất những gì in trên
+các trang này.
 
 QUY TẮC CHÉP
 1. Chép NGUYÊN VĂN từng ký tự như in. Không diễn đạt lại, không tóm tắt, không sửa
@@ -185,8 +243,9 @@ QUY TẮC CHÉP
 
 CÁCH TÁCH
 - instruction_ko: dòng chỉ dẫn CHUNG của nhóm, in ở đầu nhóm câu, vd
-  "※ [9~12] 다음 글 또는 도표의 내용과 같은 것을 고르십시오. (각 2점)". Chép nguyên văn nhưng
-  bỏ "※" ở đầu và "(각 2점)" ở cuối; giữ "[9~12]". MỌI câu trong nhóm đều mang cùng
+  "※ [9~12] 다음 글 또는 그래프의 내용과 같은 것을 고르십시오. (각 2점)". Chép nguyên văn
+  từng chữ như in (mỗi kỳ thi có thể dùng từ hơi khác, vd "그래프" hay "도표"; đừng tự "chuẩn
+  hóa" và đừng bỏ chữ nào như "가장"). Bỏ "※" ở đầu và "(각 2점)" ở cuối; giữ "[9~12]". MỌI câu trong nhóm đều mang cùng
   instruction_ko (lặp lại cho từng câu). Nếu nhóm bắt đầu ở trang không có trong tập
   này thì để null. group_from / group_to là hai số trong [ ].
 - stem_ko: chữ in ngay sau số câu. Vd câu 1: "이 동네로 이사를 ( ) 일 년이 됐다." Nếu sau
@@ -230,6 +289,39 @@ Với mỗi bảng đáp án TRẮC NGHIỆM, trả về section và mọi cặp
 - Chép đúng như in. Ô không đọc rõ thì bỏ cặp đó, đừng suy luận và đừng điền cho đủ số.
 
 Trả về đúng JSON schema, không thêm giải thích."""
+
+
+def build_refine_prompt(page: int, wants: list[dict[str, Any]]) -> str:
+    """The second, narrow look at one page: only the questions whose first reading
+    lacks something specific (an underline, the banner / poster / chart text)."""
+    lines: list[str] = []
+    for want in wants:
+        parts: list[str] = []
+        if want.get("underline"):
+            parts.append(
+                "tìm phần BỊ GẠCH CHÂN (đường kẻ dưới chữ) và chép lại câu có <u>…</u> bọc đúng đoạn bị gạch; "
+                "underline_in = 'stem' nếu gạch chân nằm ở dòng chữ ngay sau số câu, 'passage' nếu nằm trong "
+                "khung/đoạn văn, 'none' nếu nhìn kỹ vẫn không thấy gạch chân"
+            )
+        if want.get("stem"):
+            parts.append("chép stem_ko = chữ in ngay sau số câu (chuỗi rỗng nếu không có)")
+        if want.get("passage"):
+            parts.append(
+                "chép passage_ko = MỌI chữ và số in trong khung quảng cáo / biển báo / áp phích / biểu đồ / đoạn "
+                "văn mà câu hỏi dựa vào, theo thứ tự đọc (khung nhiều dòng: mỗi dòng một hàng; biểu đồ: mỗi nhãn kèm "
+                "số liệu, vd \"가격: 48%\"; không diễn giải, không tóm tắt; null nếu trên trang không có gì như vậy)"
+            )
+        lines.append(f"- Câu {want['number']}: " + "; ".join(parts) + ".")
+    wanted = "\n".join(lines)
+    return f"""Tệp đính kèm là [Trang {page}] của một đề thi TOPIK. Hệ thống đã đọc trang này một lần nhưng
+còn thiếu vài chi tiết. Hãy nhìn thật kỹ và chỉ làm các việc sau, cho đúng các câu được nêu:
+{wanted}
+
+QUY TẮC: chép NGUYÊN VĂN từng ký tự như in, không diễn đạt lại, không sửa chính tả, không dịch,
+không thêm bớt chữ. Chữ không chắc → ghi [?] tại chỗ đó và hạ confidence xuống dưới 0.6. Chỗ trống
+in là ( ) → giữ "( )". Không tự giải đề, không bịa chữ nào không thấy trên trang.
+
+Trả về đúng JSON schema, mỗi câu được nêu một phần tử; không thêm lời giải thích."""
 
 
 # ----------------------------------------------------------------- text tools --
@@ -317,25 +409,213 @@ def _json(result: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def span_diffs(a: str, b: str, *, context: int = 4, limit: int = 3) -> list[tuple[str, str]]:
-    """Where two readings of the same text differ: (what read A saw, what read B
-    saw) around each difference, found on the white-space-free text."""
-    sa, sb = squash(a), squash(b)
-    if sa == sb:
+_TOKEN_RE = re.compile(r"</?u>|.", re.DOTALL | re.IGNORECASE)
+_OPEN_MARK, _CLOSE_MARK = "\x01", "\x02"
+# Punctuation that is layout, not content: two reads that differ only in these (or in
+# spacing) say the same thing. Inside a number it is content: 23.6 is not 236.
+_IGNORED_MARKS = frozenset(".,;:!?'\"‘’“”`´·ㆍ‧•…~∼～-–—‐‑※")
+
+
+def significant(text: str | None) -> list[tuple[str, int, int]]:
+    """The characters of `text` that count when two readings are compared, each with
+    where it sits in `text` (start, end): no white space, no layout punctuation, full-
+    width forms folded. <u> and </u> count as one character each."""
+    text = text or ""
+    tokens = [(m.group(0), m.start(), m.end()) for m in _TOKEN_RE.finditer(text)]
+    out: list[tuple[str, int, int]] = []
+    for i, (token, start, end) in enumerate(tokens):
+        low = token.lower()
+        if low == "<u>":
+            out.append((_OPEN_MARK, start, end))
+            continue
+        if low == "</u>":
+            out.append((_CLOSE_MARK, start, end))
+            continue
+        if token.isspace():
+            continue
+        folded = unicodedata.normalize("NFKC", token)
+        if token in _IGNORED_MARKS or all(ch in _IGNORED_MARKS for ch in folded):
+            inside_number = (
+                0 < i < len(tokens) - 1 and tokens[i - 1][0].isdigit() and tokens[i + 1][0].isdigit()
+            )
+            if not inside_number:
+                continue
+        out.extend((ch, start, end) for ch in folded)
+    return out
+
+
+def comparable(text: str | None) -> str:
+    """The form two readings are compared in (see `significant`)."""
+    return "".join(ch for ch, _s, _e in significant(text))
+
+
+def same_text(a: str | None, b: str | None) -> bool:
+    return comparable(a) == comparable(b)
+
+
+def _word_span(text: str, start: int, end: int, words: int = 1) -> tuple[int, int]:
+    """[start, end) widened to whole words, plus `words` more on each side."""
+    size = len(text)
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    while end < size and not text[end].isspace():
+        end += 1
+    for _ in range(words):
+        while start > 0 and text[start - 1].isspace():
+            start -= 1
+        while start > 0 and not text[start - 1].isspace():
+            start -= 1
+        while end < size and text[end].isspace():
+            end += 1
+        while end < size and not text[end].isspace():
+            end += 1
+    return start, end
+
+
+def _excerpt(text: str, chars: list[tuple[str, int, int]], low: int, high: int) -> str:
+    """The words of `text` that hold the significant characters [low, high), with a
+    word of context on each side, as they are written (spaces and all)."""
+    if high > low:
+        start, end = chars[low][1], chars[high - 1][2]
+    else:
+        start = end = chars[low][1] if low < len(chars) else len(text)
+    left, right = _word_span(text, start, end)
+    excerpt = text[left:right].strip()
+    return excerpt if len(excerpt) <= 160 else excerpt[:157] + "…"
+
+
+def span_diffs(a: str, b: str, *, limit: int = 3) -> list[tuple[str, str]]:
+    """Where two readings of the same text differ, as readable words: (what read A
+    wrote, what read B wrote) around each difference. Spacing and layout punctuation
+    are not differences (see `significant`), so [] means the two say the same."""
+    ca, cb = significant(a), significant(b)
+    ka, kb = "".join(c for c, _s, _e in ca), "".join(c for c, _s, _e in cb)
+    if ka == kb:
         return []
-    out: list[tuple[str, str]] = []
-    matcher = difflib.SequenceMatcher(None, sa, sb, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+    groups: list[list[int]] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ka, kb, autojunk=False).get_opcodes():
         if tag == "equal":
             continue
-        out.append(
-            (
-                sa[max(0, i1 - context) : i2 + context],
-                sb[max(0, j1 - context) : j2 + context],
-            )
-        )
-        if len(out) >= limit:
-            break
+        if groups and i1 - groups[-1][1] <= 1 and j1 - groups[-1][3] <= 1:
+            groups[-1][1], groups[-1][3] = i2, j2  # a one-character gap does not split a difference
+        else:
+            groups.append([i1, i2, j1, j2])
+    marks = {_OPEN_MARK, _CLOSE_MARK}
+    if len(groups) > 1 and all(set(ka[i1:i2]) <= marks and set(kb[j1:j2]) <= marks for i1, i2, j1, j2 in groups):
+        # only the underlining differs: one difference, whatever the number of marks
+        groups = [[groups[0][0], groups[-1][1], groups[0][2], groups[-1][3]]]
+    return [(_excerpt(a, ca, i1, i2), _excerpt(b, cb, j1, j2)) for i1, i2, j1, j2 in groups[:limit]]
+
+
+# ---------------------------------------------------- standard wording -----------
+_MARKER_RE = re.compile(r"^\s*(?:※\s*)?(\[\s*\d+\s*(?:[~∼～\-–]\s*\d+\s*)?\])\s*")
+
+# The group instructions printed on a TOPIK II reading paper, as the 102회 paper prints
+# them (every group of that paper, copied from its pages), without the "[a~b]" mark.
+STANDARD_INSTRUCTIONS: tuple[str, ...] = (
+    "( )에 들어갈 말로 가장 알맞은 것을 고르십시오.",
+    "밑줄 친 부분과 의미가 가장 비슷한 것을 고르십시오.",
+    "다음은 무엇에 대한 글인지 고르십시오.",
+    "다음 글 또는 그래프의 내용과 같은 것을 고르십시오.",
+    "다음을 순서에 맞게 배열한 것을 고르십시오.",
+    "다음을 읽고 물음에 답하십시오.",
+    "다음 신문 기사의 제목을 가장 잘 설명한 것을 고르십시오.",
+    "다음을 읽고 글의 내용과 같은 것을 고르십시오.",
+    "다음을 읽고 글의 주제로 가장 알맞은 것을 고르십시오.",
+    "주어진 문장이 들어갈 곳으로 가장 알맞은 것을 고르십시오.",
+)
+# Wording that older papers print and that is just as right (not a misreading of a
+# standard line): never offered as a correction, never flagged.
+ALSO_ACCEPTED_INSTRUCTIONS: tuple[str, ...] = ("다음 글 또는 도표의 내용과 같은 것을 고르십시오.",)
+# The line printed beside the number, when it is one of the fixed question phrases of
+# the 102회 reading paper.
+STANDARD_STEMS: tuple[str, ...] = (
+    "( )에 들어갈 말로 가장 알맞은 것을 고르십시오.",
+    "윗글의 주제로 가장 알맞은 것을 고르십시오.",
+    "윗글의 내용과 같은 것을 고르십시오.",
+    "윗글의 내용으로 알 수 있는 것을 고르십시오.",
+    "윗글을 쓴 목적으로 가장 알맞은 것을 고르십시오.",
+    "윗글에 나타난 필자의 태도로 가장 알맞은 것을 고르십시오.",
+    "밑줄 친 부분에 나타난 '나'의 심정으로 가장 알맞은 것을 고르십시오.",
+    "밑줄 친 부분에 나타난 '그'의 심정으로 가장 알맞은 것을 고르십시오.",
+)
+
+
+def split_marker(instruction: str | None) -> tuple[str, str]:
+    """("[3~4]", "밑줄 친 부분과 …") — the group mark and the wording after it."""
+    text = _txt(instruction)
+    match = _MARKER_RE.match(text)
+    if match is None:
+        return "", text.lstrip("※").strip()
+    return re.sub(r"\s+", "", match.group(1)), text[match.end() :].strip()
+
+
+def stem_echoes_instruction(stem: str, instruction: str | None) -> bool:
+    """The model sometimes writes the group instruction into the stem as well."""
+    if not stem or not instruction:
+        return False
+    body = comparable(split_marker(clean_instruction(stem) or "")[1])
+    return bool(body) and body == comparable(split_marker(instruction)[1])
+
+
+def missing_chars(read: str, standard: str) -> int:
+    """How many characters `read` lacks of `standard`, when that is ALL that differs
+    (nothing replaced, nothing added); 0 when they are the same or differ otherwise.
+    Only a loss is a misreading to suggest a correction for: a replaced or added word
+    ("다른" for "같은", "알맞지 않은" for "알맞은") may be a different, real question."""
+    if not read or read == standard or len(read) >= len(standard):
+        return 0
+    missing = 0
+    for tag, i1, i2, _j1, _j2 in difflib.SequenceMatcher(None, standard, read, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if tag != "delete":
+            return 0
+        missing += i2 - i1
+    return missing
+
+
+def standard_match(text: str, standards: dict[str, str]) -> str | None:
+    """`standards` maps comparable() -> the standard text. None when `text` IS one of
+    them or is nothing like one; otherwise the standard it is a near-miss of."""
+    key = comparable(text)
+    if not key or key in standards:
+        return None
+    best: tuple[int, str] | None = None
+    for std_key, std_text in standards.items():
+        lost = missing_chars(key, std_key)
+        if not lost or lost > STANDARD_MAX_MISSING:
+            continue
+        if difflib.SequenceMatcher(None, key, std_key, autojunk=False).ratio() < STANDARD_MIN_RATIO:
+            continue
+        if best is None or lost < best[0]:
+            best = (lost, std_text)
+    return best[1] if best else None
+
+
+def standard_table(texts: tuple[str, ...]) -> dict[str, str]:
+    return {comparable(t): t for t in texts}
+
+
+_INSTRUCTION_TABLE = standard_table(STANDARD_INSTRUCTIONS + ALSO_ACCEPTED_INSTRUCTIONS)
+_STEM_TABLE = standard_table(STANDARD_STEMS)
+
+
+def standard_suggestion(instruction: str | None, stem: str) -> dict[str, str]:
+    """The standard wording to offer where an instruction or a stem is a standard one
+    with characters missing, e.g. {"instruction_ko": "[3~4] 밑줄 친 부분과 의미가 가장 …"}.
+    Empty when nothing is a near-miss. Wording that is not in the lists at all (another
+    kind of paper) is left alone, and a suggestion is never applied by the system."""
+    out: dict[str, str] = {}
+    if instruction:
+        mark, body = split_marker(instruction)
+        hit = standard_match(body, _INSTRUCTION_TABLE)
+        if hit:
+            out["instruction_ko"] = f"{mark} {hit}".strip()
+    if stem:
+        hit = standard_match(stem, _STEM_TABLE)
+        if hit:
+            out["stem_ko"] = hit
     return out
 
 
@@ -403,7 +683,7 @@ class _Passage:
     kind: str
     body: str | None
     withheld: bool
-    page: int  # absolute, 1-based
+    page: int  # absolute, 1-based (the [Trang N] label); 0 = the model did not say
     confidence: float
 
 
@@ -440,11 +720,18 @@ def section_skill(value: Any) -> str | None:
     return None
 
 
+def page_in(raw: Any, span: tuple[int, int]) -> int:
+    """The page the model named, when it is a page of this window (its "[Trang N]"
+    label, N counted in the file); 0 = unknown. A number outside the window is a slip
+    (the printed page number, or a position inside the window), not a page to trust."""
+    page = _int(raw)
+    return page if page is not None and span[0] < page <= span[1] else 0
+
+
 def parse_read(data: dict[str, Any], index: int, span: tuple[int, int]) -> _Read:
     """One window's answer, tolerant: a malformed passage or question costs only
     itself, never the window."""
     read = _Read(index=index, span=span, section=section_skill(data.get("paper_section")))
-    start = span[0]
 
     for raw in _list(data.get("passages")):
         if not isinstance(raw, dict):
@@ -459,7 +746,7 @@ def parse_read(data: dict[str, Any], index: int, span: tuple[int, int]) -> _Read
         withheld = bool(raw.get("withheld"))
         if withheld:
             body = None
-        page = start + (_int(raw.get("page"), 1) or 1)
+        page = page_in(raw.get("page"), span)
         read.passages[(index, ref)] = _Passage(
             key=(index, ref),
             kind=kind,
@@ -482,17 +769,23 @@ def parse_read(data: dict[str, Any], index: int, span: tuple[int, int]) -> _Read
             group = (low, high) if low is not None and high is not None and low <= high else None
         ref = _txt(raw.get("passage_ref"))
         options = [clean_option(o) for o in _list(raw.get("options")) if isinstance(o, (str, int, float))]
+        stem = tidy_text(raw.get("stem_ko"), multiline=True)
+        if instruction is None and _MARKER_RE.match(stem) and "십시오" in stem:
+            instruction, stem = clean_instruction(stem), ""  # the instruction was put where the stem goes
+            group = group_of(instruction) or group
+        elif stem_echoes_instruction(stem, instruction):
+            stem = ""  # the group instruction written a second time as the stem
         read.questions.append(
             _Question(
                 number=number,
-                stem=tidy_text(raw.get("stem_ko"), multiline=True),
+                stem=stem,
                 options=options,
                 instruction=instruction,
                 group=group,
                 passage_key=(index, ref) if ref else None,
                 qtype=_txt(raw.get("qtype_code")) or None,
                 guess=_int(raw.get("answer_guess"), 1, 5),
-                page=start + (_int(raw.get("page"), 1) or 1),
+                page=page_in(raw.get("page"), span),
                 confidence=_confidence(raw.get("confidence")),
                 window=index,
             )
@@ -516,6 +809,8 @@ class _Merged:
     duplicates: set[int]
     section: str | None
     key_rows: list[tuple[str | None, int, int]]
+    refined_questions: set[int] = field(default_factory=set)  # read again on their own page
+    refined_passages: set[tuple[int, str]] = field(default_factory=set)
 
     def passage_of(self, question: _Question) -> _Passage | None:
         if question.passage_key is None:
@@ -527,8 +822,9 @@ class _Merged:
 def same_passage(a: _Passage, b: _Passage) -> bool:
     """Two reads of one passage, whole or cut by a window edge."""
     if a.withheld or b.withheld:
-        return a.withheld and b.withheld and a.page == b.page
-    sa, sb = squash(a.body), squash(b.body)
+        # told apart by the page they are printed on (a page the model did not name matches any)
+        return a.withheld and b.withheld and (a.page == b.page or 0 in (a.page, b.page))
+    sa, sb = comparable(a.body), comparable(b.body)
     if not sa or not sb:
         return False
     if sa in sb or sb in sa:
@@ -578,8 +874,8 @@ def merge(reads: list[_Read]) -> _Merged:
         for other in ranked[1:]:
             if _spans_touch(spans[winner.window], spans[other.window]):
                 continue
-            if squash(other.stem) != squash(winner.stem) or [squash(o) for o in other.options] != [
-                squash(o) for o in winner.options
+            if not same_text(other.stem, winner.stem) or [comparable(o) for o in other.options] != [
+                comparable(o) for o in winner.options
             ]:
                 duplicates.add(number)
                 break
@@ -635,22 +931,31 @@ def adopt_passage(into: _Merged, passage: _Passage) -> tuple[int, str]:
     return passage.key
 
 
-def compare(first: _Merged, second: _Merged) -> tuple[dict[int, list[dict[str, str]]], dict[tuple[int, str], list[dict[str, str]]]]:
+def compare(first: _Merged, second: _Merged) -> tuple[dict[int, list[dict[str, Any]]], dict[tuple[int, str], list[dict[str, Any]]]]:
     """Differences between two independent readings, by question number and by
     passage (keyed by the FIRST reading's passage). A passage one read cut short
-    (a window edge) is not a difference; a changed character is."""
-    question_diffs: dict[int, list[dict[str, str]]] = {}
-    passage_diffs: dict[tuple[int, str], list[dict[str, str]]] = {}
+    (a window edge) is not a difference; spacing and layout punctuation are not
+    (see `significant`); a changed character or word is.
 
-    def note(target: list[dict[str, str]], name: str, a: str, b: str) -> None:
-        for seen, other in span_diffs(a, b):
-            target.append({"field": name, "a": seen, "b": other})
+    Each difference is {"field", "a", "b"}: the readable words around it in the first
+    and the second reading. The first difference of a field also carries `b_full`, the
+    whole second reading of that field (or `b_options`, all four options when the
+    reads found a different number), so an editor can take the second reading as it is."""
+    question_diffs: dict[int, list[dict[str, Any]]] = {}
+    passage_diffs: dict[tuple[int, str], list[dict[str, Any]]] = {}
+
+    def note(target: list[dict[str, Any]], name: str, a: str, b: str) -> None:
+        for n, (seen, other) in enumerate(span_diffs(a, b)):
+            entry: dict[str, Any] = {"field": name, "a": seen, "b": other}
+            if n == 0:
+                entry["b_full"] = b
+            target.append(entry)
 
     for number, qa in first.questions.items():
         qb = second.questions.get(number)
         if qb is None:
             continue
-        diffs: list[dict[str, str]] = []
+        diffs: list[dict[str, Any]] = []
         if qa.instruction and qb.instruction:
             note(diffs, "instruction", qa.instruction, qb.instruction)
         if qa.stem or qb.stem:
@@ -659,18 +964,171 @@ def compare(first: _Merged, second: _Merged) -> tuple[dict[int, list[dict[str, s
             for i, (oa, ob) in enumerate(zip(qa.options, qb.options), start=1):
                 note(diffs, f"option {i}", oa, ob)
         elif qa.options and qb.options and len(qb.options) == OPTION_COUNT:
-            diffs.append({"field": "options", "a": f"{len(qa.options)} phương án", "b": f"{len(qb.options)} phương án"})
+            diffs.append(
+                {
+                    "field": "options",
+                    "a": f"{len(qa.options)} phương án",
+                    "b": f"{len(qb.options)} phương án",
+                    "b_options": list(qb.options),
+                }
+            )
         if diffs:
             question_diffs[number] = diffs
         pa, pb = first.passage_of(qa), second.passage_of(qb)
         if pa is not None and pb is not None and pa.body and pb.body:
-            sa, sb = squash(pa.body), squash(pb.body)
+            sa, sb = comparable(pa.body), comparable(pb.body)
             if sa != sb and sa not in sb and sb not in sa:
-                found: list[dict[str, str]] = []
+                found: list[dict[str, Any]] = []
                 note(found, "passage", pa.body, pb.body)
                 if found:
                     passage_diffs.setdefault(pa.key, found)
     return question_diffs, passage_diffs
+
+
+# ------------------------------------------------------- targeted re-read -------
+@dataclass
+class _Want:
+    number: int
+    page: int
+    underline: bool = False  # says "밑줄" but no underline was seen
+    passage: bool = False  # needs a banner / poster / chart / passage that came back empty
+
+
+def _page_of(merged: _Merged, number: int) -> int:
+    """The page a question is printed on; when the model did not say, the page of the
+    nearest numbered question that has one."""
+    q = merged.questions[number]
+    if q.page:
+        return q.page
+    for other in sorted(merged.questions, key=lambda n: abs(n - number)):
+        if merged.questions[other].page:
+            return merged.questions[other].page
+    return 0
+
+
+def refine_targets(merged: _Merged, valid: set[str]) -> dict[int, list[_Want]]:
+    """Questions worth one more, narrow look, grouped by the page to look at."""
+    by_page: dict[int, list[_Want]] = {}
+    for number in sorted(merged.questions):
+        q = merged.questions[number]
+        passage = merged.passage_of(q)
+        if passage is not None and passage.withheld:
+            continue
+        qtype = qtype_of(q, passage, valid)
+        shown = f"{q.stem} {passage.body if passage is not None and passage.body else ''}"
+        underline = "밑줄" in f"{q.instruction or ''} {q.stem}" and "<u>" not in shown
+        passage_missing = needs_passage(q.instruction, q.stem, qtype) and (passage is None or not passage.body)
+        page = _page_of(merged, number)
+        if page and (underline or passage_missing):
+            by_page.setdefault(page, []).append(_Want(number, page, underline=underline, passage=passage_missing))
+    return by_page
+
+
+def _plain(text: str) -> str:
+    return _UNDERLINE_TAG_RE.sub("", text)
+
+
+def _refined_text(old: str, new: Any) -> str | None:
+    """The re-read text of something already read, when it is the same words with the
+    underline added (a re-read that rewrites is not trusted)."""
+    text = tidy_text(new, multiline=True)
+    if not text or "<u>" not in text or not underline_balanced(text) or UNREADABLE in text:
+        return None
+    a, b = comparable(_plain(old)), comparable(_plain(text))
+    if not a or not b:
+        return None
+    return text if difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= REFINE_MIN_SIMILARITY else None
+
+
+def apply_refine(merged: _Merged, wants: list[_Want], data: dict[str, Any]) -> None:
+    """Put what a narrow re-read found into the merged paper, marking every question
+    and passage it touched as `refined` (a human compares them with the page). A
+    re-read that found nothing new changes nothing — the flag that sent the question
+    here stays."""
+    by_number = {w.number: w for w in wants}
+    for raw in _list(data.get("items")):
+        if not isinstance(raw, dict):
+            continue
+        number = _int(raw.get("number"))
+        want = by_number.get(number) if number is not None else None
+        if want is None or number not in merged.questions:
+            continue
+        q = merged.questions[number]
+        passage = merged.passage_of(q)
+        confidence = _confidence(raw.get("confidence"))
+        if want.underline:
+            stem = _refined_text(q.stem, raw.get("stem_ko")) if q.stem else None
+            if stem is not None:
+                q.stem = stem
+                merged.refined_questions.add(number)
+            elif passage is not None and passage.body:
+                body = _refined_text(passage.body, raw.get("passage_ko"))
+                if body is not None:
+                    passage.body = body
+                    merged.refined_passages.add(passage.key)
+                    merged.refined_questions.add(number)
+        if want.passage:
+            body = tidy_text(raw.get("passage_ko"), multiline=True)
+            if not comparable(body) or UNREADABLE in body:
+                continue
+            if passage is not None and not passage.withheld:
+                passage.body = body
+                passage.confidence = confidence
+                merged.refined_passages.add(passage.key)
+            else:
+                key = (-1, f"R{number}")
+                passage = _Passage(
+                    key=key,
+                    kind="biểu đồ" if "%" in body else "đọc hiểu",
+                    body=body,
+                    withheld=False,
+                    page=want.page,
+                    confidence=confidence,
+                )
+                merged.passages[key] = passage
+                merged.alias[key] = key
+                q.passage_key = key
+                merged.refined_passages.add(key)
+            merged.refined_questions.add(number)
+
+
+def refine(
+    generate: Generate,
+    pages: list[tuple[bytes, str]],
+    merged: _Merged,
+    valid: set[str],
+    on_done: Callable[[], None],
+) -> tuple[list[int], list[int]]:
+    """Read the pages that hold the hard spots once more, only for those spots.
+    Returns (pages read, pages that failed) — a failed page changes nothing."""
+    targets = refine_targets(merged, valid)
+
+    def one(page: int) -> tuple[int, dict[str, Any] | None]:
+        if not 1 <= page <= len(pages):
+            return page, None
+        data, mime = pages[page - 1]
+        wants = [
+            {"number": w.number, "underline": w.underline, "stem": w.underline, "passage": w.passage}
+            for w in targets[page]
+        ]
+        try:
+            parts: list[Any] = [f"[Trang {page}]", gemini_client.part_from_bytes(data, mime)]
+            return page, _ask(generate, parts, build_refine_prompt(page, wants), REFINE_SCHEMA)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[exam] re-read of page {page} failed: {exc}", flush=True)
+            return page, None
+
+    done: list[int] = []
+    failed: list[int] = []
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for page, result in pool.map(one, sorted(targets)):
+            on_done()
+            if result is None:
+                failed.append(page)
+            else:
+                done.append(page)
+                apply_refine(merged, targets[page], result)
+    return done, failed
 
 
 # ------------------------------------------------------------------- flags -----
@@ -687,6 +1145,8 @@ FLAG_LABELS_VI = {
     "duplicate_number": "Số câu xuất hiện hai lần với nội dung khác nhau",
     "empty": "Đoạn văn trống",
     "text_mismatch": "Hai lượt đọc khác nhau",
+    "instruction_variant": "Chỉ dẫn/câu hỏi na ná cách ghi chuẩn nhưng thiếu chữ",
+    "refined": "Đọc lại có mục tiêu — hãy đối chiếu với trang gốc",
     "low_confidence": "Mô hình không chắc chữ chép đúng",
     "single_read": "Chỉ một lượt đọc thấy câu này",
     "no_answer": "Bảng đáp án không có câu này",
@@ -725,12 +1185,27 @@ def guess_qtype(instruction: str | None, stem: str, passage_body: str | None, va
     return "read_grammar_choice" if "read_grammar_choice" in valid else None
 
 
+def qtype_of(question: _Question, passage: _Passage | None, valid: set[str]) -> str | None:
+    """The question type to file a question under: the model's, if it is a real one,
+    else the one its printed wording points at."""
+    if question.qtype in valid:
+        return question.qtype
+    return guess_qtype(question.instruction, question.stem, passage.body if passage else None, valid)
+
+
 def needs_passage(instruction: str | None, stem: str, qtype: str | None) -> bool:
     return qtype in exam_drill.NEEDS_PASSAGE or bool(exam_drill.PASSAGE_REFERENCE.search(f"{instruction or ''} {stem}"))
 
 
 def question_flags(
-    question: _Question, passage: _Passage | None, qtype: str | None, *, diffs: list[dict[str, str]] | None, single: bool
+    question: _Question,
+    passage: _Passage | None,
+    qtype: str | None,
+    *,
+    diffs: list[dict[str, Any]] | None,
+    single: bool,
+    refined: bool = False,
+    variant: bool = False,
 ) -> list[str]:
     flags: list[str] = []
     if qtype is None:
@@ -750,6 +1225,10 @@ def question_flags(
         flags.append("no_underline")
     if diffs:
         flags.append("text_mismatch")
+    if variant:
+        flags.append("instruction_variant")
+    if refined:
+        flags.append("refined")
     if single:
         flags.append("single_read")
     if question.confidence < LOW_CONFIDENCE:
@@ -776,7 +1255,14 @@ def _default_generate(**kwargs: Any) -> dict[str, Any]:
 
 
 def _model() -> str:
+    """The model that reads exam pages. One name for the whole paper; no silent
+    fallback to another model when a call fails (a failed window is reported)."""
     return settings.GEMINI_MODEL_EXAM_INGEST or settings.GEMINI_MODEL_LESSON_INGEST
+
+
+def analysis_model() -> str:
+    """The model that analyses / solves exam material (the writing drill)."""
+    return settings.GEMINI_MODEL_EXAM_ANALYSIS or settings.GEMINI_MODEL_STUDY
 
 
 def _ask(generate: Generate, parts: list[Any], prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -799,18 +1285,28 @@ def _read_windows(
     spans: list[tuple[int, int]],
     qtypes: list[tuple[str, str, str]],
     on_done: Callable[[], None],
+    errors: list[str] | None = None,
 ) -> tuple[list[_Read], list[int]]:
     """Read every window (a few at a time). Returns the reads and the indexes of
     windows that failed — a failed window only means its questions come from a
-    neighbouring window or are reported missing."""
+    neighbouring window or are reported missing. The reason each one failed is
+    appended to `errors`, so a wrong model name is not hidden behind "no page read"."""
 
     def one(index: int) -> _Read | None:
         start, end = spans[index]
-        parts = [gemini_client.part_from_bytes(data, mime) for data, mime in pages[start:end]]
+        parts: list[Any] = []
+        for number, (data, mime) in enumerate(pages[start:end], start=start + 1):
+            parts += [f"[Trang {number}]", gemini_client.part_from_bytes(data, mime)]
         try:
-            return parse_read(_ask(generate, parts, build_prompt(end - start, qtypes), EXAM_SCHEMA), index, spans[index])
+            return parse_read(
+                _ask(generate, parts, build_prompt(end - start, qtypes, first_page=start + 1), EXAM_SCHEMA),
+                index,
+                spans[index],
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"[exam] window {index} (pages {start + 1}-{end}) failed: {exc}", flush=True)
+            if errors is not None:
+                errors.append(f"{type(exc).__name__}: {exc}")
             return None
 
     reads: list[_Read] = []
@@ -832,6 +1328,7 @@ def extract(
     session_label: str = "",
     generate: Generate | None = None,
     verify: bool | None = None,
+    refine_pass: bool | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> Draft:
     """Read an exam paper (PDF / images / text) into a draft: passages and
@@ -839,21 +1336,26 @@ def extract(
     (code, name_vi, skill) per known question type."""
     gen = generate or _default_generate
     do_verify = settings.EXAM_VERIFY_PASS if verify is None else verify
+    do_refine = settings.EXAM_REFINE_PASS if refine_pass is None else refine_pass
     pages = load_pages(files)
     first_spans = windows(len(pages))
     second_spans = windows(len(pages), phase=VERIFY_PHASE) if do_verify else []
     total = len(first_spans) + len(second_spans)
     done = 0
+    reading = True
 
     def tick() -> None:
         nonlocal done
         done += 1
         if on_progress:
-            on_progress(done, total, f"Đang đọc đề ({done}/{total} lượt)")
+            what = "lượt" if reading else "trang đọc lại"
+            on_progress(done, total, f"Đang đọc đề ({done}/{total} {what})")
 
-    reads_a, failed_a = _read_windows(gen, pages, first_spans, qtypes, tick)
+    errors: list[str] = []
+    reads_a, failed_a = _read_windows(gen, pages, first_spans, qtypes, tick, errors)
     if not reads_a:
-        raise RuntimeError("Gemini không đọc được trang nào của đề (mọi lượt đều lỗi)")
+        why = f" Lỗi: {errors[-1][:200]}" if errors else ""
+        raise RuntimeError(f"Gemini không đọc được trang nào của đề (mọi lượt đều lỗi, mô hình {_model()}).{why}")
     first = merge(reads_a)
 
     second: _Merged | None = None
@@ -862,8 +1364,8 @@ def extract(
         reads_b, failed_b = _read_windows(gen, pages, second_spans, qtypes, tick)
         second = merge(reads_b) if reads_b else None
 
-    q_diffs: dict[int, list[dict[str, str]]] = {}
-    p_diffs: dict[tuple[int, str], list[dict[str, str]]] = {}
+    q_diffs: dict[int, list[dict[str, Any]]] = {}
+    p_diffs: dict[tuple[int, str], list[dict[str, Any]]] = {}
     extra: set[int] = set()
     if second is not None:
         q_diffs, p_diffs = compare(first, second)
@@ -873,6 +1375,20 @@ def extract(
                 question.passage_key = adopt_passage(first, passage) if passage is not None else None
                 first.questions[number] = question
                 extra.add(number)
+
+    # The hard spots (an underline nobody saw, a banner that came back empty) get a
+    # narrow look at their own page; what it finds is marked `refined`.
+    refine_done: list[int] = []
+    refine_failed: list[int] = []
+    valid = {code for code, _name, _skill in qtypes}
+    if do_refine:
+        wanted_pages = refine_targets(first, valid)
+        if wanted_pages:
+            reading = False
+            total += len(wanted_pages)
+            refine_done, refine_failed = refine(gen, pages, first, valid, tick)
+            if second is not None and first.refined_questions:
+                q_diffs, p_diffs = compare(first, second)  # what was refined is compared again
 
     label_skill = section_skill(session_label)
     section = label_skill or first.section or (second.section if second else None)
@@ -886,12 +1402,16 @@ def extract(
         section=section,
         key=key,
         stats={
+            "model": _model(),
             "pages": len(pages),
             "windows": len(first_spans),
             "failed_windows": failed_a,
             "verify_windows": len(second_spans),
             "verify_failed": failed_b,
             "verified": second is not None,
+            "refine_pages": refine_done,
+            "refine_failed": refine_failed,
+            "refined": sorted(first.refined_questions),
         },
     )
 
@@ -900,8 +1420,8 @@ def build_draft(
     merged: _Merged,
     qtypes: list[tuple[str, str, str]],
     *,
-    q_diffs: dict[int, list[dict[str, str]]],
-    p_diffs: dict[tuple[int, str], list[dict[str, str]]],
+    q_diffs: dict[int, list[dict[str, Any]]],
+    p_diffs: dict[tuple[int, str], list[dict[str, Any]]],
     single: set[int],
     section: str | None,
     key: dict[str, dict[int, int]],
@@ -930,14 +1450,18 @@ def build_draft(
         diffs = p_diffs.get(p.key)
         if diffs:
             flags.append("text_mismatch")
+        if p.key in merged.refined_passages:
+            flags.append("refined")
         if not p.withheld and p.confidence < LOW_CONFIDENCE:
             flags.append("low_confidence")
+        users = sorted(n for n, q in merged.questions.items() if merged.passage_of(q) is p)
+        page = p.page or next((_page_of(merged, n) for n in users if _page_of(merged, n)), 0)
         payload: dict[str, Any] = {
             "local_ref": refs[p.key],
             "kind": p.kind,
             "body_ko": p.body,
             "withheld": p.withheld,
-            "source_page": p.page,
+            "source_page": page or 1,
             "flags": flags,
         }
         if diffs:
@@ -948,10 +1472,17 @@ def build_draft(
     for number in sorted(merged.questions):
         q = merged.questions[number]
         passage = merged.passage_of(q)
-        qtype = q.qtype if q.qtype in valid else None
-        if qtype is None:
-            qtype = guess_qtype(q.instruction, q.stem, passage.body if passage else None, valid)
-        flags = question_flags(q, passage, qtype, diffs=q_diffs.get(number), single=number in single)
+        qtype = qtype_of(q, passage, valid)
+        suggest = standard_suggestion(q.instruction, q.stem)
+        flags = question_flags(
+            q,
+            passage,
+            qtype,
+            diffs=q_diffs.get(number),
+            single=number in single,
+            refined=number in merged.refined_questions,
+            variant=bool(suggest),
+        )
         if number in merged.duplicates:
             flags.append("duplicate_number")
         payload = {
@@ -965,11 +1496,13 @@ def build_draft(
             "answer": None,
             "answer_from_key": False,
             "answer_guess": q.guess,
-            "source_page": q.page,
+            "source_page": _page_of(merged, number) or None,
             "flags": flags,
         }
         if number in q_diffs:
             payload["alt"] = q_diffs[number]
+        if suggest:
+            payload["instruction_suggest"] = suggest
         items.append({"payload": payload, "confidence": q.confidence, "flags": flags})
 
     numbers = sorted(merged.questions)

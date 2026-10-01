@@ -47,12 +47,21 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL_LESSON_INGEST: str = "gemini-3.5-flash-lite"
     GEMINI_MODEL_CORPUS_INGEST: str = "gemini-3.5-flash-lite"
-    # Reads an exam paper off its pages (app/services/exam_extract.py). Copying
-    # every character exactly is the one job where a stronger model pays off;
-    # empty = GEMINI_MODEL_LESSON_INGEST. Set on Railway, no deploy of code.
-    GEMINI_MODEL_EXAM_INGEST: str = ""
+    # Reads an exam paper (and its answer key) off the pages — see
+    # app/services/exam_extract.py. Copying every character exactly is the one
+    # job where a stronger model pays off, so this is NOT the lesson model.
+    # A GEMINI_MODEL_EXAM_INGEST variable set on Railway wins over this default;
+    # empty falls back to GEMINI_MODEL_LESSON_INGEST.
+    GEMINI_MODEL_EXAM_INGEST: str = "gemini-3.8-flash"
+    # Everything that analyses or solves exam material: the writing drill's
+    # exercise generation and grading (app/services/writing_drill.py). Same
+    # override rule: a Railway variable of this name wins; empty = the study model.
+    GEMINI_MODEL_EXAM_ANALYSIS: str = "gemini-3.8-flash"
     # Read the paper a second time and show where the two readings differ.
     EXAM_VERIFY_PASS: bool = True
+    # Look again, page by page, at the spots a first reading left empty (an
+    # underline nobody saw, a banner / chart that came back blank).
+    EXAM_REFINE_PASS: bool = True
     # Text model for the beginner study pack (translation / simplified Korean /
     # word breakdown) — see app/services/study_pack.py. Override via env to use
     # a stronger model without a code change.
